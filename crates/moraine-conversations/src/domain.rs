@@ -263,6 +263,8 @@ pub struct SearchEventHit {
     pub phase: String,
     pub source_ref: String,
     pub text_preview: String,
+    pub text_content: Option<String>,
+    pub payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +324,9 @@ pub struct ConversationSearchHit {
     pub event_count_considered: u32,
     pub best_event_uid: Option<String>,
     pub snippet: Option<String>,
+    pub text_preview: Option<String>,
+    pub text_content: Option<String>,
+    pub payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

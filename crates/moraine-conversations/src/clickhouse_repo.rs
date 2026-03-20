@@ -126,6 +126,10 @@ struct SearchRow {
     source_ref: String,
     doc_len: u32,
     text_preview: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
     score: f64,
     matched_terms: u64,
 }
@@ -159,6 +163,10 @@ struct SearchDocExtraRow {
     source_ref: String,
     doc_len: u32,
     text_preview: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
     has_codex_mcp: u8,
 }
 
@@ -215,6 +223,19 @@ struct ConversationSessionMetadataRow {
 struct ConversationSnippetRow {
     event_uid: String,
     snippet: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
+    #[serde(default)]
+    event_class: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationSnippetContent {
+    snippet: String,
+    text_content: Option<String>,
+    payload_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +314,8 @@ struct SearchDocExtraCacheEntry {
     source_ref: String,
     doc_len: u32,
     text_preview: String,
+    text_content: String,
+    payload_json: String,
     has_codex_mcp: u8,
     fetched_at: Instant,
 }
@@ -1057,6 +1080,8 @@ GROUP BY event_uid)"
         let where_sql = where_clauses.join("\n  AND ");
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
+        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
 
         Ok(format!(
             "WITH
@@ -1078,6 +1103,8 @@ SELECT
   any(d.source_ref) AS source_ref,
   any(d.doc_len) AS doc_len,
   leftUTF8(any(d.text_content), {preview}) AS text_preview,
+  leftUTF8(any(d.text_content), {text_content_limit}) AS text_content,
+  leftUTF8(any(d.payload_json), {payload_json_limit}) AS payload_json,
   sum(
     transform(toString(p.term), q_terms, q_idf, 0.0)
     *
@@ -1097,6 +1124,8 @@ ORDER BY score DESC, event_uid ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
+            text_content_limit = text_content_limit,
+            payload_json_limit = payload_json_limit,
             postings_table = postings_table,
             documents_join_sql = documents_join_sql,
         ))
@@ -1119,6 +1148,8 @@ FORMAT JSONEachRow",
         } else {
             "toUInt8(positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') > 0)"
         };
+        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
+        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         let documents_source_sql = if use_document_codex_flag {
             format!(
                 "(SELECT
@@ -1177,10 +1208,14 @@ GROUP BY event_uid)"
   d.source_ref AS source_ref,
   d.doc_len AS doc_len,
   leftUTF8(d.text_content, {preview}) AS text_preview,
+  leftUTF8(d.text_content, {text_content_limit}) AS text_content,
+  leftUTF8(d.payload_json, {payload_json_limit}) AS payload_json,
   {codex_expr} AS has_codex_mcp
 FROM {documents_source_sql} AS d
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
+            text_content_limit = text_content_limit,
+            payload_json_limit = payload_json_limit,
             codex_expr = codex_expr,
             documents_source_sql = documents_source_sql,
         ))
@@ -1268,6 +1303,10 @@ FORMAT JSONEachRow",
         }
 
         true
+    }
+
+    fn is_user_facing_event_class(event_class: &str) -> bool {
+        matches!(event_class, "message" | "reasoning" | "event_msg")
     }
 
     fn bm25_term_score(tf: u16, doc_len: u32, avgdl: f64, k1: f64, b: f64) -> f64 {
@@ -1422,6 +1461,8 @@ FORMAT JSONEachRow",
                     source_ref: row.source_ref,
                     doc_len: row.doc_len,
                     text_preview: row.text_preview,
+                    text_content: row.text_content,
+                    payload_json: row.payload_json,
                     has_codex_mcp: row.has_codex_mcp,
                     fetched_at: now,
                 };
@@ -1810,6 +1851,8 @@ FORMAT JSONEachRow",
                     source_ref: extra.source_ref.clone(),
                     doc_len: extra.doc_len,
                     text_preview: extra.text_preview.clone(),
+                    text_content: extra.text_content.clone(),
+                    payload_json: extra.payload_json.clone(),
                     score: row.score,
                     matched_terms: row.matched_terms,
                 });
@@ -2334,22 +2377,29 @@ FORMAT JSONEachRow",
     async fn fetch_conversation_snippets(
         &self,
         event_uids: &[String],
-    ) -> RepoResult<HashMap<String, String>> {
+    ) -> RepoResult<HashMap<String, ConversationSnippetContent>> {
         if event_uids.is_empty() {
             return Ok(HashMap::new());
         }
 
         let documents_table = self.table_ref("search_documents");
         let event_uids_sql = sql_array_strings(event_uids);
+        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
+        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         let sql = format!(
             "SELECT
   event_uid,
-  leftUTF8(any(text_content), {preview}) AS snippet
+  leftUTF8(any(text_content), {preview}) AS snippet,
+  leftUTF8(any(text_content), {text_content_limit}) AS text_content,
+  leftUTF8(any(payload_json), {payload_json_limit}) AS payload_json,
+  any(event_class) AS event_class
 FROM {documents_table}
 WHERE event_uid IN {event_uids_sql}
 GROUP BY event_uid
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
+            text_content_limit = text_content_limit,
+            payload_json_limit = payload_json_limit,
             documents_table = documents_table,
             event_uids_sql = event_uids_sql,
         );
@@ -2357,7 +2407,19 @@ FORMAT JSONEachRow",
             self.map_backend(self.ch.query_rows(&sql, None).await)?;
         let mut by_uid = HashMap::new();
         for row in rows {
-            by_uid.insert(row.event_uid, row.snippet);
+            let is_user_facing = Self::is_user_facing_event_class(&row.event_class);
+            by_uid.insert(
+                row.event_uid,
+                ConversationSnippetContent {
+                    snippet: row.snippet,
+                    text_content: is_user_facing
+                        .then(|| row.text_content)
+                        .filter(|value| !value.is_empty()),
+                    payload_json: is_user_facing
+                        .then(|| row.payload_json)
+                        .filter(|value| !value.is_empty()),
+                },
+            );
         }
         Ok(by_uid)
     }
@@ -2451,6 +2513,8 @@ FORMAT JSONEachRow",
                     phase: row.phase,
                     source_ref: row.source_ref,
                     text_preview: row.text_preview,
+                    text_content: (!row.text_content.is_empty()).then_some(row.text_content),
+                    payload_json: (!row.payload_json.is_empty()).then_some(row.payload_json),
                 }
             })
             .collect())
@@ -3421,10 +3485,22 @@ FORMAT JSONEachRow",
                 } else {
                     Some(row_best_event_uid)
                 };
-                let snippet = best_event_uid
+                let snippet_content = best_event_uid
                     .as_ref()
-                    .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned())
+                    .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned());
+                let snippet = snippet_content
+                    .as_ref()
+                    .map(|content| content.snippet.clone())
                     .or((!row_snippet.is_empty()).then_some(row_snippet));
+                let text_preview = snippet_content
+                    .as_ref()
+                    .map(|content| content.snippet.clone());
+                let text_content = snippet_content
+                    .as_ref()
+                    .and_then(|content| content.text_content.clone());
+                let payload_json = snippet_content
+                    .as_ref()
+                    .and_then(|content| content.payload_json.clone());
                 let has_first_event_time = !first_event_time.is_empty();
                 let has_last_event_time = !last_event_time.is_empty();
                 let provider = session_metadata
@@ -3451,6 +3527,9 @@ FORMAT JSONEachRow",
                     event_count_considered,
                     best_event_uid,
                     snippet,
+                    text_preview,
+                    text_content,
+                    payload_json,
                 }
             })
             .collect::<Vec<_>>();
@@ -3556,6 +3635,8 @@ mod tests {
             source_ref: "source-ref".to_string(),
             doc_len: 42,
             text_preview: "preview".to_string(),
+            text_content: "full preview content".to_string(),
+            payload_json: "{\"type\":\"message\"}".to_string(),
             has_codex_mcp: 0,
             fetched_at: Instant::now(),
         }
@@ -3584,6 +3665,8 @@ mod tests {
             source_ref: "source-ref".to_string(),
             doc_len: 42,
             text_preview: text_preview.to_string(),
+            text_content: text_preview.to_string(),
+            payload_json: "{\"type\":\"message\"}".to_string(),
             score,
             matched_terms,
         }

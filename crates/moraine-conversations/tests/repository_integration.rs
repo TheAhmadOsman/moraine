@@ -255,6 +255,8 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                         "source_ref": "/tmp/sess_c.jsonl:1:42",
                         "doc_len": 19,
                         "text_preview": "best event in session c",
+                        "text_content": "best event in session c with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-c\"}",
                         "score": 12.5,
                         "matched_terms": 2_u64
                     },
@@ -271,8 +273,37 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                         "source_ref": "/tmp/sess_a.jsonl:1:11",
                         "doc_len": 13,
                         "text_preview": "weaker event in session a",
+                        "text_content": "weaker event in session a with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-a\"}",
                         "score": 7.0,
                         "matched_terms": 1_u64
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("WHERE event_uid IN")
+            && query.contains("GROUP BY event_uid")
+            && query.contains("AS text_content")
+            && query.contains("AS payload_json")
+            && query.contains("AS event_class")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "event_uid": "evt-c-42",
+                        "snippet": "best match from session c",
+                        "text_content": "best match from session c with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-c\"}",
+                        "event_class": "message"
+                    },
+                    {
+                        "event_uid": "evt-a-11",
+                        "snippet": "weaker match from session a",
+                        "text_content": "weaker match from session a with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-a\"}",
+                        "event_class": "message"
                     }
                 ])),
             );
@@ -432,6 +463,18 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         Some("Session C summary")
     );
     assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
+    assert_eq!(
+        result.hits[0].text_preview.as_deref(),
+        Some("best match from session c")
+    );
+    assert_eq!(
+        result.hits[0].text_content.as_deref(),
+        Some("best match from session c with extra context")
+    );
+    assert_eq!(
+        result.hits[0].payload_json.as_deref(),
+        Some("{\"type\":\"message\",\"topic\":\"session-c\"}")
+    );
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(
         result.hits[1].first_event_time.as_deref(),
@@ -440,6 +483,10 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert_eq!(result.hits[1].provider.as_deref(), Some("codex"));
     assert_eq!(result.hits[1].session_slug, None);
     assert_eq!(result.hits[1].session_summary, None);
+    assert_eq!(
+        result.hits[1].text_content.as_deref(),
+        Some("weaker match from session a with extra context")
+    );
     assert_eq!(result.stats.requested_limit, 10);
     assert_eq!(result.stats.effective_limit, 10);
     assert!(!result.stats.limit_capped);
@@ -566,6 +613,14 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[0].session_id, "sess_c");
     assert_eq!(result.hits[0].first_event_time, "2026-01-03 10:00:00");
     assert_eq!(result.hits[0].last_event_time, "2026-01-03 10:10:00");
+    assert_eq!(
+        result.hits[0].text_content.as_deref(),
+        Some("best event in session c with extra context")
+    );
+    assert_eq!(
+        result.hits[0].payload_json.as_deref(),
+        Some("{\"type\":\"message\",\"topic\":\"session-c\"}")
+    );
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
