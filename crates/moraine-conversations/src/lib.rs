@@ -11,7 +11,7 @@ pub use domain::{
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
     SearchEventsResult, SearchEventsStats, SearchEventsStrategy, SessionEventsDirection,
-    SessionEventsQuery, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 pub use error::{RepoError, RepoResult};
 pub use repo::ConversationRepository;

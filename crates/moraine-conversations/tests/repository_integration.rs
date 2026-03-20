@@ -12,8 +12,8 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, SearchEventKind,
-    SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, RepoError,
+    SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
 };
 use serde_json::json;
 
@@ -143,6 +143,64 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "tool_calls": 2,
                         "tool_results": 2,
                         "mode": "web_search"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("argMin(event_uid, tuple(event_ts, event_order, event_uid))")
+            && query.contains("argMax(actor_role, tuple(event_ts, event_order, event_uid))")
+            && query.contains("WHERE s.session_id =")
+        {
+            if query.contains("WHERE s.session_id = 'sess-missing'") {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
+
+            if query.contains("WHERE s.session_id = 'sess-empty'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess-empty",
+                            "first_event_time": "2026-01-04 09:00:00",
+                            "first_event_unix_ms": 1767517200000_i64,
+                            "last_event_time": "2026-01-04 09:01:00",
+                            "last_event_unix_ms": 1767517260000_i64,
+                            "total_turns": 1_u32,
+                            "total_events": 2_u64,
+                            "user_messages": 1_u64,
+                            "assistant_messages": 1_u64,
+                            "tool_calls": 0_u64,
+                            "tool_results": 0_u64,
+                            "mode": "chat",
+                            "first_event_uid": "",
+                            "last_event_uid": "",
+                            "last_actor_role": ""
+                        }
+                    ])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "total_turns": 3_u32,
+                        "total_events": 30_u64,
+                        "user_messages": 6_u64,
+                        "assistant_messages": 6_u64,
+                        "tool_calls": 3_u64,
+                        "tool_results": 3_u64,
+                        "mode": "web_search",
+                        "first_event_uid": "evt-c-1",
+                        "last_event_uid": "evt-c-42",
+                        "last_actor_role": "assistant"
                     }
                 ])),
             );
@@ -608,6 +666,80 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_metadata_returns_stable_summary_fields() {
+    let (repo, state) = build_repo().await;
+
+    let metadata = repo
+        .get_session_metadata("sess_c")
+        .await
+        .expect("session metadata query succeeds")
+        .expect("session metadata exists");
+
+    assert_eq!(metadata.session_id, "sess_c");
+    assert_eq!(metadata.first_event_time, "2026-01-03 10:00:00");
+    assert_eq!(metadata.last_event_time, "2026-01-03 10:10:00");
+    assert_eq!(metadata.total_events, 30);
+    assert_eq!(metadata.total_turns, 3);
+    assert_eq!(metadata.user_messages, 6);
+    assert_eq!(metadata.assistant_messages, 6);
+    assert_eq!(metadata.first_event_uid, "evt-c-1");
+    assert_eq!(metadata.last_event_uid, "evt-c-42");
+    assert_eq!(metadata.last_actor_role, "assistant");
+    assert_eq!(metadata.mode, ConversationMode::WebSearch);
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let metadata_query = queries
+        .iter()
+        .find(|q| q.contains("argMin(event_uid, tuple(event_ts, event_order, event_uid))"))
+        .expect("session metadata query should be captured");
+    assert!(metadata_query.contains("argMax(actor_role, tuple(event_ts, event_order, event_uid))"));
+    assert!(metadata_query.contains("WHERE s.session_id = 'sess_c'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_metadata_returns_none_for_missing_session() {
+    let (repo, _state) = build_repo().await;
+
+    let metadata = repo
+        .get_session_metadata("sess-missing")
+        .await
+        .expect("session metadata query succeeds");
+    assert!(metadata.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_metadata_rejects_invalid_session_id() {
+    let (repo, _state) = build_repo().await;
+
+    let err = repo
+        .get_session_metadata("sess bad")
+        .await
+        .expect_err("invalid session_id should fail");
+    assert!(matches!(err, RepoError::InvalidArgument(_)));
+    assert_eq!(
+        err.to_string(),
+        "invalid argument: session_id contains unsupported characters"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_metadata_keeps_empty_boundary_fields_when_summary_exists() {
+    let (repo, _state) = build_repo().await;
+
+    let metadata = repo
+        .get_session_metadata("sess-empty")
+        .await
+        .expect("session metadata query succeeds")
+        .expect("session metadata exists");
+
+    assert_eq!(metadata.session_id, "sess-empty");
+    assert_eq!(metadata.mode, ConversationMode::Chat);
+    assert!(metadata.first_event_uid.is_empty());
+    assert!(metadata.last_event_uid.is_empty());
+    assert!(metadata.last_actor_role.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

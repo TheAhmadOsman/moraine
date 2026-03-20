@@ -4,7 +4,7 @@ use moraine_config::AppConfig;
 use moraine_conversations::{
     is_user_facing_content_event, ClickHouseConversationRepository, ConversationListFilter,
     ConversationMode, ConversationRepository, ConversationSearchQuery, ConversationSearchResults,
-    OpenEventRequest, PageRequest, RepoConfig, SearchEventKind, SearchEventsQuery,
+    OpenEventRequest, PageRequest, RepoConfig, RepoError, SearchEventKind, SearchEventsQuery,
     SearchEventsResult, SessionEventsDirection, SessionEventsQuery,
 };
 use serde::Deserialize;
@@ -124,6 +124,13 @@ struct ListSessionsArgs {
     to_unix_ms: Option<i64>,
     #[serde(default)]
     mode: Option<ConversationMode>,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetSessionArgs {
+    session_id: String,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -360,6 +367,58 @@ struct SessionListProseSession {
     mode: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct GetSessionProsePayload {
+    #[serde(default)]
+    found: bool,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    session: Option<GetSessionProseSession>,
+    #[serde(default)]
+    error: Option<GetSessionProseError>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GetSessionProseSession {
+    #[serde(default)]
+    first_event_time: String,
+    #[serde(default)]
+    first_event_unix_ms: i64,
+    #[serde(default)]
+    last_event_time: String,
+    #[serde(default)]
+    last_event_unix_ms: i64,
+    #[serde(default)]
+    total_events: u64,
+    #[serde(default)]
+    total_turns: u32,
+    #[serde(default)]
+    user_messages: u64,
+    #[serde(default)]
+    assistant_messages: u64,
+    #[serde(default)]
+    tool_calls: u64,
+    #[serde(default)]
+    tool_results: u64,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    first_event_uid: String,
+    #[serde(default)]
+    last_event_uid: String,
+    #[serde(default)]
+    last_actor_role: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GetSessionProseError {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     cfg: AppConfig,
@@ -559,6 +618,22 @@ impl AppState {
                     }
                 },
                 {
+                    "name": "get_session",
+                    "description": "Fetch stable metadata for one summarized session by session_id without loading full event history. Returns found=false when the session is absent from session summary metadata.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        },
+                        "required": ["session_id"]
+                    }
+                },
+                {
                     "name": "get_session_events",
                     "description": "Fetch an ordered timeline of events for one session with deterministic pagination. Results follow `direction` (`forward` = chronological, `reverse` = newest-first).",
                     "inputSchema": {
@@ -655,6 +730,16 @@ impl AppState {
                 match verbosity {
                     Verbosity::Full => Ok(tool_ok_full(payload)),
                     Verbosity::Prose => Ok(tool_ok_prose(format_session_list_prose(&payload)?)),
+                }
+            }
+            "get_session" => {
+                let args: GetSessionArgs = serde_json::from_value(params.arguments)
+                    .context("get_session expects {\"session_id\": ...}")?;
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.get_session(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => Ok(tool_ok_prose(format_get_session_prose(&payload)?)),
                 }
             }
             "get_session_events" => {
@@ -824,6 +909,21 @@ impl AppState {
         })
     }
 
+    fn build_get_session_error_payload(
+        session_id: String,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Value {
+        json!({
+            "found": false,
+            "session_id": session_id,
+            "error": {
+                "code": code,
+                "message": message.into(),
+            }
+        })
+    }
+
     async fn get_session_events(&self, args: GetSessionEventsArgs) -> Result<Value> {
         let GetSessionEventsArgs {
             session_id,
@@ -883,6 +983,52 @@ impl AppState {
             events,
             page.next_cursor,
         ))
+    }
+
+    fn build_get_session_payload(
+        session_id: String,
+        result: Result<Option<moraine_conversations::SessionMetadata>, RepoError>,
+    ) -> Result<Value> {
+        match result {
+            Ok(Some(session)) => Ok(json!({
+                "found": true,
+                "session_id": session.session_id,
+                "session": {
+                    "session_id": session.session_id,
+                    "first_event_time": session.first_event_time,
+                    "first_event_unix_ms": session.first_event_unix_ms,
+                    "last_event_time": session.last_event_time,
+                    "last_event_unix_ms": session.last_event_unix_ms,
+                    "total_events": session.total_events,
+                    "total_turns": session.total_turns,
+                    "user_messages": session.user_messages,
+                    "assistant_messages": session.assistant_messages,
+                    "tool_calls": session.tool_calls,
+                    "tool_results": session.tool_results,
+                    "mode": session.mode.as_str(),
+                    "first_event_uid": session.first_event_uid,
+                    "last_event_uid": session.last_event_uid,
+                    "last_actor_role": session.last_actor_role,
+                },
+            })),
+            Ok(None) => Ok(Self::build_get_session_error_payload(
+                session_id,
+                "not_found",
+                "session_id was not found",
+            )),
+            Err(RepoError::InvalidArgument(message)) => Ok(Self::build_get_session_error_payload(
+                session_id,
+                "invalid_argument",
+                message,
+            )),
+            Err(err) => Err(anyhow!(err.to_string())),
+        }
+    }
+
+    async fn get_session(&self, args: GetSessionArgs) -> Result<Value> {
+        let session_id = args.session_id;
+        let result = self.repo.get_session_metadata(&session_id).await;
+        Self::build_get_session_payload(session_id, result)
     }
 }
 
@@ -1291,6 +1437,65 @@ fn format_session_events_prose(payload: &Value) -> Result<String> {
 
     if let Some(cursor) = parsed.next_cursor.as_deref() {
         out.push_str(&format!("\nnext_cursor: {}", cursor));
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn format_get_session_prose(payload: &Value) -> Result<String> {
+    let parsed: GetSessionProsePayload =
+        serde_json::from_value(payload.clone()).context("failed to parse get_session payload")?;
+
+    let mut out = String::new();
+    out.push_str(&format!("Session: {}\n", parsed.session_id));
+
+    if !parsed.found {
+        if let Some(err) = parsed.error {
+            out.push_str(&format!("Not found ({})", err.code));
+            if !err.message.is_empty() {
+                out.push_str(&format!(": {}", err.message));
+            }
+        } else {
+            out.push_str("Not found.");
+        }
+        return Ok(out);
+    }
+
+    let Some(session) = parsed.session else {
+        out.push_str("No session metadata available.");
+        return Ok(out);
+    };
+
+    let mode = if session.mode.is_empty() {
+        "chat"
+    } else {
+        session.mode.as_str()
+    };
+
+    out.push_str(&format!("Mode: {}\n", mode));
+    out.push_str(&format!(
+        "First event: {} (unix_ms={})\n",
+        session.first_event_time, session.first_event_unix_ms
+    ));
+    out.push_str(&format!(
+        "Last event: {} (unix_ms={})\n",
+        session.last_event_time, session.last_event_unix_ms
+    ));
+    out.push_str(&format!(
+        "Counts: events={} turns={} user={} assistant={} tool_calls={} tool_results={}\n",
+        session.total_events,
+        session.total_turns,
+        session.user_messages,
+        session.assistant_messages,
+        session.tool_calls,
+        session.tool_results
+    ));
+    out.push_str(&format!(
+        "Boundary event_uids: first={} last={}\n",
+        session.first_event_uid, session.last_event_uid
+    ));
+    if !session.last_actor_role.is_empty() {
+        out.push_str(&format!("Last actor role: {}", session.last_actor_role));
     }
 
     Ok(out.trim_end().to_string())
@@ -1879,5 +2084,91 @@ mod tests {
         assert!(text.contains("[3] assistant message (text)"));
         assert!(text.contains("uid=evt-3"));
         assert!(text.contains("next_cursor: cursor-next"));
+    }
+
+    #[test]
+    fn format_get_session_includes_summary_fields() {
+        let payload = json!({
+            "found": true,
+            "session_id": "sess-1",
+            "session": {
+                "session_id": "sess-1",
+                "first_event_time": "2026-01-02 12:00:00",
+                "first_event_unix_ms": 1767355200000_i64,
+                "last_event_time": "2026-01-02 12:05:00",
+                "last_event_unix_ms": 1767355500000_i64,
+                "total_events": 22_u64,
+                "total_turns": 3_u32,
+                "user_messages": 5_u64,
+                "assistant_messages": 5_u64,
+                "tool_calls": 2_u64,
+                "tool_results": 2_u64,
+                "mode": "web_search",
+                "first_event_uid": "evt-0001",
+                "last_event_uid": "evt-0022",
+                "last_actor_role": "assistant"
+            }
+        });
+
+        let text = format_get_session_prose(&payload).expect("format");
+        assert!(text.contains("Session: sess-1"));
+        assert!(text.contains("Mode: web_search"));
+        assert!(text
+            .contains("Counts: events=22 turns=3 user=5 assistant=5 tool_calls=2 tool_results=2"));
+        assert!(text.contains("Boundary event_uids: first=evt-0001 last=evt-0022"));
+        assert!(text.contains("Last actor role: assistant"));
+    }
+
+    #[test]
+    fn format_get_session_handles_not_found_payload() {
+        let payload = json!({
+            "found": false,
+            "session_id": "sess-missing",
+            "error": {
+                "code": "not_found",
+                "message": "session_id was not found"
+            }
+        });
+
+        let text = format_get_session_prose(&payload).expect("format");
+        assert!(text.contains("Session: sess-missing"));
+        assert!(text.contains("Not found (not_found): session_id was not found"));
+    }
+
+    #[test]
+    fn build_get_session_payload_returns_structured_invalid_argument() {
+        let payload = AppState::build_get_session_payload(
+            "sess bad".to_string(),
+            Err(RepoError::invalid_argument(
+                "session_id contains unsupported characters",
+            )),
+        )
+        .expect("payload");
+
+        assert_eq!(payload["found"], json!(false));
+        assert_eq!(payload["session_id"], json!("sess bad"));
+        assert_eq!(payload["error"]["code"], json!("invalid_argument"));
+        assert_eq!(
+            payload["error"]["message"],
+            json!("session_id contains unsupported characters")
+        );
+    }
+
+    #[test]
+    fn format_get_session_handles_invalid_argument_payload() {
+        let payload = json!({
+            "found": false,
+            "session_id": "sess bad",
+            "error": {
+                "code": "invalid_argument",
+                "message": "session_id contains unsupported characters"
+            }
+        });
+
+        let text = format_get_session_prose(&payload).expect("format");
+        assert!(text.contains("Session: sess bad"));
+        assert!(text.contains(
+            "Not found (invalid_argument): session_id contains unsupported characters"
+        ));
     }
 }

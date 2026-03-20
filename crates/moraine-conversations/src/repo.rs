@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, OpenContext, OpenEventRequest, Page, PageRequest, SearchEventsQuery,
-    SearchEventsResult, SessionEventsQuery, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SearchEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter,
+    TurnSummary,
 };
 use crate::error::RepoResult;
 
@@ -20,6 +21,8 @@ pub trait ConversationRepository: Send + Sync {
         session_id: &str,
         opts: ConversationDetailOptions,
     ) -> RepoResult<Option<Conversation>>;
+
+    async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>>;
 
     async fn list_turns(
         &self,

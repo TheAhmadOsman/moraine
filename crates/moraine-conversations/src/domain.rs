@@ -84,6 +84,25 @@ pub struct ConversationSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub session_id: String,
+    pub first_event_time: String,
+    pub first_event_unix_ms: i64,
+    pub last_event_time: String,
+    pub last_event_unix_ms: i64,
+    pub total_turns: u32,
+    pub total_events: u64,
+    pub user_messages: u64,
+    pub assistant_messages: u64,
+    pub tool_calls: u64,
+    pub tool_results: u64,
+    pub mode: ConversationMode,
+    pub first_event_uid: String,
+    pub last_event_uid: String,
+    pub last_actor_role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub summary: ConversationSummary,
     pub turns: Vec<TurnSummary>,

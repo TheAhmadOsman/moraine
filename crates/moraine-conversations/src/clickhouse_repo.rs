@@ -21,7 +21,7 @@ use crate::domain::{
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
     SearchEventsResult, SearchEventsStats, SearchEventsStrategy, SessionEventsDirection,
-    SessionEventsQuery, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -68,6 +68,28 @@ struct ConversationSummaryRow {
     tool_calls: u64,
     tool_results: u64,
     mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionMetadataRow {
+    session_id: String,
+    first_event_time: String,
+    first_event_unix_ms: i64,
+    last_event_time: String,
+    last_event_unix_ms: i64,
+    total_turns: u32,
+    total_events: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    tool_calls: u64,
+    tool_results: u64,
+    mode: String,
+    #[serde(default)]
+    first_event_uid: String,
+    #[serde(default)]
+    last_event_uid: String,
+    #[serde(default)]
+    last_actor_role: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -756,6 +778,26 @@ GROUP BY session_id"
         }
     }
 
+    fn map_session_metadata_row(row: SessionMetadataRow) -> SessionMetadata {
+        SessionMetadata {
+            session_id: row.session_id,
+            first_event_time: row.first_event_time,
+            first_event_unix_ms: row.first_event_unix_ms,
+            last_event_time: row.last_event_time,
+            last_event_unix_ms: row.last_event_unix_ms,
+            total_turns: row.total_turns,
+            total_events: row.total_events,
+            user_messages: row.user_messages,
+            assistant_messages: row.assistant_messages,
+            tool_calls: row.tool_calls,
+            tool_results: row.tool_results,
+            mode: Self::parse_mode(&row.mode),
+            first_event_uid: row.first_event_uid,
+            last_event_uid: row.last_event_uid,
+            last_actor_role: row.last_actor_role,
+        }
+    }
+
     fn map_turn_row(row: TurnSummaryRow) -> TurnSummary {
         TurnSummary {
             session_id: row.session_id,
@@ -858,6 +900,53 @@ FORMAT JSONEachRow",
         let rows: Vec<ConversationSummaryRow> =
             self.map_backend(self.ch.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_conversation_row))
+    }
+
+    async fn load_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
+        let session_summary = self.table_ref("v_session_summary");
+        let mode_subquery = self.mode_subquery();
+        let events_table = self.table_ref("events");
+        let query = format!(
+            "SELECT
+  s.session_id,
+  toString(s.first_event_time) AS first_event_time,
+  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+  toString(s.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+  toUInt32(s.total_turns) AS total_turns,
+  toUInt64(s.total_events) AS total_events,
+  toUInt64(s.user_messages) AS user_messages,
+  toUInt64(s.assistant_messages) AS assistant_messages,
+  toUInt64(s.tool_calls) AS tool_calls,
+  toUInt64(s.tool_results) AS tool_results,
+  ifNull(m.mode, 'chat') AS mode,
+  ifNull(e.first_event_uid, '') AS first_event_uid,
+  ifNull(e.last_event_uid, '') AS last_event_uid,
+  ifNull(e.last_actor_role, '') AS last_actor_role
+FROM {session_summary} AS s
+LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
+LEFT JOIN (
+  SELECT
+    session_id,
+    argMin(event_uid, tuple(event_ts, event_order, event_uid)) AS first_event_uid,
+    argMax(event_uid, tuple(event_ts, event_order, event_uid)) AS last_event_uid,
+    argMax(actor_role, tuple(event_ts, event_order, event_uid)) AS last_actor_role
+  FROM {events_table}
+  WHERE session_id = {session_id_sql}
+  GROUP BY session_id
+) AS e ON e.session_id = s.session_id
+WHERE s.session_id = {session_id_sql}
+LIMIT 1
+FORMAT JSONEachRow",
+            session_summary = session_summary,
+            mode_subquery = mode_subquery,
+            events_table = events_table,
+            session_id_sql = sql_quote(session_id),
+        );
+
+        let rows: Vec<SessionMetadataRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::map_session_metadata_row))
     }
 
     async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
@@ -2816,6 +2905,11 @@ FORMAT JSONEachRow",
         };
 
         Ok(Some(Conversation { summary, turns }))
+    }
+
+    async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
+        Self::validate_session_id(session_id)?;
+        self.load_session_metadata(session_id).await
     }
 
     async fn list_turns(
