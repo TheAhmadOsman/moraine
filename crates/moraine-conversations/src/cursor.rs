@@ -2,7 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::SessionEventsDirection;
+use crate::domain::{ConversationListSort, SessionEventsDirection};
 use crate::error::{RepoError, RepoResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,6 +10,8 @@ pub struct ConversationCursor {
     pub last_event_unix_ms: i64,
     pub session_id: String,
     pub filter_sig: String,
+    #[serde(default)]
+    pub sort: ConversationListSort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

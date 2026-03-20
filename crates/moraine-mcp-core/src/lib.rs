@@ -3,9 +3,10 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
     is_user_facing_content_event, ClickHouseConversationRepository, ConversationListFilter,
-    ConversationMode, ConversationRepository, ConversationSearchQuery, ConversationSearchResults,
-    OpenEventRequest, PageRequest, RepoConfig, RepoError, SearchEventKind, SearchEventsQuery,
-    SearchEventsResult, SessionEventsDirection, SessionEventsQuery,
+    ConversationListSort, ConversationMode, ConversationRepository, ConversationSearchQuery,
+    ConversationSearchResults, OpenEventRequest, PageRequest, RepoConfig, RepoError,
+    SearchEventKind, SearchEventsQuery, SearchEventsResult, SessionEventsDirection,
+    SessionEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -124,6 +125,8 @@ struct ListSessionsArgs {
     to_unix_ms: Option<i64>,
     #[serde(default)]
     mode: Option<ConversationMode>,
+    #[serde(default)]
+    sort: Option<ConversationListSort>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -313,6 +316,8 @@ struct SessionListProsePayload {
     sessions: Vec<SessionListProseSession>,
     #[serde(default)]
     next_cursor: Option<String>,
+    #[serde(default)]
+    sort: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -609,6 +614,12 @@ impl AppState {
                                 "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
                                 "description": SEARCH_CONVERSATIONS_MODE_DOC
                             },
+                            "sort": {
+                                "type": "string",
+                                "enum": ["asc", "desc"],
+                                "default": "desc",
+                                "description": "Sort by session end time then session_id. Use `desc` for newest-first or `asc` for oldest-first. Cursor tokens are deterministic for a fixed filter + sort."
+                            },
                             "verbosity": {
                                 "type": "string",
                                 "enum": ["prose", "full"],
@@ -719,12 +730,14 @@ impl AppState {
                 }
             }
             "list_sessions" => {
-                let args: ListSessionsArgs = if params.arguments.is_null() {
+                let mut args: ListSessionsArgs = if params.arguments.is_null() {
                     ListSessionsArgs::default()
                 } else {
                     serde_json::from_value(params.arguments)
                         .context("list_sessions expects a JSON object with optional filters")?
                 };
+                args.limit =
+                    validate_tool_limit("list_sessions", args.limit, self.cfg.mcp.max_results)?;
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.list_sessions(args).await?;
                 match verbosity {
@@ -837,8 +850,10 @@ impl AppState {
             from_unix_ms,
             to_unix_ms,
             mode,
+            sort,
             verbosity: _,
         } = args;
+        let sort = sort.unwrap_or_default();
 
         let page = self
             .repo
@@ -847,6 +862,7 @@ impl AppState {
                     from_unix_ms,
                     to_unix_ms,
                     mode,
+                    sort,
                 },
                 PageRequest {
                     limit: limit.unwrap_or(self.cfg.mcp.max_results),
@@ -881,6 +897,7 @@ impl AppState {
             "from_unix_ms": from_unix_ms,
             "to_unix_ms": to_unix_ms,
             "mode": mode.map(ConversationMode::as_str),
+            "sort": sort.as_str(),
             "sessions": sessions,
             "next_cursor": page.next_cursor,
         }))
@@ -1361,6 +1378,12 @@ fn format_session_list_prose(payload: &Value) -> Result<String> {
     let mut out = String::new();
     out.push_str("Session List\n");
     out.push_str(&format!("Sessions: {}\n", parsed.sessions.len()));
+    let sort = if parsed.sort.is_empty() {
+        "desc"
+    } else {
+        parsed.sort.as_str()
+    };
+    out.push_str(&format!("Sort: {}\n", sort));
 
     if parsed.sessions.is_empty() {
         out.push_str("\nNo sessions.");
@@ -2026,11 +2049,13 @@ mod tests {
     fn format_session_list_handles_empty_result() {
         let payload = json!({
             "sessions": [],
+            "sort": "desc",
             "next_cursor": null
         });
 
         let text = format_session_list_prose(&payload).expect("format");
         assert!(text.contains("Session List"));
+        assert!(text.contains("Sort: desc"));
         assert!(text.contains("No sessions"));
     }
 
@@ -2048,11 +2073,13 @@ mod tests {
                     "mode": "web_search"
                 }
             ],
+            "sort": "asc",
             "next_cursor": "cursor-token"
         });
 
         let text = format_session_list_prose(&payload).expect("format");
         assert!(text.contains("session=sess-1"));
+        assert!(text.contains("Sort: asc"));
         assert!(text.contains("mode=web_search"));
         assert!(text.contains("next_cursor: cursor-token"));
     }

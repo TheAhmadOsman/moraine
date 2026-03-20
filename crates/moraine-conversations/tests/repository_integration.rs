@@ -11,9 +11,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, RepoError,
-    SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
+    RepoError, SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
 };
 use serde_json::json;
 
@@ -201,6 +201,80 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "first_event_uid": "evt-c-1",
                         "last_event_uid": "evt-c-42",
                         "last_actor_role": "assistant"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("ORDER BY s.last_event_time ASC")
+        {
+            if query.contains("s.session_id > 'sess_b'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess_c",
+                            "first_event_time": "2026-01-03 10:00:00",
+                            "first_event_unix_ms": 1767434400000_i64,
+                            "last_event_time": "2026-01-03 10:10:00",
+                            "last_event_unix_ms": 1767435000000_i64,
+                            "total_turns": 3,
+                            "total_events": 30,
+                            "user_messages": 6,
+                            "assistant_messages": 6,
+                            "tool_calls": 3,
+                            "tool_results": 3,
+                            "mode": "web_search"
+                        }
+                    ])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1767261600000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1767262200000_i64,
+                        "total_turns": 2,
+                        "total_events": 20,
+                        "user_messages": 4,
+                        "assistant_messages": 4,
+                        "tool_calls": 2,
+                        "tool_results": 2,
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_b",
+                        "first_event_time": "2026-01-02 10:00:00",
+                        "first_event_unix_ms": 1767348000000_i64,
+                        "last_event_time": "2026-01-02 10:10:00",
+                        "last_event_unix_ms": 1767348600000_i64,
+                        "total_turns": 2,
+                        "total_events": 22,
+                        "user_messages": 4,
+                        "assistant_messages": 4,
+                        "tool_calls": 2,
+                        "tool_results": 2,
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "total_turns": 3,
+                        "total_events": 30,
+                        "user_messages": 6,
+                        "assistant_messages": 6,
+                        "tool_calls": 3,
+                        "tool_results": 3,
+                        "mode": "web_search"
                     }
                 ])),
             );
@@ -624,6 +698,7 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
         from_unix_ms: Some(1767261600000_i64),
         to_unix_ms: Some(1767500000000_i64),
         mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Desc,
     };
 
     let first = repo
@@ -666,6 +741,107 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
+    assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_conversations_supports_ascending_sort_with_deterministic_cursor() {
+    let (repo, state) = build_repo().await;
+
+    let filter = ConversationListFilter {
+        from_unix_ms: Some(1767261600000_i64),
+        to_unix_ms: Some(1767500000000_i64),
+        mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Asc,
+    };
+
+    let first = repo
+        .list_conversations(
+            filter.clone(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].session_id, "sess_a");
+    assert_eq!(first.items[1].session_id, "sess_b");
+    assert!(first.next_cursor.is_some());
+
+    let second = repo
+        .list_conversations(
+            filter,
+            PageRequest {
+                limit: 2,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .expect("second page");
+
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].session_id, "sess_c");
+    assert!(second.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let first_query = queries
+        .iter()
+        .find(|q| q.contains("ORDER BY s.last_event_time ASC, s.session_id ASC"))
+        .expect("ascending list query should be captured");
+    assert!(first_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
+
+    let paged_query = queries
+        .iter()
+        .find(|q| q.contains("s.session_id > 'sess_b'"))
+        .expect("ascending pagination query should include deterministic cursor predicate");
+    assert!(paged_query.contains("toUnixTimestamp64Milli(s.last_event_time) > 1767348600000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_conversations_rejects_cursor_when_sort_changes() {
+    let (repo, _state) = build_repo().await;
+
+    let desc_filter = ConversationListFilter {
+        from_unix_ms: Some(1767261600000_i64),
+        to_unix_ms: Some(1767500000000_i64),
+        mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Desc,
+    };
+    let asc_filter = ConversationListFilter {
+        sort: ConversationListSort::Asc,
+        ..desc_filter.clone()
+    };
+
+    let first = repo
+        .list_conversations(
+            desc_filter,
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+    let cursor = first.next_cursor.expect("next cursor");
+
+    let err = repo
+        .list_conversations(
+            asc_filter,
+            PageRequest {
+                limit: 1,
+                cursor: Some(cursor),
+            },
+        )
+        .await
+        .expect_err("sort mismatch should fail");
+
+    assert_eq!(
+        err.to_string(),
+        "invalid cursor: cursor does not match current conversation filter"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
