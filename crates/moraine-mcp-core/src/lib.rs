@@ -2,11 +2,11 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    is_user_facing_content_event, ClickHouseConversationRepository, ConversationListFilter,
-    ConversationListSort, ConversationMode, ConversationRepository, ConversationSearchQuery,
-    ConversationSearchResults, OpenEventRequest, PageRequest, RepoConfig, RepoError,
-    SearchEventKind, SearchEventsQuery, SearchEventsResult, SessionEventsDirection,
-    SessionEventsQuery,
+    is_user_facing_content_event, ClickHouseConversationRepository, ConversationDetailOptions,
+    ConversationListFilter, ConversationListSort, ConversationMode, ConversationRepository,
+    ConversationSearchQuery, ConversationSearchResults, OpenEventRequest, PageRequest, RepoConfig,
+    RepoError, SearchEventKind, SearchEventsQuery, SearchEventsResult, SessionEventsDirection,
+    SessionEventsQuery, TurnListFilter,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -140,7 +140,18 @@ struct GetSessionArgs {
 
 #[derive(Debug, Deserialize)]
 struct OpenArgs {
-    event_uid: String,
+    #[serde(default)]
+    event_uid: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    scope: Option<OpenScope>,
+    #[serde(default)]
+    include_payload: Option<OpenPayloadArg>,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    cursor: Option<String>,
     #[serde(default)]
     before: Option<u16>,
     #[serde(default)]
@@ -149,6 +160,71 @@ struct OpenArgs {
     include_system_events: Option<bool>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OpenScope {
+    #[default]
+    All,
+    Messages,
+    Events,
+    Turns,
+}
+
+impl OpenScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Messages => "messages",
+            Self::Events => "events",
+            Self::Turns => "turns",
+        }
+    }
+
+    fn include_events(self) -> bool {
+        matches!(self, Self::All | Self::Messages | Self::Events)
+    }
+
+    fn include_turns(self) -> bool {
+        matches!(self, Self::All | Self::Turns)
+    }
+
+    fn messages_only(self) -> bool {
+        matches!(self, Self::Messages)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenPayloadField {
+    Text,
+    PayloadJson,
+}
+
+impl OpenPayloadField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::PayloadJson => "payload_json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OpenPayloadArg {
+    One(OpenPayloadField),
+    Many(Vec<OpenPayloadField>),
+}
+
+impl OpenPayloadArg {
+    fn into_vec(self) -> Vec<OpenPayloadField> {
+        match self {
+            Self::One(field) => vec![field],
+            Self::Many(fields) => fields,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +326,76 @@ struct OpenProseEvent {
     payload_type: String,
     #[serde(default)]
     text_content: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenSessionProsePayload {
+    #[serde(default)]
+    found: bool,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    include_system_events: bool,
+    #[serde(default)]
+    include_payload: Vec<String>,
+    #[serde(default)]
+    limit: u16,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+    #[serde(default)]
+    summary: Option<OpenSessionProseSummary>,
+    #[serde(default)]
+    turns: Vec<OpenSessionProseTurn>,
+    #[serde(default)]
+    events: Vec<OpenSessionProseEvent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenSessionProseSummary {
+    #[serde(default)]
+    start_time: String,
+    #[serde(default)]
+    start_unix_ms: i64,
+    #[serde(default)]
+    end_time: String,
+    #[serde(default)]
+    end_unix_ms: i64,
+    #[serde(default)]
+    event_count: u64,
+    #[serde(default)]
+    turn_count: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenSessionProseTurn {
+    #[serde(default)]
+    turn_seq: u32,
+    #[serde(default)]
+    started_at: String,
+    #[serde(default)]
+    ended_at: String,
+    #[serde(default)]
+    event_count: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenSessionProseEvent {
+    #[serde(default)]
+    event_order: u64,
+    #[serde(default)]
+    actor_role: String,
+    #[serde(default)]
+    event_class: String,
+    #[serde(default)]
+    payload_type: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -547,11 +693,34 @@ impl AppState {
                 },
                 {
                     "name": "open",
-                    "description": "Open one event by uid with surrounding conversation context.",
+                    "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "event_uid": { "type": "string" },
+                            "session_id": { "type": "string" },
+                            "scope": {
+                                "type": "string",
+                                "enum": ["all", "messages", "events", "turns"],
+                                "default": "all"
+                            },
+                            "include_payload": {
+                                "oneOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": ["text", "payload_json"]
+                                    },
+                                    {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string",
+                                            "enum": ["text", "payload_json"]
+                                        }
+                                    }
+                                ]
+                            },
+                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                            "cursor": { "type": "string" },
                             "before": { "type": "integer", "minimum": 0 },
                             "after": { "type": "integer", "minimum": 0 },
                             "include_system_events": { "type": "boolean", "default": false },
@@ -561,7 +730,10 @@ impl AppState {
                                 "default": "prose"
                             }
                         },
-                        "required": ["event_uid"]
+                        "oneOf": [
+                            { "required": ["event_uid"] },
+                            { "required": ["session_id"] }
+                        ]
                     }
                 },
                 {
@@ -700,8 +872,9 @@ impl AppState {
                 }
             }
             "open" => {
-                let args: OpenArgs = serde_json::from_value(params.arguments)
-                    .context("open expects {\"event_uid\": ...}")?;
+                let mut args: OpenArgs = serde_json::from_value(params.arguments)
+                    .context("open expects one of {\"event_uid\": ...} or {\"session_id\": ...}")?;
+                args.limit = validate_tool_limit("open", args.limit, self.cfg.mcp.max_results)?;
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.open(args).await?;
                 match verbosity {
@@ -799,10 +972,34 @@ impl AppState {
     }
 
     async fn open(&self, args: OpenArgs) -> Result<Value> {
+        let event_uid = args
+            .event_uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let session_id = args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        match (event_uid, session_id) {
+            (Some(_), Some(_)) => Err(anyhow!(
+                "open expects exactly one of event_uid or session_id"
+            )),
+            (None, None) => Err(anyhow!("open expects one of event_uid or session_id")),
+            (Some(event_uid), None) => self.open_by_event_uid(event_uid, args).await,
+            (None, Some(session_id)) => self.open_by_session_id(session_id, args).await,
+        }
+    }
+
+    async fn open_by_event_uid(&self, event_uid: String, args: OpenArgs) -> Result<Value> {
         let result = self
             .repo
             .open_event(OpenEventRequest {
-                event_uid: args.event_uid,
+                event_uid,
                 before: args.before,
                 after: args.after,
                 include_system_events: args.include_system_events,
@@ -819,6 +1016,145 @@ impl AppState {
         }
 
         serde_json::to_value(result).context("failed to encode open result payload")
+    }
+
+    async fn open_by_session_id(&self, session_id: String, args: OpenArgs) -> Result<Value> {
+        let scope = args.scope.unwrap_or_default();
+        let include_system_events = args.include_system_events.unwrap_or(false);
+        let include_payload_fields = args
+            .include_payload
+            .map(OpenPayloadArg::into_vec)
+            .unwrap_or_default();
+        let include_text = include_payload_fields.contains(&OpenPayloadField::Text);
+        let include_payload_json = include_payload_fields.contains(&OpenPayloadField::PayloadJson);
+        let limit = args.limit.unwrap_or(self.cfg.mcp.max_results);
+        let cursor = args.cursor;
+
+        let Some(conversation) = self
+            .repo
+            .get_conversation(
+                &session_id,
+                ConversationDetailOptions {
+                    include_turns: false,
+                },
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?
+        else {
+            return Ok(json!({
+                "open_mode": "session",
+                "found": false,
+                "session_id": session_id,
+                "scope": scope.as_str(),
+                "events": [],
+                "turns": [],
+                "next_cursor": Value::Null,
+            }));
+        };
+
+        let turn_page = self
+            .repo
+            .list_turns(
+                &session_id,
+                TurnListFilter::default(),
+                PageRequest {
+                    limit,
+                    cursor: cursor.clone(),
+                },
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let turns = turn_page
+            .items
+            .iter()
+            .map(|turn| {
+                json!({
+                    "turn_seq": turn.turn_seq,
+                    "started_at": turn.started_at,
+                    "started_at_unix_ms": turn.started_at_unix_ms,
+                    "ended_at": turn.ended_at,
+                    "ended_at_unix_ms": turn.ended_at_unix_ms,
+                    "event_count": turn.total_events,
+                    "user_messages": turn.user_messages,
+                    "assistant_messages": turn.assistant_messages,
+                    "tool_calls": turn.tool_calls,
+                    "tool_results": turn.tool_results,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let events = if scope.include_events() {
+            let mut session_events = Vec::new();
+            for turn in &turn_page.items {
+                let Some(turn_detail) = self
+                    .repo
+                    .get_turn(&session_id, turn.turn_seq)
+                    .await
+                    .map_err(|err| anyhow!(err.to_string()))?
+                else {
+                    continue;
+                };
+
+                for event in turn_detail.events {
+                    if !include_system_events
+                        && is_low_information_system_event(&event.actor_role, &event.payload_type)
+                    {
+                        continue;
+                    }
+                    if scope.messages_only() && !event.event_class.eq_ignore_ascii_case("message") {
+                        continue;
+                    }
+
+                    let mut event_payload = json!({
+                        "event_uid": event.event_uid,
+                        "event_order": event.event_order,
+                        "turn_seq": event.turn_seq,
+                        "event_time": event.event_time,
+                        "actor_role": event.actor_role,
+                        "event_class": event.event_class,
+                        "payload_type": event.payload_type,
+                    });
+                    if include_text {
+                        event_payload["text_content"] = Value::String(event.text_content);
+                    }
+                    if include_payload_json {
+                        event_payload["payload_json"] = Value::String(event.payload_json);
+                    }
+                    session_events.push(event_payload);
+                }
+            }
+            session_events
+        } else {
+            Vec::new()
+        };
+
+        let include_payload = include_payload_fields
+            .into_iter()
+            .map(OpenPayloadField::as_str)
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "open_mode": "session",
+            "found": true,
+            "session_id": session_id,
+            "scope": scope.as_str(),
+            "include_system_events": include_system_events,
+            "include_payload": include_payload,
+            "limit": limit,
+            "cursor": cursor,
+            "next_cursor": turn_page.next_cursor,
+            "summary": {
+                "start_time": conversation.summary.first_event_time,
+                "start_unix_ms": conversation.summary.first_event_unix_ms,
+                "end_time": conversation.summary.last_event_time,
+                "end_unix_ms": conversation.summary.last_event_unix_ms,
+                "event_count": conversation.summary.total_events,
+                "turn_count": conversation.summary.total_turns,
+            },
+            "turns": if scope.include_turns() { turns } else { Vec::new() },
+            "events": events,
+        }))
     }
 
     async fn search_conversations(&self, args: SearchConversationsArgs) -> Result<Value> {
@@ -1204,6 +1540,10 @@ fn format_search_prose(payload: &Value) -> Result<String> {
 }
 
 fn format_open_prose(payload: &Value) -> Result<String> {
+    if payload.get("open_mode").and_then(Value::as_str) == Some("session") {
+        return format_open_session_prose(payload);
+    }
+
     let mut parsed: OpenProsePayload =
         serde_json::from_value(payload.clone()).context("failed to parse open payload")?;
 
@@ -1263,6 +1603,98 @@ fn format_open_prose(payload: &Value) -> Result<String> {
         for event in &after_events {
             append_open_event_line(&mut out, event);
         }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn format_open_session_prose(payload: &Value) -> Result<String> {
+    let parsed: OpenSessionProsePayload =
+        serde_json::from_value(payload.clone()).context("failed to parse open session payload")?;
+
+    let mut out = String::new();
+    out.push_str(&format!("Open session: {}\n", parsed.session_id));
+
+    if !parsed.found {
+        out.push_str("Not found.");
+        return Ok(out);
+    }
+
+    let scope = if parsed.scope.is_empty() {
+        OpenScope::All.as_str()
+    } else {
+        parsed.scope.as_str()
+    };
+    out.push_str(&format!("Scope: {}\n", scope));
+    out.push_str(&format!(
+        "System events: {}\n",
+        if parsed.include_system_events {
+            "included"
+        } else {
+            "filtered"
+        }
+    ));
+    out.push_str(&format!("Turn page limit: {}\n", parsed.limit));
+
+    if !parsed.include_payload.is_empty() {
+        out.push_str(&format!(
+            "Payload fields: {}\n",
+            parsed.include_payload.join(", ")
+        ));
+    }
+
+    if let Some(summary) = parsed.summary.as_ref() {
+        out.push_str(&format!(
+            "Session window: {} -> {}\n",
+            summary.start_time, summary.end_time
+        ));
+        out.push_str(&format!(
+            "Session totals: turns={} events={}\n",
+            summary.turn_count, summary.event_count
+        ));
+        out.push_str(&format!(
+            "Session unix_ms: {} -> {}\n",
+            summary.start_unix_ms, summary.end_unix_ms
+        ));
+    }
+
+    if let Some(cursor) = parsed.cursor.as_deref() {
+        out.push_str(&format!("Cursor: {}\n", cursor));
+    }
+    if let Some(next_cursor) = parsed.next_cursor.as_deref() {
+        out.push_str(&format!("Next cursor: {}\n", next_cursor));
+    }
+
+    if !parsed.turns.is_empty() {
+        out.push_str("\nTurns:\n");
+        for turn in &parsed.turns {
+            out.push_str(&format!(
+                "- turn={} events={} {} -> {}\n",
+                turn.turn_seq, turn.event_count, turn.started_at, turn.ended_at
+            ));
+        }
+    }
+
+    if !parsed.events.is_empty() {
+        out.push_str("\nEvents:\n");
+        for event in &parsed.events {
+            out.push_str(&format!(
+                "- [{}] {} {}\n",
+                event.event_order,
+                event.actor_role,
+                display_kind(&event.event_class, &event.payload_type)
+            ));
+            let text = compact_text_line(&event.text_content, 220);
+            if !text.is_empty() {
+                out.push_str(&format!("  {}\n", text));
+            }
+            let payload_json = compact_text_line(&event.payload_json, 220);
+            if !payload_json.is_empty() {
+                out.push_str(&format!("  payload_json: {}\n", payload_json));
+            }
+        }
+    } else if parsed.turns.is_empty() {
+        out.push_str("\nNo transcript data in this page.");
     }
 
     Ok(out.trim_end().to_string())
@@ -1576,6 +2008,14 @@ fn compact_text_line(text: &str, max_chars: usize) -> String {
     let mut trimmed: String = compact.chars().take(max_chars.saturating_sub(3)).collect();
     trimmed.push_str("...");
     trimmed
+}
+
+fn is_low_information_system_event(actor_role: &str, payload_type: &str) -> bool {
+    actor_role.eq_ignore_ascii_case("system")
+        && matches!(
+            payload_type.to_ascii_lowercase().as_str(),
+            "progress" | "file_history_snapshot" | "system"
+        )
 }
 
 pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
@@ -2196,5 +2636,69 @@ mod tests {
         assert!(text.contains("Session: sess bad"));
         assert!(text
             .contains("Not found (invalid_argument): session_id contains unsupported characters"));
+    }
+
+    #[test]
+    fn open_args_accept_session_scope_payload_and_paging() {
+        let args: OpenArgs = serde_json::from_value(json!({
+            "session_id": "sess-42",
+            "scope": "messages",
+            "include_payload": ["text", "payload_json"],
+            "limit": 5,
+            "cursor": "c1"
+        }))
+        .expect("parse open args");
+
+        assert_eq!(args.session_id.as_deref(), Some("sess-42"));
+        assert!(args.event_uid.is_none());
+        assert!(matches!(args.scope, Some(OpenScope::Messages)));
+        assert_eq!(args.limit, Some(5));
+        assert_eq!(args.cursor.as_deref(), Some("c1"));
+        let include_payload = args
+            .include_payload
+            .expect("include payload should parse")
+            .into_vec();
+        assert_eq!(
+            include_payload,
+            vec![OpenPayloadField::Text, OpenPayloadField::PayloadJson]
+        );
+    }
+
+    #[test]
+    fn format_open_prose_formats_session_transcript_payload() {
+        let payload = json!({
+            "open_mode": "session",
+            "found": true,
+            "session_id": "sess-a",
+            "scope": "messages",
+            "include_system_events": false,
+            "include_payload": ["text"],
+            "limit": 10_u16,
+            "cursor": null,
+            "next_cursor": "cursor-next",
+            "summary": {
+                "start_time": "2026-01-01 00:00:00",
+                "start_unix_ms": 1767225600000_i64,
+                "end_time": "2026-01-01 00:10:00",
+                "end_unix_ms": 1767226200000_i64,
+                "event_count": 2_u64,
+                "turn_count": 1_u32
+            },
+            "events": [
+                {
+                    "event_order": 1_u64,
+                    "actor_role": "user",
+                    "event_class": "message",
+                    "payload_type": "text",
+                    "text_content": "hello world"
+                }
+            ]
+        });
+
+        let text = format_open_prose(&payload).expect("format");
+        assert!(text.contains("Open session: sess-a"));
+        assert!(text.contains("Scope: messages"));
+        assert!(text.contains("Next cursor: cursor-next"));
+        assert!(text.contains("hello world"));
     }
 }
