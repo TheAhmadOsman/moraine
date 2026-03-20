@@ -11,7 +11,8 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, SearchEventsQuery,
+    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, SearchEventKind,
+    SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
 };
 use serde_json::json;
 
@@ -300,6 +301,146 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             );
         }
 
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess_c'")
+            && query.contains("ORDER BY event_order ASC, event_uid ASC")
+        {
+            if query.contains("event_order > 2 OR (event_order = 2 AND event_uid > 'evt-2')") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess_c",
+                            "event_uid": "evt-3",
+                            "event_order": 3_u64,
+                            "turn_seq": 2_u32,
+                            "event_time": "2026-01-03 10:02:00",
+                            "actor_role": "assistant",
+                            "event_class": "message",
+                            "payload_type": "text",
+                            "call_id": "",
+                            "name": "",
+                            "phase": "",
+                            "item_id": "itm-3",
+                            "source_ref": "/tmp/sess_c.jsonl:1:3",
+                            "text_content": "assistant answer",
+                            "payload_json": "{\"text\":\"assistant answer\"}",
+                            "token_usage_json": "{}"
+                        }
+                    ])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "event_uid": "evt-1",
+                        "event_order": 1_u64,
+                        "turn_seq": 1_u32,
+                        "event_time": "2026-01-03 10:00:00",
+                        "actor_role": "user",
+                        "event_class": "message",
+                        "payload_type": "text",
+                        "call_id": "",
+                        "name": "",
+                        "phase": "",
+                        "item_id": "itm-1",
+                        "source_ref": "/tmp/sess_c.jsonl:1:1",
+                        "text_content": "user question",
+                        "payload_json": "{\"text\":\"user question\"}",
+                        "token_usage_json": "{}"
+                    },
+                    {
+                        "session_id": "sess_c",
+                        "event_uid": "evt-2",
+                        "event_order": 2_u64,
+                        "turn_seq": 1_u32,
+                        "event_time": "2026-01-03 10:01:00",
+                        "actor_role": "assistant",
+                        "event_class": "reasoning",
+                        "payload_type": "text",
+                        "call_id": "",
+                        "name": "",
+                        "phase": "",
+                        "item_id": "itm-2",
+                        "source_ref": "/tmp/sess_c.jsonl:1:2",
+                        "text_content": "assistant reasoning",
+                        "payload_json": "{\"text\":\"assistant reasoning\"}",
+                        "token_usage_json": "{}"
+                    },
+                    {
+                        "session_id": "sess_c",
+                        "event_uid": "evt-3",
+                        "event_order": 3_u64,
+                        "turn_seq": 2_u32,
+                        "event_time": "2026-01-03 10:02:00",
+                        "actor_role": "assistant",
+                        "event_class": "message",
+                        "payload_type": "text",
+                        "call_id": "",
+                        "name": "",
+                        "phase": "",
+                        "item_id": "itm-3",
+                        "source_ref": "/tmp/sess_c.jsonl:1:3",
+                        "text_content": "assistant answer",
+                        "payload_json": "{\"text\":\"assistant answer\"}",
+                        "token_usage_json": "{}"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess_c'")
+            && query.contains("ORDER BY event_order DESC, event_uid DESC")
+        {
+            if query.contains("event_class = 'message'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess_c",
+                            "event_uid": "evt-3",
+                            "event_order": 3_u64,
+                            "turn_seq": 2_u32,
+                            "event_time": "2026-01-03 10:02:00",
+                            "actor_role": "assistant",
+                            "event_class": "message",
+                            "payload_type": "text",
+                            "call_id": "",
+                            "name": "",
+                            "phase": "",
+                            "item_id": "itm-3",
+                            "source_ref": "/tmp/sess_c.jsonl:1:3",
+                            "text_content": "assistant answer",
+                            "payload_json": "{\"text\":\"assistant answer\"}",
+                            "token_usage_json": "{}"
+                        },
+                        {
+                            "session_id": "sess_c",
+                            "event_uid": "evt-1",
+                            "event_order": 1_u64,
+                            "turn_seq": 1_u32,
+                            "event_time": "2026-01-03 10:00:00",
+                            "actor_role": "user",
+                            "event_class": "message",
+                            "payload_type": "text",
+                            "call_id": "",
+                            "name": "",
+                            "phase": "",
+                            "item_id": "itm-1",
+                            "source_ref": "/tmp/sess_c.jsonl:1:1",
+                            "text_content": "user question",
+                            "payload_json": "{\"text\":\"user question\"}",
+                            "token_usage_json": "{}"
+                        }
+                    ])),
+                );
+            }
+        }
+
         (StatusCode::OK, json_each_row(json!([])))
     }
 
@@ -569,4 +710,93 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_session_events_supports_forward_cursor_pagination() {
+    let (repo, state) = build_repo().await;
+
+    let first = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].event_uid, "evt-1");
+    assert_eq!(first.items[1].event_uid, "evt-2");
+    assert!(first.next_cursor.is_some());
+
+    let second = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 2,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .expect("second page");
+
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].event_uid, "evt-3");
+    assert!(second.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let initial_query = queries
+        .iter()
+        .find(|q| q.contains("ORDER BY event_order ASC, event_uid ASC") && q.contains("LIMIT 3"))
+        .expect("initial page query should be captured");
+    assert!(initial_query.contains("WHERE session_id = 'sess_c'"));
+
+    let paged_query = queries
+        .iter()
+        .find(|q| q.contains("event_order > 2 OR (event_order = 2 AND event_uid > 'evt-2')"))
+        .expect("cursor query should include deterministic pagination clause");
+    assert!(paged_query.contains("ORDER BY event_order ASC, event_uid ASC"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_session_events_supports_reverse_direction_and_event_kind_filter() {
+    let (repo, state) = build_repo().await;
+
+    let page = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Reverse,
+                event_kinds: Some(vec![SearchEventKind::Message]),
+            },
+            PageRequest {
+                limit: 5,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("reverse page");
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].event_uid, "evt-3");
+    assert_eq!(page.items[1].event_uid, "evt-1");
+    assert!(page.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let reverse_query = queries
+        .iter()
+        .find(|q| q.contains("ORDER BY event_order DESC, event_uid DESC"))
+        .expect("reverse query should be captured");
+    assert!(reverse_query.contains("event_class = 'message'"));
 }

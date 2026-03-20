@@ -233,6 +233,32 @@ impl SearchEventKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEventsDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+impl SessionEventsDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventsQuery {
+    pub session_id: String,
+    #[serde(default)]
+    pub direction: SessionEventsDirection,
+    #[serde(default)]
+    pub event_kinds: Option<Vec<SearchEventKind>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchEventsStats {
     pub docs: u64,

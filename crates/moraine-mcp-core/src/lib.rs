@@ -4,7 +4,7 @@ use moraine_config::AppConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
     ConversationRepository, ConversationSearchQuery, OpenEventRequest, PageRequest, RepoConfig,
-    SearchEventKind, SearchEventsQuery,
+    SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -132,6 +132,21 @@ struct OpenArgs {
     after: Option<u16>,
     #[serde(default)]
     include_system_events: Option<bool>,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetSessionEventsArgs {
+    session_id: String,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    direction: Option<SessionEventsDirection>,
+    #[serde(default, alias = "event_kinds", alias = "kind", alias = "kinds")]
+    event_kind: Option<SearchEventKindsArg>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -286,6 +301,40 @@ struct SessionListProsePayload {
     sessions: Vec<SessionListProseSession>,
     #[serde(default)]
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionEventsProsePayload {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    events: Vec<SessionEventsProseEvent>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionEventsProseEvent {
+    #[serde(default)]
+    event_uid: String,
+    #[serde(default)]
+    event_order: u64,
+    #[serde(default)]
+    turn_seq: u32,
+    #[serde(default)]
+    event_time: String,
+    #[serde(default)]
+    actor_role: String,
+    #[serde(default)]
+    event_class: String,
+    #[serde(default)]
+    payload_type: String,
+    #[serde(default)]
+    source_ref: String,
+    #[serde(default)]
+    text_content: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -493,6 +542,44 @@ impl AppState {
                             }
                         }
                     }
+                },
+                {
+                    "name": "get_session_events",
+                    "description": "Fetch an ordered timeline of events for one session with deterministic pagination.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                            "cursor": { "type": "string" },
+                            "direction": {
+                                "type": "string",
+                                "enum": ["forward", "reverse"],
+                                "default": "forward"
+                            },
+                            "event_kind": {
+                                "oneOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                                    },
+                                    {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string",
+                                            "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                                        }
+                                    }
+                                ]
+                            },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        },
+                        "required": ["session_id"]
+                    }
                 }
             ]
         })
@@ -553,6 +640,21 @@ impl AppState {
                 match verbosity {
                     Verbosity::Full => Ok(tool_ok_full(payload)),
                     Verbosity::Prose => Ok(tool_ok_prose(format_session_list_prose(&payload)?)),
+                }
+            }
+            "get_session_events" => {
+                let mut args: GetSessionEventsArgs = serde_json::from_value(params.arguments)
+                    .context("get_session_events expects {\"session_id\": ...}")?;
+                args.limit = validate_tool_limit(
+                    "get_session_events",
+                    args.limit,
+                    self.cfg.mcp.max_results,
+                )?;
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.get_session_events(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => Ok(tool_ok_prose(format_session_events_prose(&payload)?)),
                 }
             }
             other => Err(anyhow!("unknown tool: {other}")),
@@ -676,6 +778,67 @@ impl AppState {
             "to_unix_ms": to_unix_ms,
             "mode": mode.map(ConversationMode::as_str),
             "sessions": sessions,
+            "next_cursor": page.next_cursor,
+        }))
+    }
+
+    async fn get_session_events(&self, args: GetSessionEventsArgs) -> Result<Value> {
+        let GetSessionEventsArgs {
+            session_id,
+            limit,
+            cursor,
+            direction,
+            event_kind,
+            verbosity: _,
+        } = args;
+
+        let direction = direction.unwrap_or_default();
+        let event_kinds = event_kind.map(SearchEventKindsArg::into_vec);
+        let page = self
+            .repo
+            .list_session_events(
+                SessionEventsQuery {
+                    session_id: session_id.clone(),
+                    direction,
+                    event_kinds: event_kinds.clone(),
+                },
+                PageRequest {
+                    limit: limit.unwrap_or(self.cfg.mcp.max_results),
+                    cursor,
+                },
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let events = page
+            .items
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "event_uid": event.event_uid,
+                    "event_order": event.event_order,
+                    "turn_seq": event.turn_seq,
+                    "event_time": event.event_time,
+                    "actor_role": event.actor_role,
+                    "event_class": event.event_class,
+                    "payload_type": event.payload_type,
+                    "call_id": event.call_id,
+                    "name": event.name,
+                    "phase": event.phase,
+                    "item_id": event.item_id,
+                    "source_ref": event.source_ref,
+                    "text_content": event.text_content,
+                    "payload_json": event.payload_json,
+                    "token_usage_json": event.token_usage_json,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "session_id": session_id,
+            "direction": direction.as_str(),
+            "event_kind": event_kinds.map(|kinds| kinds.into_iter().map(SearchEventKind::as_str).collect::<Vec<_>>()),
+            "events": events,
             "next_cursor": page.next_cursor,
         }))
     }
@@ -1022,6 +1185,50 @@ fn format_session_list_prose(payload: &Value) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
+fn format_session_events_prose(payload: &Value) -> Result<String> {
+    let parsed: SessionEventsProsePayload = serde_json::from_value(payload.clone())
+        .context("failed to parse get_session_events payload")?;
+
+    let mut out = String::new();
+    out.push_str(&format!("Session events: {}\n", parsed.session_id));
+    out.push_str(&format!("Direction: {}\n", parsed.direction));
+    out.push_str(&format!("Events: {}\n", parsed.events.len()));
+
+    if parsed.events.is_empty() {
+        out.push_str("\nNo events.");
+        return Ok(out);
+    }
+
+    for (idx, event) in parsed.events.iter().enumerate() {
+        let kind = display_kind(&event.event_class, &event.payload_type);
+        out.push_str(&format!(
+            "\n{}) [{}] {} {} turn={} uid={}\n",
+            idx + 1,
+            event.event_order,
+            event.actor_role,
+            kind,
+            event.turn_seq,
+            event.event_uid
+        ));
+        if !event.event_time.is_empty() {
+            out.push_str(&format!("   time: {}\n", event.event_time));
+        }
+        if !event.source_ref.is_empty() {
+            out.push_str(&format!("   source_ref: {}\n", event.source_ref));
+        }
+        let snippet = compact_text_line(&event.text_content, 220);
+        if !snippet.is_empty() {
+            out.push_str(&format!("   text: {}\n", snippet));
+        }
+    }
+
+    if let Some(cursor) = parsed.next_cursor.as_deref() {
+        out.push_str(&format!("\nnext_cursor: {}", cursor));
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
 fn append_open_event_line(out: &mut String, event: &OpenProseEvent) {
     let kind = display_kind(&event.event_class, &event.payload_type);
     out.push_str(&format!(
@@ -1192,6 +1399,18 @@ mod tests {
             parsed,
             vec![SearchEventKind::Message, SearchEventKind::ToolResult]
         );
+    }
+
+    #[test]
+    fn get_session_events_args_accept_single_event_kind_alias() {
+        let args: GetSessionEventsArgs = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "kind": "tool_call"
+        }))
+        .expect("parse get_session_events args");
+
+        let parsed = args.event_kind.expect("event kind should parse").into_vec();
+        assert_eq!(parsed, vec![SearchEventKind::ToolCall]);
     }
 
     #[test]
@@ -1391,5 +1610,34 @@ mod tests {
         assert!(text.contains("session=sess-1"));
         assert!(text.contains("mode=web_search"));
         assert!(text.contains("next_cursor: cursor-token"));
+    }
+
+    #[test]
+    fn format_session_events_includes_cursor_and_event_details() {
+        let payload = json!({
+            "session_id": "sess-1",
+            "direction": "reverse",
+            "events": [
+                {
+                    "event_uid": "evt-3",
+                    "event_order": 3_u64,
+                    "turn_seq": 2_u32,
+                    "event_time": "2026-01-02 12:05:00",
+                    "actor_role": "assistant",
+                    "event_class": "message",
+                    "payload_type": "text",
+                    "source_ref": "/tmp/sess-1.jsonl:1:3",
+                    "text_content": "assistant answer"
+                }
+            ],
+            "next_cursor": "cursor-next"
+        });
+
+        let text = format_session_events_prose(&payload).expect("format");
+        assert!(text.contains("Session events: sess-1"));
+        assert!(text.contains("Direction: reverse"));
+        assert!(text.contains("[3] assistant message (text)"));
+        assert!(text.contains("uid=evt-3"));
+        assert!(text.contains("next_cursor: cursor-next"));
     }
 }
