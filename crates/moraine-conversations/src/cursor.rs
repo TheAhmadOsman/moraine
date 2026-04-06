@@ -2,6 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::SessionEventsDirection;
 use crate::error::{RepoError, RepoResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +16,15 @@ pub struct ConversationCursor {
 pub struct TurnCursor {
     pub last_turn_seq: u32,
     pub session_id: String,
+    pub filter_sig: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventCursor {
+    pub last_event_order: u64,
+    pub last_event_uid: String,
+    pub session_id: String,
+    pub direction: SessionEventsDirection,
     pub filter_sig: String,
 }
 

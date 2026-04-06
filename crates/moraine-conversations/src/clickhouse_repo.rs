@@ -12,14 +12,16 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::cursor::{decode_cursor, encode_cursor, ConversationCursor, TurnCursor};
+use crate::cursor::{
+    decode_cursor, encode_cursor, ConversationCursor, SessionEventCursor, TurnCursor,
+};
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationMode, ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
-    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, SessionEventsDirection,
+    SessionEventsQuery, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -568,6 +570,26 @@ GROUP BY session_id"
         format!(
             "session={};from={:?};to={:?}",
             session_id, filter.from_turn_seq, filter.to_turn_seq
+        )
+    }
+
+    fn session_events_filter_sig(
+        session_id: &str,
+        direction: SessionEventsDirection,
+        event_kinds: Option<&[SearchEventKind]>,
+    ) -> String {
+        let event_kind_sig = event_kinds
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|| "__none__".to_string());
+        format!(
+            "session={session_id};direction={};event_kinds={event_kind_sig}",
+            direction.as_str()
         )
     }
 
@@ -3141,6 +3163,133 @@ FORMAT JSONEachRow",
             after,
             events,
         })
+    }
+
+    async fn list_session_events(
+        &self,
+        query: SessionEventsQuery,
+        page: PageRequest,
+    ) -> RepoResult<Page<TraceEvent>> {
+        let session_id = query.session_id.trim();
+        if session_id.is_empty() {
+            return Err(RepoError::invalid_argument("session_id cannot be empty"));
+        }
+        Self::validate_session_id(session_id)?;
+
+        let direction = query.direction;
+        let event_kinds = Self::normalize_event_kinds(query.event_kinds)?;
+        let filter_sig =
+            Self::session_events_filter_sig(session_id, direction, event_kinds.as_deref());
+        let limit = page.normalized_limit(self.cfg.max_results);
+
+        let cursor = if let Some(token) = page.cursor.as_deref() {
+            let cursor: SessionEventCursor = decode_cursor(token)?;
+            if cursor.session_id != session_id {
+                return Err(RepoError::invalid_cursor(
+                    "cursor session_id does not match requested session_id",
+                ));
+            }
+            if cursor.direction != direction {
+                return Err(RepoError::invalid_cursor(
+                    "cursor direction does not match requested direction",
+                ));
+            }
+            if cursor.filter_sig != filter_sig {
+                return Err(RepoError::invalid_cursor(
+                    "cursor does not match current session event filter",
+                ));
+            }
+            Some(cursor)
+        } else {
+            None
+        };
+
+        let trace_table = self.table_ref("v_conversation_trace");
+        let mut where_clauses = vec![format!("session_id = {}", sql_quote(session_id))];
+        if let Some(event_kinds) = event_kinds.as_deref() {
+            where_clauses.push(Self::event_kind_filter_clause(
+                "event_class",
+                "payload_type",
+                event_kinds,
+            ));
+        }
+        if let Some(cursor) = &cursor {
+            let cursor_clause = match direction {
+                SessionEventsDirection::Forward => format!(
+                    "(event_order > {} OR (event_order = {} AND event_uid > {}))",
+                    cursor.last_event_order,
+                    cursor.last_event_order,
+                    sql_quote(&cursor.last_event_uid)
+                ),
+                SessionEventsDirection::Reverse => format!(
+                    "(event_order < {} OR (event_order = {} AND event_uid < {}))",
+                    cursor.last_event_order,
+                    cursor.last_event_order,
+                    sql_quote(&cursor.last_event_uid)
+                ),
+            };
+            where_clauses.push(cursor_clause);
+        }
+        let where_sql = where_clauses.join("\n  AND ");
+        let order_by_sql = match direction {
+            SessionEventsDirection::Forward => "event_order ASC, event_uid ASC",
+            SessionEventsDirection::Reverse => "event_order DESC, event_uid DESC",
+        };
+
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json
+FROM {trace_table}
+WHERE {where_sql}
+ORDER BY {order_by_sql}
+LIMIT {limit_plus}
+FORMAT JSONEachRow",
+            trace_table = trace_table,
+            where_sql = where_sql,
+            order_by_sql = order_by_sql,
+            limit_plus = (limit as usize) + 1,
+        );
+
+        let mut rows: Vec<TraceEventRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let has_more = rows.len() > limit as usize;
+        if has_more {
+            rows.truncate(limit as usize);
+        }
+
+        let next_cursor = if has_more {
+            if let Some(last) = rows.last() {
+                Some(encode_cursor(&SessionEventCursor {
+                    last_event_order: last.event_order,
+                    last_event_uid: last.event_uid.clone(),
+                    session_id: session_id.to_string(),
+                    direction,
+                    filter_sig,
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let items = rows.into_iter().map(Self::map_trace_event).collect();
+        Ok(Page { items, next_cursor })
     }
 
     async fn search_events(&self, query: SearchEventsQuery) -> RepoResult<SearchEventsResult> {

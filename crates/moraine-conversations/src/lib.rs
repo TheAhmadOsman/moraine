@@ -10,8 +10,8 @@ pub use domain::{
     ConversationMode, ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
-    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, SessionEventsDirection,
+    SessionEventsQuery, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 pub use error::{RepoError, RepoResult};
 pub use repo::ConversationRepository;
