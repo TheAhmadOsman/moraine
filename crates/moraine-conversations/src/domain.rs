@@ -259,6 +259,12 @@ pub struct SessionEventsQuery {
     pub event_kinds: Option<Vec<SearchEventKind>>,
 }
 
+/// Search/list payloads should only expose richer content for user-facing events.
+pub fn is_user_facing_content_event(event_class: &str, actor_role: &str) -> bool {
+    !actor_role.eq_ignore_ascii_case("system")
+        && matches!(event_class, "message" | "reasoning" | "event_msg")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchEventsStats {
     pub docs: u64,
@@ -289,6 +295,8 @@ pub struct SearchEventHit {
     pub phase: String,
     pub source_ref: String,
     pub text_preview: String,
+    pub text_content: Option<String>,
+    pub payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +356,9 @@ pub struct ConversationSearchHit {
     pub event_count_considered: u32,
     pub best_event_uid: Option<String>,
     pub snippet: Option<String>,
+    pub text_preview: Option<String>,
+    pub text_content: Option<String>,
+    pub payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
@@ -16,9 +17,15 @@ use moraine_conversations::{
 };
 use serde_json::json;
 
+#[derive(Clone, Default)]
+struct MockOptions {
+    omit_second_snippet_row: bool,
+}
+
 #[derive(Default)]
 struct MockState {
     queries: Mutex<Vec<String>>,
+    options: MockOptions,
 }
 
 fn test_clickhouse_config(url: String) -> ClickHouseConfig {
@@ -47,7 +54,7 @@ fn json_each_row(rows: serde_json::Value) -> String {
     }
 }
 
-async fn spawn_mock_server() -> (String, Arc<MockState>) {
+async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
     async fn handler(
         State(state): State<Arc<MockState>>,
         Query(params): Query<HashMap<String, String>>,
@@ -256,6 +263,8 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                         "source_ref": "/tmp/sess_c.jsonl:1:42",
                         "doc_len": 19,
                         "text_preview": "best event in session c",
+                        "text_content": "best event in session c with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-c\"}",
                         "score": 12.5,
                         "matched_terms": 2_u64
                     },
@@ -272,11 +281,41 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                         "source_ref": "/tmp/sess_a.jsonl:1:11",
                         "doc_len": 13,
                         "text_preview": "weaker event in session a",
+                        "text_content": "weaker event in session a with extra context",
+                        "payload_json": "{\"type\":\"message\",\"topic\":\"session-a\"}",
                         "score": 7.0,
                         "matched_terms": 1_u64
                     }
                 ])),
             );
+        }
+
+        if query.contains("WHERE event_uid IN")
+            && query.contains("GROUP BY event_uid")
+            && query.contains("AS text_content")
+            && query.contains("AS payload_json")
+            && query.contains("AS event_class")
+            && query.contains("AS actor_role")
+        {
+            let mut rows = vec![json!({
+                "event_uid": "evt-c-42",
+                "snippet": "best match from session c",
+                "text_content": "best match from session c with extra context",
+                "payload_json": "{\"type\":\"message\",\"topic\":\"session-c\"}",
+                "event_class": "message",
+                "actor_role": "assistant"
+            })];
+            if !state.options.omit_second_snippet_row {
+                rows.push(json!({
+                    "event_uid": "evt-a-11",
+                    "snippet": "weaker match from session a",
+                    "text_content": "weaker match from session a with extra context",
+                    "payload_json": "{\"type\":\"message\",\"topic\":\"session-a\"}",
+                    "event_class": "message",
+                    "actor_role": "assistant"
+                }));
+            }
+            return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
         if query.contains("WHERE event_kind = 'session_meta'")
@@ -397,6 +436,32 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             && query.contains("ORDER BY event_order DESC, event_uid DESC")
         {
             if query.contains("event_class = 'message'") {
+                if query.contains("event_order < 3 OR (event_order = 3 AND event_uid < 'evt-3')") {
+                    return (
+                        StatusCode::OK,
+                        json_each_row(json!([
+                            {
+                                "session_id": "sess_c",
+                                "event_uid": "evt-1",
+                                "event_order": 1_u64,
+                                "turn_seq": 1_u32,
+                                "event_time": "2026-01-03 10:00:00",
+                                "actor_role": "user",
+                                "event_class": "message",
+                                "payload_type": "text",
+                                "call_id": "",
+                                "name": "",
+                                "phase": "",
+                                "item_id": "itm-1",
+                                "source_ref": "/tmp/sess_c.jsonl:1:1",
+                                "text_content": "user question",
+                                "payload_json": "{\"text\":\"user question\"}",
+                                "token_usage_json": "{}"
+                            }
+                        ])),
+                    );
+                }
+
                 return (
                     StatusCode::OK,
                     json_each_row(json!([
@@ -444,7 +509,10 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
         (StatusCode::OK, json_each_row(json!([])))
     }
 
-    let state = Arc::new(MockState::default());
+    let state = Arc::new(MockState {
+        queries: Mutex::default(),
+        options,
+    });
     let app = Router::new()
         .route("/", get(handler).post(handler))
         .with_state(state.clone());
@@ -464,7 +532,14 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
 async fn build_repo_with_max_results(
     max_results: u16,
 ) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    let (base_url, state) = spawn_mock_server().await;
+    build_repo_with_options(max_results, MockOptions::default()).await
+}
+
+async fn build_repo_with_options(
+    max_results: u16,
+    options: MockOptions,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server(options).await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
 
@@ -573,6 +648,18 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         Some("Session C summary")
     );
     assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
+    assert_eq!(
+        result.hits[0].text_preview.as_deref(),
+        Some("best match from session c")
+    );
+    assert_eq!(
+        result.hits[0].text_content.as_deref(),
+        Some("best match from session c with extra context")
+    );
+    assert_eq!(
+        result.hits[0].payload_json.as_deref(),
+        Some("{\"type\":\"message\",\"topic\":\"session-c\"}")
+    );
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(
         result.hits[1].first_event_time.as_deref(),
@@ -581,6 +668,10 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert_eq!(result.hits[1].provider.as_deref(), Some("codex"));
     assert_eq!(result.hits[1].session_slug, None);
     assert_eq!(result.hits[1].session_summary, None);
+    assert_eq!(
+        result.hits[1].text_content.as_deref(),
+        Some("weaker match from session a with extra context")
+    );
     assert_eq!(result.stats.requested_limit, 10);
     assert_eq!(result.stats.effective_limit, 10);
     assert!(!result.stats.limit_capped);
@@ -621,6 +712,43 @@ async fn search_conversations_reports_capped_limit_metadata() {
     assert_eq!(result.stats.requested_limit, 100);
     assert_eq!(result.stats.effective_limit, 25);
     assert!(result.stats.limit_capped);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_falls_back_to_row_snippet_for_text_preview() {
+    let (repo, _state) = build_repo_with_options(
+        100,
+        MockOptions {
+            omit_second_snippet_row: true,
+        },
+    )
+    .await;
+
+    let result = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: Some(1767261600000_i64),
+            to_unix_ms: Some(1767500000000_i64),
+            mode: Some(ConversationMode::Chat),
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    assert_eq!(
+        result.hits[1].snippet.as_deref(),
+        Some("weaker match from session a")
+    );
+    assert_eq!(
+        result.hits[1].text_preview.as_deref(),
+        Some("weaker match from session a")
+    );
+    assert!(result.hits[1].text_content.is_none());
+    assert!(result.hits[1].payload_json.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -707,6 +835,14 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[0].session_id, "sess_c");
     assert_eq!(result.hits[0].first_event_time, "2026-01-03 10:00:00");
     assert_eq!(result.hits[0].last_event_time, "2026-01-03 10:10:00");
+    assert_eq!(
+        result.hits[0].text_content.as_deref(),
+        Some("best event in session c with extra context")
+    );
+    assert_eq!(
+        result.hits[0].payload_json.as_deref(),
+        Some("{\"type\":\"message\",\"topic\":\"session-c\"}")
+    );
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
@@ -799,4 +935,90 @@ async fn list_session_events_supports_reverse_direction_and_event_kind_filter() 
         .find(|q| q.contains("ORDER BY event_order DESC, event_uid DESC"))
         .expect("reverse query should be captured");
     assert!(reverse_query.contains("event_class = 'message'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_session_events_supports_reverse_cursor_pagination() {
+    let (repo, state) = build_repo().await;
+
+    let first = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Reverse,
+                event_kinds: Some(vec![SearchEventKind::Message]),
+            },
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first reverse page");
+
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].event_uid, "evt-3");
+    assert!(first.next_cursor.is_some());
+
+    let second = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Reverse,
+                event_kinds: Some(vec![SearchEventKind::Message]),
+            },
+            PageRequest {
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .expect("second reverse page");
+
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].event_uid, "evt-1");
+    assert!(second.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let paged_query = queries
+        .iter()
+        .find(|q| q.contains("event_order < 3 OR (event_order = 3 AND event_uid < 'evt-3')"))
+        .expect("reverse cursor query should include deterministic pagination clause");
+    assert!(paged_query.contains("ORDER BY event_order DESC, event_uid DESC"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_session_events_rejects_cursor_with_mismatched_direction() {
+    let (repo, state) = build_repo().await;
+    let cursor = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "last_event_order": 3_u64,
+            "last_event_uid": "evt-3",
+            "session_id": "sess_c",
+            "direction": "reverse",
+            "filter_sig": "session=sess_c;direction=reverse;event_kinds=__none__"
+        }))
+        .expect("serialize cursor"),
+    );
+
+    let err = repo
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "sess_c".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 2,
+                cursor: Some(cursor),
+            },
+        )
+        .await
+        .expect_err("mismatched direction cursor must fail");
+
+    assert_eq!(
+        err.to_string(),
+        "invalid cursor: cursor direction does not match requested direction"
+    );
+    assert!(state.queries.lock().expect("queries lock").is_empty());
 }

@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, OpenEventRequest, PageRequest, RepoConfig,
-    SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    is_user_facing_content_event, ClickHouseConversationRepository, ConversationListFilter,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, ConversationSearchResults,
+    OpenEventRequest, PageRequest, RepoConfig, SearchEventKind, SearchEventsQuery,
+    SearchEventsResult, SessionEventsDirection, SessionEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -65,6 +66,8 @@ struct SearchArgs {
     #[serde(default)]
     exclude_codex_mcp: Option<bool>,
     #[serde(default)]
+    include_payload_json: Option<bool>,
+    #[serde(default)]
     verbosity: Option<Verbosity>,
 }
 
@@ -103,6 +106,8 @@ struct SearchConversationsArgs {
     include_tool_events: Option<bool>,
     #[serde(default)]
     exclude_codex_mcp: Option<bool>,
+    #[serde(default)]
+    include_payload_json: Option<bool>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -462,6 +467,11 @@ impl AppState {
                                 ]
                             },
                             "exclude_codex_mcp": { "type": "boolean" },
+                            "include_payload_json": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Include truncated payload_json for user-facing message events."
+                            },
                             "verbosity": {
                                 "type": "string",
                                 "enum": ["prose", "full"],
@@ -511,6 +521,11 @@ impl AppState {
                             },
                             "include_tool_events": { "type": "boolean" },
                             "exclude_codex_mcp": { "type": "boolean" },
+                            "include_payload_json": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Include truncated payload_json for the best event per hit when user-facing."
+                            },
                             "verbosity": {
                                 "type": "string",
                                 "enum": ["prose", "full"],
@@ -545,7 +560,7 @@ impl AppState {
                 },
                 {
                     "name": "get_session_events",
-                    "description": "Fetch an ordered timeline of events for one session with deterministic pagination.",
+                    "description": "Fetch an ordered timeline of events for one session with deterministic pagination. Results follow `direction` (`forward` = chronological, `reverse` = newest-first).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -662,7 +677,8 @@ impl AppState {
     }
 
     async fn search(&self, args: SearchArgs) -> Result<Value> {
-        let result = self
+        let include_payload_json = args.include_payload_json.unwrap_or(false);
+        let mut result = self
             .repo
             .search_events(SearchEventsQuery {
                 query: args.query,
@@ -680,6 +696,7 @@ impl AppState {
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
 
+        apply_search_content_policy(&mut result, include_payload_json);
         serde_json::to_value(result).context("failed to encode search result payload")
     }
 
@@ -707,7 +724,8 @@ impl AppState {
     }
 
     async fn search_conversations(&self, args: SearchConversationsArgs) -> Result<Value> {
-        let result = self
+        let include_payload_json = args.include_payload_json.unwrap_or(false);
+        let mut result = self
             .repo
             .search_conversations(ConversationSearchQuery {
                 query: args.query,
@@ -723,6 +741,7 @@ impl AppState {
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
 
+        apply_conversation_search_content_policy(&mut result, include_payload_json);
         serde_json::to_value(result).context("failed to encode search_conversations result payload")
     }
 
@@ -782,6 +801,29 @@ impl AppState {
         }))
     }
 
+    fn build_session_events_payload(
+        session_id: String,
+        direction: SessionEventsDirection,
+        event_kinds: Option<Vec<SearchEventKind>>,
+        events: Vec<Value>,
+        next_cursor: Option<String>,
+    ) -> Value {
+        let event_kinds = event_kinds.map(|kinds| {
+            kinds
+                .into_iter()
+                .map(SearchEventKind::as_str)
+                .collect::<Vec<_>>()
+        });
+
+        json!({
+            "session_id": session_id,
+            "direction": direction.as_str(),
+            "event_kinds": event_kinds,
+            "events": events,
+            "next_cursor": next_cursor,
+        })
+    }
+
     async fn get_session_events(&self, args: GetSessionEventsArgs) -> Result<Value> {
         let GetSessionEventsArgs {
             session_id,
@@ -834,13 +876,13 @@ impl AppState {
             })
             .collect::<Vec<_>>();
 
-        Ok(json!({
-            "session_id": session_id,
-            "direction": direction.as_str(),
-            "event_kind": event_kinds.map(|kinds| kinds.into_iter().map(SearchEventKind::as_str).collect::<Vec<_>>()),
-            "events": events,
-            "next_cursor": page.next_cursor,
-        }))
+        Ok(Self::build_session_events_payload(
+            session_id,
+            direction,
+            event_kinds,
+            events,
+            page.next_cursor,
+        ))
     }
 }
 
@@ -859,6 +901,31 @@ fn validate_tool_limit(
             "{tool_name} limit must be between {min} and {max} (received {value})"
         )),
         _ => Ok(limit),
+    }
+}
+
+fn apply_search_content_policy(result: &mut SearchEventsResult, include_payload_json: bool) {
+    for hit in &mut result.hits {
+        if !is_user_facing_content_event(&hit.event_class, &hit.actor_role) {
+            hit.text_content = None;
+            hit.payload_json = None;
+            continue;
+        }
+
+        if !include_payload_json {
+            hit.payload_json = None;
+        }
+    }
+}
+
+fn apply_conversation_search_content_policy(
+    result: &mut ConversationSearchResults,
+    include_payload_json: bool,
+) {
+    for hit in &mut result.hits {
+        if !include_payload_json {
+            hit.payload_json = None;
+        }
     }
 }
 
@@ -1411,6 +1478,179 @@ mod tests {
 
         let parsed = args.event_kind.expect("event kind should parse").into_vec();
         assert_eq!(parsed, vec![SearchEventKind::ToolCall]);
+    }
+
+    #[test]
+    fn search_args_accept_include_payload_json_flag() {
+        let args: SearchArgs = serde_json::from_value(json!({
+            "query": "error",
+            "include_payload_json": true
+        }))
+        .expect("parse search args");
+
+        assert_eq!(args.include_payload_json, Some(true));
+    }
+
+    #[test]
+    fn apply_search_content_policy_redacts_non_user_facing_events() {
+        let mut result = SearchEventsResult {
+            query_id: "q1".to_string(),
+            query: "query".to_string(),
+            terms: vec!["query".to_string()],
+            stats: moraine_conversations::SearchEventsStats {
+                docs: 1,
+                avgdl: 1.0,
+                took_ms: 1,
+                result_count: 3,
+                requested_limit: 3,
+                effective_limit: 3,
+                limit_capped: false,
+            },
+            hits: vec![
+                moraine_conversations::SearchEventHit {
+                    rank: 1,
+                    event_uid: "evt-1".to_string(),
+                    session_id: "sess-1".to_string(),
+                    first_event_time: String::new(),
+                    last_event_time: String::new(),
+                    source_name: "src".to_string(),
+                    provider: "provider".to_string(),
+                    score: 1.0,
+                    matched_terms: 1,
+                    doc_len: 1,
+                    event_class: "message".to_string(),
+                    payload_type: "text".to_string(),
+                    actor_role: "assistant".to_string(),
+                    name: String::new(),
+                    phase: String::new(),
+                    source_ref: String::new(),
+                    text_preview: "preview".to_string(),
+                    text_content: Some("full text".to_string()),
+                    payload_json: Some("{\"x\":1}".to_string()),
+                },
+                moraine_conversations::SearchEventHit {
+                    rank: 2,
+                    event_uid: "evt-2".to_string(),
+                    session_id: "sess-1".to_string(),
+                    first_event_time: String::new(),
+                    last_event_time: String::new(),
+                    source_name: "src".to_string(),
+                    provider: "provider".to_string(),
+                    score: 0.9,
+                    matched_terms: 1,
+                    doc_len: 1,
+                    event_class: "tool_result".to_string(),
+                    payload_type: "json".to_string(),
+                    actor_role: "tool".to_string(),
+                    name: "search".to_string(),
+                    phase: String::new(),
+                    source_ref: String::new(),
+                    text_preview: "preview".to_string(),
+                    text_content: Some("tool text".to_string()),
+                    payload_json: Some("{\"tool\":true}".to_string()),
+                },
+                moraine_conversations::SearchEventHit {
+                    rank: 3,
+                    event_uid: "evt-3".to_string(),
+                    session_id: "sess-1".to_string(),
+                    first_event_time: String::new(),
+                    last_event_time: String::new(),
+                    source_name: "src".to_string(),
+                    provider: "provider".to_string(),
+                    score: 0.8,
+                    matched_terms: 1,
+                    doc_len: 1,
+                    event_class: "message".to_string(),
+                    payload_type: "text".to_string(),
+                    actor_role: "system".to_string(),
+                    name: String::new(),
+                    phase: String::new(),
+                    source_ref: String::new(),
+                    text_preview: "preview".to_string(),
+                    text_content: Some("system text".to_string()),
+                    payload_json: Some("{\"system\":true}".to_string()),
+                },
+            ],
+        };
+
+        apply_search_content_policy(&mut result, false);
+
+        assert_eq!(result.hits[0].text_content.as_deref(), Some("full text"));
+        assert!(result.hits[0].payload_json.is_none());
+        assert!(result.hits[1].text_content.is_none());
+        assert!(result.hits[1].payload_json.is_none());
+        assert!(result.hits[2].text_content.is_none());
+        assert!(result.hits[2].payload_json.is_none());
+
+        let payload = serde_json::to_value(&result).expect("serialize search payload");
+        assert!(payload["hits"][0]["payload_json"].is_null());
+        assert!(payload["hits"][1]["text_content"].is_null());
+        assert!(payload["hits"][2]["text_content"].is_null());
+    }
+
+    #[test]
+    fn apply_conversation_search_content_policy_requires_payload_opt_in() {
+        let mut result = ConversationSearchResults {
+            query_id: "q1".to_string(),
+            query: "query".to_string(),
+            terms: vec!["query".to_string()],
+            stats: moraine_conversations::ConversationSearchStats {
+                docs: 1,
+                avgdl: 1.0,
+                took_ms: 1,
+                result_count: 1,
+                requested_limit: 1,
+                effective_limit: 1,
+                limit_capped: false,
+            },
+            hits: vec![moraine_conversations::ConversationSearchHit {
+                rank: 1,
+                session_id: "sess-1".to_string(),
+                first_event_time: None,
+                first_event_unix_ms: None,
+                last_event_time: None,
+                last_event_unix_ms: None,
+                provider: None,
+                session_slug: None,
+                session_summary: None,
+                score: 1.0,
+                matched_terms: 1,
+                event_count_considered: 1,
+                best_event_uid: Some("evt-1".to_string()),
+                snippet: Some("preview".to_string()),
+                text_preview: Some("preview".to_string()),
+                text_content: Some("full text".to_string()),
+                payload_json: Some("{\"x\":1}".to_string()),
+            }],
+        };
+
+        apply_conversation_search_content_policy(&mut result, false);
+        assert!(result.hits[0].payload_json.is_none());
+        let payload = serde_json::to_value(&result).expect("serialize conversation payload");
+        assert!(payload["hits"][0]["payload_json"].is_null());
+
+        result.hits[0].payload_json = Some("{\"x\":1}".to_string());
+        apply_conversation_search_content_policy(&mut result, true);
+        assert_eq!(result.hits[0].payload_json.as_deref(), Some("{\"x\":1}"));
+        let payload =
+            serde_json::to_value(&result).expect("serialize opted-in conversation payload");
+        assert_eq!(payload["hits"][0]["payload_json"], json!("{\"x\":1}"));
+    }
+
+    #[test]
+    fn build_session_events_payload_uses_plural_event_kinds() {
+        let payload = AppState::build_session_events_payload(
+            "sess-1".to_string(),
+            SessionEventsDirection::Reverse,
+            Some(vec![SearchEventKind::Message, SearchEventKind::ToolCall]),
+            Vec::new(),
+            Some("cursor-next".to_string()),
+        );
+
+        assert_eq!(payload["session_id"], json!("sess-1"));
+        assert_eq!(payload["direction"], json!("reverse"));
+        assert_eq!(payload["event_kinds"], json!(["message", "tool_call"]));
+        assert_eq!(payload["next_cursor"], json!("cursor-next"));
     }
 
     #[test]
