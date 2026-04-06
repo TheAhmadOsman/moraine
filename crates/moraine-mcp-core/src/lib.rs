@@ -2167,8 +2167,7 @@ mod tests {
 
         let text = format_get_session_prose(&payload).expect("format");
         assert!(text.contains("Session: sess bad"));
-        assert!(text.contains(
-            "Not found (invalid_argument): session_id contains unsupported characters"
-        ));
+        assert!(text
+            .contains("Not found (invalid_argument): session_id contains unsupported characters"));
     }
 }
