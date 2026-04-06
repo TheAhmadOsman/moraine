@@ -6,8 +6,8 @@ mod repo;
 
 pub use clickhouse_repo::ClickHouseConversationRepository;
 pub use domain::{
-    Conversation, ConversationDetailOptions, ConversationListFilter, ConversationMode,
-    ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
+    is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
+    ConversationMode, ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
     SearchEventsResult, SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter,
