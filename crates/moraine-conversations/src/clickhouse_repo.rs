@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::cursor::{decode_cursor, encode_cursor, ConversationCursor, TurnCursor};
 use crate::domain::{
-    Conversation, ConversationDetailOptions, ConversationListFilter, ConversationMode,
-    ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
+    is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
+    ConversationMode, ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
     SearchEventsResult, SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter,
@@ -229,6 +229,8 @@ struct ConversationSnippetRow {
     payload_json: String,
     #[serde(default)]
     event_class: String,
+    #[serde(default)]
+    actor_role: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1303,10 +1305,6 @@ FORMAT JSONEachRow",
         }
 
         true
-    }
-
-    fn is_user_facing_event_class(event_class: &str) -> bool {
-        matches!(event_class, "message" | "reasoning" | "event_msg")
     }
 
     fn bm25_term_score(tf: u16, doc_len: u32, avgdl: f64, k1: f64, b: f64) -> f64 {
@@ -2392,7 +2390,8 @@ FORMAT JSONEachRow",
   leftUTF8(any(text_content), {preview}) AS snippet,
   leftUTF8(any(text_content), {text_content_limit}) AS text_content,
   leftUTF8(any(payload_json), {payload_json_limit}) AS payload_json,
-  any(event_class) AS event_class
+  any(event_class) AS event_class,
+  any(actor_role) AS actor_role
 FROM {documents_table}
 WHERE event_uid IN {event_uids_sql}
 GROUP BY event_uid
@@ -2407,16 +2406,16 @@ FORMAT JSONEachRow",
             self.map_backend(self.ch.query_rows(&sql, None).await)?;
         let mut by_uid = HashMap::new();
         for row in rows {
-            let is_user_facing = Self::is_user_facing_event_class(&row.event_class);
+            let is_user_facing = is_user_facing_content_event(&row.event_class, &row.actor_role);
             by_uid.insert(
                 row.event_uid,
                 ConversationSnippetContent {
                     snippet: row.snippet,
                     text_content: is_user_facing
-                        .then(|| row.text_content)
+                        .then_some(row.text_content)
                         .filter(|value| !value.is_empty()),
                     payload_json: is_user_facing
-                        .then(|| row.payload_json)
+                        .then_some(row.payload_json)
                         .filter(|value| !value.is_empty()),
                 },
             );
@@ -3492,9 +3491,7 @@ FORMAT JSONEachRow",
                     .as_ref()
                     .map(|content| content.snippet.clone())
                     .or((!row_snippet.is_empty()).then_some(row_snippet));
-                let text_preview = snippet_content
-                    .as_ref()
-                    .map(|content| content.snippet.clone());
+                let text_preview = snippet.clone();
                 let text_content = snippet_content
                     .as_ref()
                     .and_then(|content| content.text_content.clone());

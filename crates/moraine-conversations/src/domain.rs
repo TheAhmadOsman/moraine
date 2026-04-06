@@ -233,6 +233,12 @@ impl SearchEventKind {
     }
 }
 
+/// Search/list payloads should only expose richer content for user-facing events.
+pub fn is_user_facing_content_event(event_class: &str, actor_role: &str) -> bool {
+    !actor_role.eq_ignore_ascii_case("system")
+        && matches!(event_class, "message" | "reasoning" | "event_msg")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchEventsStats {
     pub docs: u64,

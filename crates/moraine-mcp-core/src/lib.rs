@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, ConversationSearchResults, OpenEventRequest,
-    PageRequest, RepoConfig, SearchEventKind, SearchEventsQuery, SearchEventsResult,
+    is_user_facing_content_event, ClickHouseConversationRepository, ConversationListFilter,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, ConversationSearchResults,
+    OpenEventRequest, PageRequest, RepoConfig, SearchEventKind, SearchEventsQuery,
+    SearchEventsResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -717,13 +718,9 @@ fn validate_tool_limit(
     }
 }
 
-fn is_user_facing_event_class(event_class: &str) -> bool {
-    matches!(event_class, "message" | "reasoning" | "event_msg")
-}
-
 fn apply_search_content_policy(result: &mut SearchEventsResult, include_payload_json: bool) {
     for hit in &mut result.hits {
-        if !is_user_facing_event_class(&hit.event_class) {
+        if !is_user_facing_content_event(&hit.event_class, &hit.actor_role) {
             hit.text_content = None;
             hit.payload_json = None;
             continue;
@@ -1262,9 +1259,9 @@ mod tests {
                 docs: 1,
                 avgdl: 1.0,
                 took_ms: 1,
-                result_count: 2,
-                requested_limit: 2,
-                effective_limit: 2,
+                result_count: 3,
+                requested_limit: 3,
+                effective_limit: 3,
                 limit_capped: false,
             },
             hits: vec![
@@ -1310,6 +1307,27 @@ mod tests {
                     text_content: Some("tool text".to_string()),
                     payload_json: Some("{\"tool\":true}".to_string()),
                 },
+                moraine_conversations::SearchEventHit {
+                    rank: 3,
+                    event_uid: "evt-3".to_string(),
+                    session_id: "sess-1".to_string(),
+                    first_event_time: String::new(),
+                    last_event_time: String::new(),
+                    source_name: "src".to_string(),
+                    provider: "provider".to_string(),
+                    score: 0.8,
+                    matched_terms: 1,
+                    doc_len: 1,
+                    event_class: "message".to_string(),
+                    payload_type: "text".to_string(),
+                    actor_role: "system".to_string(),
+                    name: String::new(),
+                    phase: String::new(),
+                    source_ref: String::new(),
+                    text_preview: "preview".to_string(),
+                    text_content: Some("system text".to_string()),
+                    payload_json: Some("{\"system\":true}".to_string()),
+                },
             ],
         };
 
@@ -1319,6 +1337,13 @@ mod tests {
         assert!(result.hits[0].payload_json.is_none());
         assert!(result.hits[1].text_content.is_none());
         assert!(result.hits[1].payload_json.is_none());
+        assert!(result.hits[2].text_content.is_none());
+        assert!(result.hits[2].payload_json.is_none());
+
+        let payload = serde_json::to_value(&result).expect("serialize search payload");
+        assert!(payload["hits"][0]["payload_json"].is_null());
+        assert!(payload["hits"][1]["text_content"].is_null());
+        assert!(payload["hits"][2]["text_content"].is_null());
     }
 
     #[test]
@@ -1359,10 +1384,15 @@ mod tests {
 
         apply_conversation_search_content_policy(&mut result, false);
         assert!(result.hits[0].payload_json.is_none());
+        let payload = serde_json::to_value(&result).expect("serialize conversation payload");
+        assert!(payload["hits"][0]["payload_json"].is_null());
 
         result.hits[0].payload_json = Some("{\"x\":1}".to_string());
         apply_conversation_search_content_policy(&mut result, true);
         assert_eq!(result.hits[0].payload_json.as_deref(), Some("{\"x\":1}"));
+        let payload =
+            serde_json::to_value(&result).expect("serialize opted-in conversation payload");
+        assert_eq!(payload["hits"][0]["payload_json"], json!("{\"x\":1}"));
     }
 
     #[test]
