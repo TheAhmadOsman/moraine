@@ -1,0 +1,16 @@
+# Moraine dev sandbox — optional host-session overlay. See RFC #232.
+#
+# Layered in by `moraine-sandbox` via `-f compose.yaml -f compose.sessions.yaml`
+# when the caller opts in to mounting the host's real session archives
+# (SANDBOX_MOUNT_HOST_SESSIONS=1). The base compose file never references
+# these mounts, so the overlay is the only place they are defined.
+#
+# Additional environment variables the host CLI must export:
+#   SANDBOX_CODEX_SESSIONS_DIR   host ~/.codex/sessions, read-only
+#   SANDBOX_CLAUDE_PROJECTS_DIR  host ~/.claude/projects, read-only
+
+services:
+  moraine:
+    volumes:
+      - "${SANDBOX_CODEX_SESSIONS_DIR}:/host/codex/sessions:ro"
+      - "${SANDBOX_CLAUDE_PROJECTS_DIR}:/host/claude/projects:ro"

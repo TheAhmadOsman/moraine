@@ -1,0 +1,46 @@
+# Moraine dev sandbox — compose file. See RFC #232.
+#
+# This file is always loaded by `moraine-sandbox`. When the caller opts in to
+# mounting host session archives, the sibling `compose.sessions.yaml` overlay
+# is layered on top with `-f compose.sessions.yaml`.
+#
+# Environment variables the host CLI must export before `docker compose up`:
+#   COMPOSE_PROJECT_NAME              per-sandbox project name (container name)
+#   SANDBOX_MONITOR_HOST_PORT         host port published to container :8080
+#   SANDBOX_CLICKHOUSE_HTTP_HOST_PORT host port published to container :8123
+#   SANDBOX_CLICKHOUSE_TCP_HOST_PORT  host port published to container :9000
+#   SANDBOX_REPO_ROOT                 worktree root, mounted at /repo  (ro)
+#   SANDBOX_BIN_DIR                   Linux binaries, mounted at /opt/moraine/bin (ro)
+#   SANDBOX_WEB_DIR                   monitor dist dir, mounted at /opt/moraine/web (ro)
+#   SANDBOX_CONFIG_DIR                generated config dir, mounted at /sandbox (ro)
+
+services:
+  moraine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: ${COMPOSE_PROJECT_NAME}
+    user: "1000:1000"
+    tty: true
+    stdin_open: true
+    restart: "no"
+    ports:
+      - "${SANDBOX_MONITOR_HOST_PORT}:8080"
+      - "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"
+      - "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"
+    volumes:
+      - "${SANDBOX_REPO_ROOT}:/repo:ro"
+      - "${SANDBOX_BIN_DIR}:/opt/moraine/bin:ro"
+      - "${SANDBOX_WEB_DIR}:/opt/moraine/web:ro"
+      - "${SANDBOX_CONFIG_DIR}:/sandbox:ro"
+      - "state:/home/moraine/.moraine"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  state: {}

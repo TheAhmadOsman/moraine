@@ -31,6 +31,8 @@ Use Rust 2021 idioms and keep code `rustfmt`-clean.
 ## Testing Guidelines
 Run `cargo test --workspace --locked` before opening a PR. CI also runs `scripts/ci/e2e-stack.sh`, so changes affecting ingest, monitor, MCP, or ClickHouse flows should be validated with that script locally when possible. Place tests close to the code they verify (`#[cfg(test)]` modules or crate-level integration tests).
 
+For changes that touch ingest, MCP, monitor, or ClickHouse schema, run them inside a dev sandbox rather than against your host install: `scripts/dev/sandbox/moraine-sandbox up` (see [docs/development/sandbox.md](docs/development/sandbox.md)), verify via the printed monitor URL, and always `scripts/dev/sandbox/moraine-sandbox down <id>` when finished. The sandbox is isolated from your live `~/.moraine/`; the host stack is not.
+
 ## Development: Worktrees
 When the user asks you to take on new development work, 
 check out a fresh worktree with an appropriate name for your work to prevent multi-agent collision.
