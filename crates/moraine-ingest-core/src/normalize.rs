@@ -62,16 +62,16 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provider {
+enum Harness {
     Codex,
-    Claude,
+    ClaudeCode,
 }
 
-impl Provider {
+impl Harness {
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
-            "claude-code" => Ok(Self::Claude),
+            "claude-code" => Ok(Self::ClaudeCode),
             _ => Err(anyhow!(
                 "unsupported harness `{}`; expected one of: codex, claude-code",
                 raw.trim()
@@ -82,14 +82,14 @@ impl Provider {
     fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Claude => "claude-code",
+            Self::ClaudeCode => "claude-code",
         }
     }
 
     fn inference_provider(self) -> &'static str {
         match self {
             Self::Codex => "openai",
-            Self::Claude => "anthropic",
+            Self::ClaudeCode => "anthropic",
         }
     }
 }
@@ -1504,14 +1504,14 @@ pub fn normalize_record(
     session_hint: &str,
     model_hint: &str,
 ) -> Result<NormalizedRecord> {
-    let harness = Provider::parse(harness)?;
+    let harness = Harness::parse(harness)?;
     let harness_name = harness.as_str();
     let inference_provider = harness.inference_provider();
     let record_ts = to_str(record.get("timestamp"));
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if harness == Provider::Claude {
+    let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1524,7 +1524,7 @@ pub fn normalize_record(
         };
     }
 
-    if harness == Provider::Codex && top_type == "session_meta" {
+    if harness == Harness::Codex && top_type == "session_meta" {
         let payload = record.get("payload").cloned().unwrap_or(Value::Null);
         let payload_id = to_str(payload.get("id"));
         if !payload_id.is_empty() {
@@ -1596,7 +1596,7 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if harness == Provider::Claude {
+    let (event_rows, link_rows, tool_rows) = if harness == Harness::ClaudeCode {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
