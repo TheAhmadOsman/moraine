@@ -1,6 +1,6 @@
 # Unified Trace Schema Mapping
 
-This page maps raw Codex and Claude Code trace fields into the unified `moraine.events` table so you can move directly from source JSONL to canonical columns when querying ClickHouse. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
+This page maps raw Codex and Claude Code trace fields into the unified `moraine.events` table so you can move directly from source JSONL to canonical columns when querying ClickHouse. Hermes Agent trajectories now normalize into the same table as well; because Hermes uses ShareGPT-compatible JSONL with one whole rollout per line, its mapping is summarized after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
 
 ## Field Mapping Table
 
@@ -59,3 +59,16 @@ This page maps raw Codex and Claude Code trace fields into the unified `moraine.
 | `event_version` | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. |
 
 Field defaults and provider-specific overrides come from `base_event_obj`, `normalize_codex_event`, `normalize_claude_event`, and `normalize_record`. [src: crates/moraine-ingest-core/src/normalize.rs:L78-L104, crates/moraine-ingest-core/src/normalize.rs:L172-L230, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L440-L997, crates/moraine-ingest-core/src/normalize.rs:L999-L1320, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
+
+## Hermes ShareGPT Mapping
+
+Hermes Agent trajectories are stored as ShareGPT-compatible JSONL where one line contains the full rollout plus metadata such as `timestamp`, `model`, `completed`, `partial`, and `conversations`. Moraine maps that shape into canonical rows with these rules:
+
+- One raw JSONL line becomes one synthetic session. Because the format has no native session ID, Moraine derives `session_id` as `hermes:{raw_event_uid}`.
+- The top-level rollout metadata becomes a canonical `session_meta` row. `op_status` reflects `completed`/`partial`.
+- Hermes encodes the LLM vendor in the record's `model` field as `vendor/model` (e.g. `anthropic/claude-sonnet-4.6`). The normalizer splits on the first `/`: the left side becomes `inference_provider` on every emitted row, and the right side is stored verbatim as `model`. Values with no slash keep `inference_provider` empty and store the whole string as `model`.
+- `conversations[].from == "system"` becomes `event_kind=system`, `actor_kind=system`.
+- `conversations[].from == "human"` becomes `event_kind=message`, `actor_kind=user`.
+- `conversations[].from == "gpt"` is segmented: plain text becomes `message`, `<think>...</think>` becomes `reasoning` with `payload_type=thinking`, and `<tool_call>...</tool_call>` becomes `tool_call` with `payload_type=tool_use`.
+- `conversations[].from == "tool"` is segmented on `<tool_response>...</tool_response>` and normalized into `tool_result` rows plus `tool_io` response rows.
+- When Hermes emits only one top-level timestamp for the entire rollout, Moraine preserves event order by assigning microsecond offsets per generated canonical event. This keeps `v_conversation_trace` chronological within the rollout while preserving the original raw JSON in `raw_events`.

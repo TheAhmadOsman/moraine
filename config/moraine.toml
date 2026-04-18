@@ -32,6 +32,16 @@ enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 
+# Hermes Agent trajectories are ShareGPT-compatible JSONL written to the
+# directory tree where you ran the agent or batch runner. Add a source like
+# this for any Hermes output directory you want Moraine to watch.
+# [[ingest.sources]]
+# name = "hermes"
+# harness = "hermes"
+# enabled = true
+# glob = "~/trajectories/**/*.jsonl"
+# watch_root = "~/trajectories"
+
 [mcp]
 max_results = 25
 preview_chars = 320

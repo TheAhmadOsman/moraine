@@ -200,6 +200,7 @@ main() {
   run_stamp="$(date +%s)_$$_$RANDOM"
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
+  local hermes_keyword="${base_keyword}_hermes_${run_stamp}"
   local clickhouse_database="moraine"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
@@ -209,6 +210,7 @@ main() {
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
+  local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
 
   need_cmd curl
   need_cmd "$python_bin"
@@ -234,9 +236,11 @@ main() {
   local config_path="$tmp_root/moraine-ci.toml"
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
+  local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
+  mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$runtime_root"
 
   cat > "$codex_fixture_file" <<EOF
@@ -249,6 +253,14 @@ EOF
   cat > "$claude_fixture_file" <<EOF
 {"type":"user","sessionId":"${claude_session_id}","uuid":"claude-user-${run_stamp}","timestamp":"2026-02-16T12:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e claude user prompt ${claude_keyword}"}]}}
 {"type":"assistant","sessionId":"${claude_session_id}","uuid":"claude-assistant-${run_stamp}","parentUuid":"claude-user-${run_stamp}","requestId":"req-${run_stamp}","timestamp":"2026-02-16T12:00:05.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","usage":{"input_tokens":9,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"service_tier":"standard"},"content":[{"type":"text","text":"local e2e claude assistant reply ${claude_keyword} ${claude_trace_marker}"}]}}
+EOF
+
+  # Hermes ShareGPT trajectory: one completed rollout per line. Exercises a
+  # vendor/model prefix (`anthropic/claude-sonnet-4.6`), a `<think>` segment,
+  # and an assistant text turn carrying the MCP trace marker so the
+  # search+open smoke below can find it.
+  cat > "$hermes_fixture_file" <<EOF
+{"timestamp":"2026-02-16T12:00:06.000000","model":"anthropic/claude-sonnet-4.6","prompt_index":1,"completed":true,"partial":false,"api_calls":1,"conversations":[{"from":"human","value":"local e2e hermes user prompt ${hermes_keyword}"},{"from":"gpt","value":"<think>draft the answer</think>\nlocal e2e hermes assistant reply ${hermes_keyword} ${hermes_trace_marker}"}]}
 EOF
 
   cat > "$config_path" <<EOF
@@ -281,6 +293,13 @@ enabled = true
 glob = "${fixtures_root}/claude/projects/**/*.jsonl"
 watch_root = "${fixtures_root}/claude/projects"
 
+[[ingest.sources]]
+name = "ci-hermes"
+harness = "hermes"
+enabled = true
+glob = "${fixtures_root}/hermes/trajectories/**/*.jsonl"
+watch_root = "${fixtures_root}/hermes/trajectories"
+
 [runtime]
 root_dir = "${runtime_root}"
 logs_dir = "logs"
@@ -300,6 +319,7 @@ EOF
   echo "[e2e] clickhouse db: ${clickhouse_database}"
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
+  echo "[e2e] hermes fixture: ${hermes_fixture_file}"
 
   echo "[e2e] installing managed ClickHouse"
   "$moraine_bin" clickhouse install --config "$config_path"
@@ -319,6 +339,12 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${codex_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
+  # Confirm the vendor/model split landed at ingest time: the Hermes row
+  # should carry harness=hermes and inference_provider=anthropic (parsed from
+  # the `anthropic/claude-sonnet-4.6` record field).
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE harness = 'hermes' AND inference_provider = 'anthropic' AND positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 60
 
   echo "[e2e] checking monitor API routes"
   for path in /api/health /api/status /api/analytics /api/web-searches; do
@@ -344,6 +370,17 @@ EOF
     --expect-session-id "$claude_session_id" \
     --expect-source-file "$claude_fixture_file" \
     --expect-open-text "$claude_trace_marker"
+
+  # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
+  # --expect-session-id; source file + trace marker are enough to prove the
+  # row round-tripped from fixture through ingest to MCP search/open.
+  echo "[e2e] checking MCP initialize/tools/search/open (hermes)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$hermes_keyword" \
+    --expect-source-file "$hermes_fixture_file" \
+    --expect-open-text "$hermes_trace_marker"
 
   if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
     echo "[e2e] checking replay benchmark script (dry-run)"

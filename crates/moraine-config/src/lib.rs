@@ -528,12 +528,12 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
 
 fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
     let normalized = harness.trim().to_ascii_lowercase();
-    if normalized == "codex" || normalized == "claude-code" {
+    if normalized == "codex" || normalized == "claude-code" || normalized == "hermes" {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes",
         harness.trim(),
         source_name
     ))
@@ -747,7 +747,7 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code"),
+            format!("{err:#}").contains("expected one of: codex, claude-code, hermes"),
             "unexpected error: {err:#}"
         );
     }
@@ -768,7 +768,7 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code"),
+            format!("{err:#}").contains("expected one of: codex, claude-code, hermes"),
             "unexpected error: {err:#}"
         );
     }
@@ -795,5 +795,31 @@ watch_root = "~/.claude/projects"
             .find(|s| s.name == "claude")
             .expect("claude source should be present");
         assert_eq!(source.harness, "claude-code");
+    }
+
+    #[test]
+    fn load_config_accepts_hermes_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "hermes"
+harness = "hermes"
+enabled = true
+glob = "~/trajectories/**/*.jsonl"
+watch_root = "~/trajectories"
+"#,
+            "hermes-harness",
+        );
+        let cfg = load_config(&path).expect("hermes harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "hermes")
+            .expect("hermes source");
+        assert_eq!(source.name, "hermes");
+        assert!(source.glob.ends_with("/trajectories/**/*.jsonl"));
+        assert!(source.watch_root.ends_with("/trajectories"));
     }
 }
