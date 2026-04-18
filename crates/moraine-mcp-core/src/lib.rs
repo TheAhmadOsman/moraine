@@ -441,6 +441,8 @@ struct ConversationSearchProseHit {
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
+    inference_provider: Option<String>,
+    #[serde(default)]
     session_slug: Option<String>,
     #[serde(default)]
     session_summary: Option<String>,
@@ -1761,6 +1763,9 @@ fn format_conversation_search_prose(
         if let Some(harness) = hit.harness.as_deref() {
             out.push_str(&format!("   harness: {}\n", harness));
         }
+        if let Some(inference_provider) = hit.inference_provider.as_deref() {
+            out.push_str(&format!("   inference_provider: {}\n", inference_provider));
+        }
         if let (Some(first), Some(last)) = (
             hit.first_event_time.as_deref(),
             hit.last_event_time.as_deref(),
@@ -2183,6 +2188,7 @@ mod tests {
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
                     harness: "harness".to_string(),
+                    inference_provider: "inference-provider".to_string(),
                     score: 1.0,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2204,6 +2210,7 @@ mod tests {
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
                     harness: "harness".to_string(),
+                    inference_provider: "inference-provider".to_string(),
                     score: 0.9,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2225,6 +2232,7 @@ mod tests {
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
                     harness: "harness".to_string(),
+                    inference_provider: "inference-provider".to_string(),
                     score: 0.8,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2279,6 +2287,7 @@ mod tests {
                 last_event_time: None,
                 last_event_unix_ms: None,
                 harness: None,
+                inference_provider: None,
                 session_slug: None,
                 session_summary: None,
                 score: 1.0,

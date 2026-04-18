@@ -62,18 +62,18 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provider {
+enum Harness {
     Codex,
-    Claude,
+    ClaudeCode,
 }
 
-impl Provider {
+impl Harness {
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::Claude),
+            "claude-code" => Ok(Self::ClaudeCode),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude",
+                "unsupported harness `{}`; expected one of: codex, claude-code",
                 raw.trim()
             )),
         }
@@ -82,7 +82,14 @@ impl Provider {
     fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Claude => "claude",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    fn inference_provider(self) -> &'static str {
+        match self {
+            Self::Codex => "openai",
+            Self::ClaudeCode => "anthropic",
         }
     }
 }
@@ -353,6 +360,7 @@ fn io_hash(input_json: &str, output_json: &str) -> u64 {
 struct RecordContext<'a> {
     source_name: &'a str,
     harness: &'a str,
+    inference_provider: &'a str,
     session_id: &'a str,
     session_date: &'a str,
     source_file: &'a str,
@@ -396,6 +404,10 @@ fn base_event_obj(
     obj.insert(
         "harness".to_string(),
         Value::String(ctx.harness.to_string()),
+    );
+    obj.insert(
+        "inference_provider".to_string(),
+        Value::String(ctx.inference_provider.to_string()),
     );
     obj.insert(
         "source_file".to_string(),
@@ -505,6 +517,7 @@ fn build_link_row(
         "link_type": link_type,
         "session_id": ctx.session_id,
         "harness": ctx.harness,
+        "inference_provider": ctx.inference_provider,
         "source_name": ctx.source_name,
         "metadata_json": metadata_json,
         "event_version": event_version(),
@@ -565,6 +578,7 @@ fn build_tool_row(
         "event_uid": event_uid,
         "session_id": ctx.session_id,
         "harness": ctx.harness,
+        "inference_provider": ctx.inference_provider,
         "source_name": ctx.source_name,
         "tool_call_id": tool_call_id,
         "parent_tool_call_id": parent_tool_call_id,
@@ -1169,7 +1183,7 @@ fn normalize_claude_event(
 
     let message = record.get("message").cloned().unwrap_or(Value::Null);
     let msg_role = to_str(message.get("role"));
-    let model = canonicalize_model("claude", &to_str(message.get("model")));
+    let model = canonicalize_model("claude-code", &to_str(message.get("model")));
 
     let usage = message.get("usage").cloned().unwrap_or(Value::Null);
     let input_tokens = to_u32(usage.get("input_tokens"));
@@ -1490,13 +1504,14 @@ pub fn normalize_record(
     session_hint: &str,
     model_hint: &str,
 ) -> Result<NormalizedRecord> {
-    let harness = Provider::parse(harness)?;
+    let harness = Harness::parse(harness)?;
     let harness_name = harness.as_str();
+    let inference_provider = harness.inference_provider();
     let record_ts = to_str(record.get("timestamp"));
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if harness == Provider::Claude {
+    let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1509,7 +1524,7 @@ pub fn normalize_record(
         };
     }
 
-    if harness == Provider::Codex && top_type == "session_meta" {
+    if harness == Harness::Codex && top_type == "session_meta" {
         let payload = record.get("payload").cloned().unwrap_or(Value::Null);
         let payload_id = to_str(payload.get("id"));
         if !payload_id.is_empty() {
@@ -1532,6 +1547,7 @@ pub fn normalize_record(
     let raw_row = json!({
         "source_name": source_name,
         "harness": harness_name,
+        "inference_provider": inference_provider,
         "source_file": source_file,
         "source_inode": source_inode,
         "source_generation": source_generation,
@@ -1550,6 +1566,7 @@ pub fn normalize_record(
         error_rows.push(json!({
             "source_name": source_name,
             "harness": harness_name,
+            "inference_provider": inference_provider,
             "source_file": source_file,
             "source_inode": source_inode,
             "source_generation": source_generation,
@@ -1567,6 +1584,7 @@ pub fn normalize_record(
     let ctx = RecordContext {
         source_name,
         harness: harness_name,
+        inference_provider,
         session_id: &session_id,
         session_date: &session_date,
         source_file,
@@ -1578,7 +1596,7 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if harness == Provider::Claude {
+    let (event_rows, link_rows, tool_rows) = if harness == Harness::ClaudeCode {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
@@ -1867,7 +1885,7 @@ mod tests {
         let out = normalize_record(
             &record,
             "claude",
-            "claude",
+            "claude-code",
             "/Users/eric/.claude/projects/p1/s1.jsonl",
             55,
             2,
@@ -1886,7 +1904,14 @@ mod tests {
             first.get("event_kind").unwrap().as_str().unwrap(),
             "tool_call"
         );
-        assert_eq!(first.get("harness").unwrap().as_str().unwrap(), "claude");
+        assert_eq!(
+            first.get("harness").unwrap().as_str().unwrap(),
+            "claude-code"
+        );
+        assert_eq!(
+            first.get("inference_provider").unwrap().as_str().unwrap(),
+            "anthropic"
+        );
         assert!(out.error_rows.is_empty());
     }
 
@@ -2006,6 +2031,88 @@ mod tests {
     }
 
     #[test]
+    fn legacy_claude_harness_value_is_rejected() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:42.191Z",
+            "type": "assistant",
+            "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+            "uuid": "assistant-1",
+            "message": {"role": "assistant", "content": "done"}
+        });
+
+        let err = normalize_record(
+            &record,
+            "claude",
+            "claude",
+            "/Users/eric/.claude/projects/p1/s1.jsonl",
+            1,
+            1,
+            1,
+            1,
+            "",
+            "",
+        )
+        .expect_err("legacy `claude` harness value should be rejected");
+
+        assert!(
+            err.to_string().contains("unsupported harness"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn codex_event_populates_inference_provider_openai() {
+        let record = json!({
+            "timestamp": "2026-02-14T02:28:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_ip",
+                "name": "Read",
+                "arguments": "{}"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/14/session-019c59f9-6389-77a1-a0cb-304eecf935b6.jsonl",
+            10,
+            1,
+            1,
+            1,
+            "",
+            "",
+        )
+        .expect("codex event should normalize");
+
+        assert_eq!(
+            out.raw_row
+                .get("inference_provider")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "openai"
+        );
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("harness").unwrap().as_str().unwrap(), "codex");
+        assert_eq!(
+            row.get("inference_provider").unwrap().as_str().unwrap(),
+            "openai"
+        );
+        let tool_row = out.tool_rows[0].as_object().unwrap();
+        assert_eq!(
+            tool_row
+                .get("inference_provider")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "openai"
+        );
+    }
+
+    #[test]
     fn claude_links_split_event_uids_from_external_ids() {
         let record = json!({
             "type": "assistant",
@@ -2025,7 +2132,7 @@ mod tests {
         let out = normalize_record(
             &record,
             "claude",
-            "claude",
+            "claude-code",
             "/Users/eric/.claude/projects/p1/s1.jsonl",
             55,
             2,
@@ -2243,7 +2350,7 @@ mod tests {
         let out = normalize_record(
             &record,
             "claude",
-            "claude",
+            "claude-code",
             "/Users/eric/.claude/projects/p1/s1.jsonl",
             1,
             1,
@@ -2271,6 +2378,7 @@ mod tests {
         let ctx = RecordContext {
             source_name: "codex",
             harness: "codex",
+            inference_provider: "openai",
             session_id: "s1",
             session_date: "2026-02-15",
             source_file: "/tmp/s1.jsonl",
