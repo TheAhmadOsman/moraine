@@ -269,10 +269,12 @@ ensure_compose_env() {
     : "${SANDBOX_ENTRYPOINT:=/dev/null}"
     : "${SANDBOX_CODEX_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
+    : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
     export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
         SANDBOX_CLICKHOUSE_TCP_HOST_PORT SANDBOX_MONITOR_HOST_PORT \
         SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
-        SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR
+        SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
+        SANDBOX_SCCACHE_HOST_DIR
 }
 
 dc() {
@@ -664,6 +666,18 @@ cmd_up() {
     export SANDBOX_WEB_DIR="$web_dir"
     export SANDBOX_CONFIG_DIR="$config_dir"
     export SANDBOX_ENTRYPOINT="${REPO_ROOT}/scripts/dev/sandbox/entrypoint.sh"
+
+    # sccache cache bind. Prefer the host's SCCACHE_DIR (what the developer
+    # already uses), falling back to the XDG default. Created lazily so first
+    # use inside the sandbox doesn't fail on a missing directory, and so
+    # docker doesn't create it as root on the host.
+    local host_sccache_dir="${SCCACHE_DIR:-${HOME}/.cache/sccache}"
+    if [[ ! -d "$host_sccache_dir" ]]; then
+        mkdir -p "$host_sccache_dir"
+        log "created host sccache dir ${host_sccache_dir} (first use)"
+    fi
+    export SANDBOX_SCCACHE_HOST_DIR="$host_sccache_dir"
+    log "sccache: sharing ${host_sccache_dir} with container (RUSTC_WRAPPER=sccache)"
     if [[ "$mount_sessions" == "1" ]]; then
         export SANDBOX_CODEX_SESSIONS_DIR="$codex_dir"
         export SANDBOX_CLAUDE_PROJECTS_DIR="$claude_dir"

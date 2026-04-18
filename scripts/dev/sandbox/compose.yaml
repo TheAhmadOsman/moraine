@@ -22,6 +22,13 @@
 #   SANDBOX_WEB_DIR                   monitor dist dir, mounted at /opt/moraine/web (ro)
 #   SANDBOX_CONFIG_DIR                generated config dir, mounted at /sandbox (ro)
 #   SANDBOX_ENTRYPOINT                path to entrypoint.sh in the worktree  (ro)
+#   SANDBOX_SCCACHE_HOST_DIR          host $SCCACHE_DIR (or equivalent),
+#                                     mounted rw at /home/moraine/.cache/sccache
+#                                     so builds inside the sandbox share the
+#                                     host's sccache disk cache. Defaulted to
+#                                     /tmp by ensure_compose_env when unset, so
+#                                     sandboxes on hosts without sccache still
+#                                     start — they just don't share a cache.
 #
 # The `moraine` service points at a single shared runtime image
 # (moraine-sandbox-runtime:latest) rather than a per-sandbox image. The runtime
@@ -79,6 +86,7 @@ services:
       - "${SANDBOX_WEB_DIR}:/opt/moraine/web:ro"
       - "${SANDBOX_CONFIG_DIR}:/sandbox:ro"
       - "${SANDBOX_ENTRYPOINT}:/usr/local/bin/entrypoint.sh:ro"
+      - "${SANDBOX_SCCACHE_HOST_DIR}:/home/moraine/.cache/sccache"
       - "state:/home/moraine/.moraine"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/health || exit 1"]

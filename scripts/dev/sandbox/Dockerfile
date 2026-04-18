@@ -41,11 +41,20 @@ RUN mkdir -p /build/target/release && cp -a /out/. /build/target/release/
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
+# sccache version — kept in sync with whatever the host has installed so disk
+# cache entries are wire-compatible. Update both host (via `cargo install
+# sccache`) and this value together.
+ARG SCCACHE_VERSION=0.14.0
+ARG TARGETARCH
+
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PATH=/opt/moraine/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    MORAINE_MONITOR_STATIC_DIR=/opt/moraine/web
+    MORAINE_MONITOR_STATIC_DIR=/opt/moraine/web \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/home/moraine/.cache/sccache \
+    SCCACHE_CACHE_SIZE=20G
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -56,6 +65,22 @@ RUN apt-get update \
         tzdata \
         procps \
     && rm -rf /var/lib/apt/lists/*
+
+# Install sccache. Binary targets linux-musl for static linkage so it runs
+# regardless of glibc version. When the host (macOS) and the container (linux)
+# both point RUSTC_WRAPPER=sccache at a shared disk cache, their entries are
+# content-addressed by {compiler, flags, source} and so live side-by-side
+# without collision — darwin and linux outputs share the 20G budget but never
+# confuse each other.
+RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        arm64)  sccache_triple=aarch64-unknown-linux-musl ;; \
+        amd64)  sccache_triple=x86_64-unknown-linux-musl  ;; \
+        *)      echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${sccache_triple}.tar.gz" \
+        | tar -xz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-${sccache_triple}/sccache" \
+    && chmod 0755 /usr/local/bin/sccache \
+    && /usr/local/bin/sccache --version
 
 # Non-root user matching the host bind-mount ownership contract.
 RUN groupadd --system --gid 1000 moraine \
@@ -71,6 +96,7 @@ RUN mkdir -p \
         /opt/moraine/web \
         /sandbox \
         /home/moraine/.moraine \
+        /home/moraine/.cache/sccache \
     && chown -R moraine:moraine \
         /opt/moraine \
         /sandbox \
