@@ -51,27 +51,11 @@ fn to_u16(value: Option<&Value>) -> u16 {
 
 fn to_u8_bool(value: Option<&Value>) -> u8 {
     match value {
-        Some(Value::Bool(v)) => {
-            if *v {
-                1
-            } else {
-                0
-            }
-        }
-        Some(Value::Number(v)) => {
-            if v.as_i64().unwrap_or(0) != 0 {
-                1
-            } else {
-                0
-            }
-        }
+        Some(Value::Bool(v)) => u8::from(*v),
+        Some(Value::Number(v)) => u8::from(v.as_i64().unwrap_or(0) != 0),
         Some(Value::String(s)) => {
             let lower = s.to_ascii_lowercase();
-            if lower == "true" || lower == "1" {
-                1
-            } else {
-                0
-            }
+            u8::from(lower == "true" || lower == "1")
         }
         _ => 0,
     }
@@ -146,10 +130,8 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 fn extract_message_text(content: &Value) -> String {
     fn walk(node: &Value, out: &mut Vec<String>) {
         match node {
-            Value::String(s) => {
-                if !s.trim().is_empty() {
-                    out.push(s.clone());
-                }
+            Value::String(s) if !s.trim().is_empty() => {
+                out.push(s.clone());
             }
             Value::Array(items) => {
                 for item in items {
