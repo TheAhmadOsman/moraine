@@ -568,7 +568,7 @@ mod tests {
         fs::write(&path, "").expect("write empty jsonl");
         let work = WorkItem {
             source_name: "test-source".to_string(),
-            provider: "test-provider".to_string(),
+            harness: "test-harness".to_string(),
             path: path.to_string_lossy().to_string(),
         };
         let key = work.key();
