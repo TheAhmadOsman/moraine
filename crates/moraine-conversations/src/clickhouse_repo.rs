@@ -143,6 +143,8 @@ struct SearchRow {
     session_id: String,
     source_name: String,
     harness: String,
+    #[serde(default)]
+    inference_provider: String,
     event_class: String,
     payload_type: String,
     actor_role: String,
@@ -180,6 +182,8 @@ struct SearchDocExtraRow {
     session_id: String,
     source_name: String,
     harness: String,
+    #[serde(default)]
+    inference_provider: String,
     event_class: String,
     payload_type: String,
     actor_role: String,
@@ -225,6 +229,8 @@ struct ConversationSearchRow {
     last_event_unix_ms: i64,
     #[serde(default)]
     harness: String,
+    #[serde(default)]
+    inference_provider: String,
     score: f64,
     matched_terms: u16,
     event_count_considered: u32,
@@ -238,6 +244,8 @@ struct ConversationSessionMetadataRow {
     session_id: String,
     #[serde(default)]
     harness: String,
+    #[serde(default)]
+    inference_provider: String,
     #[serde(default)]
     session_slug: String,
     #[serde(default)]
@@ -333,6 +341,7 @@ struct SearchDocExtraCacheEntry {
     session_id: String,
     source_name: String,
     harness: String,
+    inference_provider: String,
     event_class: String,
     payload_type: String,
     actor_role: String,
@@ -1123,6 +1132,7 @@ FORMAT JSONEachRow",
   any(session_id) AS session_id,
   any(source_name) AS source_name,
   any(harness) AS harness,
+  any(inference_provider) AS inference_provider,
   any(event_class) AS event_class,
   any(payload_type) AS payload_type,
   any(actor_role) AS actor_role,
@@ -1143,6 +1153,7 @@ GROUP BY event_uid)"
   any(session_id) AS session_id,
   any(source_name) AS source_name,
   any(harness) AS harness,
+  any(inference_provider) AS inference_provider,
   any(event_class) AS event_class,
   any(payload_type) AS payload_type,
   any(actor_role) AS actor_role,
@@ -1210,6 +1221,7 @@ SELECT
   any(d.session_id) AS session_id,
   any(d.source_name) AS source_name,
   any(d.harness) AS harness,
+  any(d.inference_provider) AS inference_provider,
   any(d.event_class) AS event_class,
   any(d.payload_type) AS payload_type,
   any(d.actor_role) AS actor_role,
@@ -1272,6 +1284,7 @@ FORMAT JSONEachRow",
   any(session_id) AS session_id,
   any(source_name) AS source_name,
   any(harness) AS harness,
+  any(inference_provider) AS inference_provider,
   any(event_class) AS event_class,
   any(payload_type) AS payload_type,
   any(actor_role) AS actor_role,
@@ -1293,6 +1306,7 @@ GROUP BY event_uid)"
   any(session_id) AS session_id,
   any(source_name) AS source_name,
   any(harness) AS harness,
+  any(inference_provider) AS inference_provider,
   any(event_class) AS event_class,
   any(payload_type) AS payload_type,
   any(actor_role) AS actor_role,
@@ -1315,6 +1329,7 @@ GROUP BY event_uid)"
   d.session_id AS session_id,
   d.source_name AS source_name,
   d.harness AS harness,
+  d.inference_provider AS inference_provider,
   d.event_class AS event_class,
   d.payload_type AS payload_type,
   d.actor_role AS actor_role,
@@ -1564,6 +1579,7 @@ FORMAT JSONEachRow",
                     session_id: row.session_id,
                     source_name: row.source_name,
                     harness: row.harness,
+                    inference_provider: row.inference_provider,
                     event_class: row.event_class,
                     payload_type: row.payload_type,
                     actor_role: row.actor_role,
@@ -1954,6 +1970,7 @@ FORMAT JSONEachRow",
                     session_id: extra.session_id.clone(),
                     source_name: extra.source_name.clone(),
                     harness: extra.harness.clone(),
+                    inference_provider: extra.inference_provider.clone(),
                     event_class: extra.event_class.clone(),
                     payload_type: extra.payload_type.clone(),
                     actor_role: extra.actor_role.clone(),
@@ -2426,6 +2443,7 @@ SELECT
     toInt64(toUnixTimestamp64Milli(s.last_event_time))
   ) AS last_event_unix_ms,
   c.harness AS harness,
+  c.inference_provider AS inference_provider,
   c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
@@ -2437,12 +2455,14 @@ FROM (
     {outer_matched_terms_sql} AS matched_terms,
     count() AS event_count_considered,
     argMax(e.harness, e.event_score) AS harness,
+    argMax(e.inference_provider, e.event_score) AS inference_provider,
     argMax(e.event_uid, e.event_score) AS best_event_uid
   FROM (
     SELECT
       p.doc_id AS event_uid,
       any(p.session_id) AS session_id,
       any(p.harness) AS harness,
+      any(p.inference_provider) AS inference_provider,
       {inner_matched_terms_sql}
       sum(
         transform(toString(p.term), q_terms, q_idf, 0.0)
@@ -2615,6 +2635,7 @@ FORMAT JSONEachRow",
                     last_event_time,
                     source_name: row.source_name,
                     harness: row.harness,
+                    inference_provider: row.inference_provider,
                     score: row.score,
                     matched_terms: row.matched_terms,
                     doc_len: row.doc_len,
@@ -2646,6 +2667,7 @@ FORMAT JSONEachRow",
             "SELECT
   session_id,
   argMax(harness, event_ts) AS harness,
+  argMax(inference_provider, event_ts) AS inference_provider,
   ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), event_ts), '') AS session_slug,
   ifNull(
     argMax(
@@ -2738,6 +2760,7 @@ FORMAT JSONEachRow",
                     "session_id": hit.session_id,
                     "source_name": hit.source_name,
                     "harness": hit.harness,
+                    "inference_provider": hit.inference_provider,
                     "score": hit.score,
                     "matched_terms": hit.matched_terms as u16,
                     "doc_len": hit.doc_len,
@@ -3732,6 +3755,7 @@ FORMAT JSONEachRow",
                     last_event_time,
                     last_event_unix_ms,
                     harness: row_harness,
+                    inference_provider: row_inference_provider,
                     score,
                     matched_terms,
                     event_count_considered,
@@ -3764,6 +3788,12 @@ FORMAT JSONEachRow",
                 let harness = session_metadata
                     .and_then(|meta| (!meta.harness.is_empty()).then(|| meta.harness.clone()))
                     .or((!row_harness.is_empty()).then_some(row_harness));
+                let inference_provider = session_metadata
+                    .and_then(|meta| {
+                        (!meta.inference_provider.is_empty())
+                            .then(|| meta.inference_provider.clone())
+                    })
+                    .or((!row_inference_provider.is_empty()).then_some(row_inference_provider));
                 let session_slug = session_metadata.and_then(|meta| {
                     (!meta.session_slug.is_empty()).then(|| meta.session_slug.clone())
                 });
@@ -3778,6 +3808,7 @@ FORMAT JSONEachRow",
                     last_event_time: has_last_event_time.then_some(last_event_time),
                     last_event_unix_ms: has_last_event_time.then_some(last_event_unix_ms),
                     harness,
+                    inference_provider,
                     session_slug,
                     session_summary,
                     score,
@@ -3885,6 +3916,7 @@ mod tests {
             session_id: "session-1".to_string(),
             source_name: "source".to_string(),
             harness: "harness".to_string(),
+            inference_provider: "inference-provider".to_string(),
             event_class: "message".to_string(),
             payload_type: "message".to_string(),
             actor_role: "assistant".to_string(),
@@ -3915,6 +3947,7 @@ mod tests {
             session_id: session_id.to_string(),
             source_name: "source".to_string(),
             harness: "harness".to_string(),
+            inference_provider: "inference-provider".to_string(),
             event_class: event_class.to_string(),
             payload_type: payload_type.to_string(),
             actor_role: actor_role.to_string(),

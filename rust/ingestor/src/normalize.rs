@@ -1331,7 +1331,7 @@ pub fn normalize_record(
     let event_ts = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if harness == "claude" {
+    let mut session_id = if harness == "claude-code" {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1394,7 +1394,7 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if harness == "claude" {
+    let (event_rows, link_rows, tool_rows) = if harness == "claude-code" {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)

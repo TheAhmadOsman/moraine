@@ -27,7 +27,7 @@ watch_root = "~/.codex/sessions"
 
 [[ingest.sources]]
 name = "claude"
-harness = "claude"
+harness = "claude-code"
 enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"

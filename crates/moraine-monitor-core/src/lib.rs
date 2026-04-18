@@ -506,7 +506,7 @@ async fn api_analytics(
                GROUP BY event_uid \
              ) WHERE {generation_latest_filter} \
            ) \
-           WHERE harness_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
+           WHERE harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
            GROUP BY bucket_unix, model, session_id_latest, request_id_latest \
            UNION ALL \
            SELECT \
@@ -525,7 +525,7 @@ async fn api_analytics(
              FROM {table} \
              GROUP BY event_uid \
            ) WHERE {generation_latest_filter} \
-           AND NOT (harness_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
+           AND NOT (harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
          ) \
          GROUP BY bucket_unix, model \
          ORDER BY bucket_unix ASC, model ASC",
@@ -555,7 +555,7 @@ async fn api_analytics(
          FROM ( \
            SELECT \
              toUInt64(toUnixTimestamp(toStartOfInterval(event_ts, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-             if(harness = 'claude' AND length(trim(BOTH ' ' FROM agent_run_id)) > 0, concat(session_id, '::', agent_run_id), session_id) AS session_stream_key \
+             if(harness = 'claude-code' AND length(trim(BOTH ' ' FROM agent_run_id)) > 0, concat(session_id, '::', agent_run_id), session_id) AS session_stream_key \
            FROM {table} \
            WHERE {concurrent_filter} \
          ) \

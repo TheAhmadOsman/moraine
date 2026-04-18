@@ -498,6 +498,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "011_rename_provider_to_harness.sql",
             sql: include_str!("../../../sql/011_rename_provider_to_harness.sql"),
         },
+        Migration {
+            version: "012",
+            name: "012_add_inference_provider_and_rename_claude.sql",
+            sql: include_str!("../../../sql/012_add_inference_provider_and_rename_claude.sql"),
+        },
     ]
 }
 
@@ -768,26 +773,26 @@ mod tests {
         let migrations = bundled_migrations();
         assert_eq!(
             migrations.len(),
-            11,
-            "expected 11 bundled migrations, got {}",
+            12,
+            "expected 12 bundled migrations, got {}",
             migrations.len()
         );
 
         let last = migrations.last().expect("migrations non-empty");
-        assert_eq!(last.version, "011");
+        assert_eq!(last.version, "012");
         assert!(
-            last.name.contains("011"),
-            "expected migration name to contain '011', got {}",
+            last.name.contains("012"),
+            "expected migration name to contain '012', got {}",
             last.name
         );
         assert!(
-            last.name.contains("rename_provider_to_harness"),
-            "expected migration name to contain 'rename_provider_to_harness', got {}",
+            last.name.contains("add_inference_provider"),
+            "expected migration name to contain 'add_inference_provider', got {}",
             last.name
         );
         assert!(
             !last.sql.is_empty(),
-            "expected migration 011 sql to be bundled via include_str!"
+            "expected migration 012 sql to be bundled via include_str!"
         );
     }
 
