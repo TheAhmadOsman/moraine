@@ -32,15 +32,29 @@ enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 
-# Hermes Agent trajectories are ShareGPT-compatible JSONL written to the
-# directory tree where you ran the agent or batch runner. Add a source like
-# this for any Hermes output directory you want Moraine to watch.
+# Hermes Agent LIVE sessions: one JSON file per conversation under
+# ~/.hermes/sessions/ that the agent rewrites in place every turn.
+# `format = "session_json"` opts into the rewrite-aware processor that emits
+# only the newly appended messages on each watcher notify. Leave `format`
+# unset and moraine will infer it from the `.json` glob.
+[[ingest.sources]]
+name = "hermes"
+harness = "hermes"
+enabled = true
+glob = "~/.hermes/sessions/session_*.json"
+watch_root = "~/.hermes/sessions"
+format = "session_json"
+
+# Hermes Agent offline trajectories: ShareGPT-compatible JSONL written by
+# the datagen batch runner. Point at whatever directory your runner writes
+# `trajectory_samples.jsonl` to. Uncomment and adjust when you need it.
 # [[ingest.sources]]
-# name = "hermes"
+# name = "hermes-trajectories"
 # harness = "hermes"
 # enabled = true
 # glob = "~/trajectories/**/*.jsonl"
 # watch_root = "~/trajectories"
+# format = "jsonl"
 
 [mcp]
 max_results = 25

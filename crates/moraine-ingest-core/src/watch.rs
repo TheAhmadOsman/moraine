@@ -140,30 +140,34 @@ fn event_is_relevant(kind: &EventKind) -> bool {
     }
 }
 
-fn event_jsonl_paths(event: &Event) -> Vec<String> {
+fn event_tracked_paths(event: &Event, extension: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
-        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
             dedup.insert(path.to_string_lossy().to_string());
         }
     }
     dedup.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_rescan(
     glob_pattern: &str,
     source_name: &str,
     harness: &str,
+    format: &str,
+    extension: &str,
     tx: &mpsc::UnboundedSender<WorkItem>,
     metrics: &Arc<Metrics>,
 ) {
     record_rescan(metrics);
-    match enumerate_jsonl_files(glob_pattern) {
+    match enumerate_tracked_files(glob_pattern, extension) {
         Ok(paths) => {
             for path in paths {
                 let _ = tx.send(WorkItem {
                     source_name: source_name.to_string(),
                     harness: harness.to_string(),
+                    format: format.to_string(),
                     path,
                 });
             }
@@ -172,14 +176,15 @@ fn queue_rescan(
             warn!(
                 source = source_name,
                 harness,
+                format,
                 glob_pattern,
                 error = %exc,
-                "watcher rescan failed to enumerate jsonl files"
+                "watcher rescan failed to enumerate tracked files"
             );
             record_watcher_error(
                 metrics,
                 &format!(
-                    "rescan enumerate failed for source={source_name} harness={harness} glob={glob_pattern}: {exc}"
+                    "rescan enumerate failed for source={source_name} harness={harness} format={format} glob={glob_pattern}: {exc}"
                 ),
             );
         }
@@ -196,16 +201,19 @@ pub(crate) fn spawn_watcher_threads(
     for source in sources {
         let source_name = source.name.clone();
         let harness = source.harness.clone();
+        let format = source.format.clone();
+        let extension = source.tracked_extension().to_string();
         let glob_pattern = source.glob.clone();
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
         let metrics_clone = metrics.clone();
 
         info!(
-            "starting watcher on {} (source={}, harness={})",
+            "starting watcher on {} (source={}, harness={}, format={})",
             watch_root.display(),
             source_name,
-            harness
+            harness,
+            format
         );
 
         let handle = std::thread::spawn(move || {
@@ -259,6 +267,8 @@ pub(crate) fn spawn_watcher_threads(
                                 &glob_pattern,
                                 &source_name,
                                 &harness,
+                                &format,
+                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -286,6 +296,8 @@ pub(crate) fn spawn_watcher_threads(
                     &glob_pattern,
                     &source_name,
                     &harness,
+                    &format,
+                    &extension,
                     &tx_clone,
                     &metrics_clone,
                 );
@@ -301,6 +313,8 @@ pub(crate) fn spawn_watcher_threads(
                                 &glob_pattern,
                                 &source_name,
                                 &harness,
+                                &format,
+                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -311,10 +325,11 @@ pub(crate) fn spawn_watcher_threads(
                             continue;
                         }
 
-                        for path in event_jsonl_paths(&event) {
+                        for path in event_tracked_paths(&event, &extension) {
                             let _ = tx_clone.send(WorkItem {
                                 source_name: source_name.clone(),
                                 harness: harness.clone(),
+                                format: format.clone(),
                                 path,
                             });
                         }
@@ -329,6 +344,8 @@ pub(crate) fn spawn_watcher_threads(
                             &glob_pattern,
                             &source_name,
                             &harness,
+                            &format,
+                            &extension,
                             &tx_clone,
                             &metrics_clone,
                         );
@@ -344,7 +361,7 @@ pub(crate) fn spawn_watcher_threads(
     Ok(handles)
 }
 
-pub(crate) fn enumerate_jsonl_files(glob_pattern: &str) -> Result<Vec<String>> {
+pub(crate) fn enumerate_tracked_files(glob_pattern: &str, extension: &str) -> Result<Vec<String>> {
     let mut files = Vec::<String>::new();
     for entry in glob(glob_pattern).with_context(|| format!("invalid glob: {}", glob_pattern))? {
         let path = match entry {
@@ -355,7 +372,7 @@ pub(crate) fn enumerate_jsonl_files(glob_pattern: &str) -> Result<Vec<String>> {
             }
         };
 
-        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
             files.push(path.to_string_lossy().to_string());
         }
     }
@@ -396,16 +413,20 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_paths_are_deduped_and_filtered() {
+    fn tracked_paths_are_deduped_and_filtered_by_extension() {
         let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
         event.paths = vec![
             PathBuf::from("/tmp/a.jsonl"),
             PathBuf::from("/tmp/a.jsonl"),
             PathBuf::from("/tmp/b.txt"),
+            PathBuf::from("/tmp/c.json"),
         ];
 
-        let paths = event_jsonl_paths(&event);
-        assert_eq!(paths, vec!["/tmp/a.jsonl".to_string()]);
+        let jsonl = event_tracked_paths(&event, "jsonl");
+        assert_eq!(jsonl, vec!["/tmp/a.jsonl".to_string()]);
+
+        let session_json = event_tracked_paths(&event, "json");
+        assert_eq!(session_json, vec!["/tmp/c.json".to_string()]);
     }
 
     #[test]
@@ -427,7 +448,15 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        queue_rescan("[", "source-alpha", "harness-alpha", &tx, &metrics);
+        queue_rescan(
+            "[",
+            "source-alpha",
+            "harness-alpha",
+            "jsonl",
+            "jsonl",
+            &tx,
+            &metrics,
+        );
 
         assert!(rx.try_recv().is_err());
         assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
