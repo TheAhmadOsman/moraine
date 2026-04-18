@@ -112,7 +112,7 @@ from the same (or any) worktree hit the shared sccache and finish in
 
 ## Commands
 
-### `up [--id <sb-xxxxxx>] [--rebuild] [--mount-host-sessions]`
+### `up [--id <sb-xxxxxx>] [--rebuild] [--mount-host-sessions] [--quiet|-q]`
 
 Bring up a sandbox.
 
@@ -127,6 +127,13 @@ Bring up a sandbox.
   `$SANDBOX_CLAUDE_PROJECTS_DIR`. Without this flag, ingest sources
   point at empty fixture dirs under the generated config dir so you
   can drop in your own `.jsonl` files.
+- `--quiet` / `-q` — redirect all progress output (log lines, docker
+  compose build + up chatter, the summary block) to stderr, and emit
+  only the sandbox id on stdout. Designed for scripting and agents:
+  `id=$(moraine-sandbox up --quiet)`. This closes a footgun where
+  piping `up` through `tail`/`head` truncated the `[sandbox] up: <id>`
+  banner, leaving the caller with a running sandbox it could no longer
+  identify.
 
 ### `shell [<id>]`
 

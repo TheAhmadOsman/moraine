@@ -486,6 +486,7 @@ cmd_up() {
     local id=""
     local mount_sessions=0
     local rebuild=0
+    local quiet=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -496,6 +497,7 @@ cmd_up() {
                 ;;
             --mount-host-sessions) mount_sessions=1; shift ;;
             --rebuild)             rebuild=1; shift ;;
+            -q|--quiet)            quiet=1; shift ;;
             -h|--help)             print_help; exit 0 ;;
             *) die "unknown flag for 'up': $1" ;;
         esac
@@ -505,6 +507,16 @@ cmd_up() {
         id="$(generate_sandbox_id)"
     fi
     validate_sandbox_id "$id"
+
+    # In quiet mode, redirect all progress noise to stderr and only emit the
+    # sandbox id to the real stdout at the very end — so callers can do:
+    #   id=$(moraine-sandbox up --quiet)
+    # and pipes/truncation like `| tail -30` can never swallow the id, which
+    # was a real footgun that caused agents to leak orphan sandboxes.
+    if (( quiet )); then
+        exec 3>&1   # save original stdout
+        exec 1>&2   # redirect stdout → stderr for the rest of this function
+    fi
 
     check_docker
     check_repo_root
@@ -595,6 +607,12 @@ cmd_up() {
     fi
 
     print_summary "$id" "$monitor_port" "$ch_http_port" "$config_path"
+
+    # Only the id to the real stdout in quiet mode — everything above went
+    # to stderr thanks to the exec 1>&2 up top.
+    if (( quiet )); then
+        printf '%s\n' "$id" >&3
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -784,12 +802,15 @@ USAGE:
     moraine-sandbox <command> [args]
 
 COMMANDS:
-    up [--id <id>] [--mount-host-sessions] [--rebuild]
+    up [--id <id>] [--mount-host-sessions] [--rebuild] [--quiet|-q]
          Bring up a new sandbox. Picks random host ports and generates
          a moraine.toml under /tmp/moraine-sandbox-<id>/. The first boot
          compiles the workspace inside the container (takes a few minutes
          cold, seconds warm). --rebuild forces a fresh cargo build even
-         when the binaries volume already has prior output.
+         when the binaries volume already has prior output. --quiet emits
+         only the sandbox id on stdout (progress/summary go to stderr), so
+         callers can capture the id without piping/tailing:
+             id=$(moraine-sandbox up --quiet)
 
     shell [<id>]       Exec an interactive bash as user 'moraine' inside
                        the container. If <id> is omitted and exactly one

@@ -40,14 +40,15 @@ The sandbox is a long-lived linux container that mounts your current worktree at
 ### Typical agent flow
 
 ```bash
-# 1. Boot. First time from a cold sccache takes ~2 min; warm cache is ~30 s.
-#    Picks random host ports, prints monitor URL + id.
-scripts/dev/sandbox/moraine-sandbox up
+# 1. Boot. Capture the id with --quiet so you can't lose it to output
+#    truncation. First boot cold is ~2 min; warm is ~30 s.
+id=$(scripts/dev/sandbox/moraine-sandbox up --quiet)
+echo "sandbox: $id"
 
 # 2. Shell in and iterate. cargo check / cargo test / cargo clippy all just
 #    work. sccache is RUSTC_WRAPPER, so builds share a cache with every
 #    other sandbox and with host cargo (for matching target triples).
-scripts/dev/sandbox/moraine-sandbox shell         # auto-selects if only one sandbox
+scripts/dev/sandbox/moraine-sandbox shell "$id"
 # inside the container:
 #   cd /repo
 #   cargo check --workspace --locked
@@ -55,23 +56,38 @@ scripts/dev/sandbox/moraine-sandbox shell         # auto-selects if only one san
 #   cargo clippy --workspace --all-targets -- -D warnings
 
 # 3. Validate behavior against the printed monitor URL.
-curl -fsS http://127.0.0.1:<monitor-port>/api/health
+port=$(scripts/dev/sandbox/moraine-sandbox status "$id" | awk -F: '/^\[sandbox\] monitor/{print $NF}')
+curl -fsS "http://127.0.0.1:${port}/api/health"
 
 # 4. Tear down before reporting task complete. Leftover sandboxes leak
 #    ClickHouse data and consume host ports.
-scripts/dev/sandbox/moraine-sandbox down <id>     # or: down --all
+scripts/dev/sandbox/moraine-sandbox down "$id"
 ```
+
+**Important**: do NOT pipe `moraine-sandbox up` through `tail` / `head` to
+limit output — the `[sandbox] up: sb-xxxxxx` summary line can fall off the
+end of the buffer, at which point you've booted a sandbox you can no longer
+identify (and, since you assume it belongs to another agent when it shows
+up in `list`, you boot a *second* one and leak the first). Use `--quiet`
+(id-only on stdout) or pass `--id sb-xxxxxx` yourself so you always know
+which sandbox is yours.
 
 ### Commands
 
 | Command | What it does |
 |---|---|
-| `moraine-sandbox up [--id <id>] [--rebuild] [--mount-host-sessions]` | Boot. Builds the workspace on first run; `--rebuild` forces re-compile even when binaries already exist in the volume. |
+| `moraine-sandbox up [--id <id>] [--rebuild] [--mount-host-sessions] [--quiet\|-q]` | Boot. Builds the workspace on first run; `--rebuild` forces re-compile; `--quiet` prints only the sandbox id on stdout (progress goes to stderr) so the id is safe under piping/truncation. |
 | `moraine-sandbox shell [<id>]` | `docker exec` an interactive bash as user `moraine`. |
 | `moraine-sandbox logs [<id>] [-f]` | Tail container logs (includes the bootstrap cargo build output). |
 | `moraine-sandbox status [<id>]` | Summary block + `docker compose ps`. |
 | `moraine-sandbox list` | One-line-per-sandbox table. |
 | `moraine-sandbox down <id>` / `down --all` | Stop, remove the container + all named volumes + the `/tmp/moraine-sandbox-<id>/` config dir. |
+
+### Isolation worktrees (spawned via the Agent SDK's `isolation: "worktree"`)
+
+If you were spawned into a temporary worktree (e.g. `/Users/.../.claude/worktrees/agent-<id>/`), its branch may be **`main`**, not the branch the parent session is working on. The Agent SDK currently branches isolation worktrees from the repo root's `HEAD`, not the calling process's current branch.
+
+**Before you start:** compare `git -C <your-worktree> rev-parse HEAD` against `git -C /Users/eric/src/moraine/.claude/worktrees/*/ rev-parse HEAD` for any sibling worktree whose branch name matches the task you were given. If they differ, the sibling worktree (the parent session's working copy) is the authoritative source for in-progress code. Invoke `scripts/dev/sandbox/moraine-sandbox` from there — the sandbox will bind-mount *that* worktree at `/repo`, which is what you actually want to test.
 
 ### Things to know
 
