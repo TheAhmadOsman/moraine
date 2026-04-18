@@ -263,18 +263,18 @@ ensure_compose_env() {
     : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
     : "${SANDBOX_MONITOR_HOST_PORT:=0}"
     : "${SANDBOX_REPO_ROOT:=/tmp}"
-    : "${SANDBOX_BIN_DIR:=/tmp}"
     : "${SANDBOX_WEB_DIR:=/tmp}"
     : "${SANDBOX_CONFIG_DIR:=/tmp}"
     : "${SANDBOX_ENTRYPOINT:=/dev/null}"
     : "${SANDBOX_CODEX_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
     : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
+    : "${SANDBOX_REBUILD:=0}"
     export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
         SANDBOX_CLICKHOUSE_TCP_HOST_PORT SANDBOX_MONITOR_HOST_PORT \
-        SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
+        SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
         SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
-        SANDBOX_SCCACHE_HOST_DIR
+        SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
 }
 
 dc() {
@@ -412,98 +412,6 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Build strategies
-# ---------------------------------------------------------------------------
-
-# Decide SANDBOX_BIN_DIR based on build flags. Echoes the chosen absolute
-# path on stdout.
-prepare_binaries() {
-    local strategy="$1"  # skip | in-container | use-host | default
-    local id="$2"
-    local os
-    os="$(detect_os)"
-
-    case "$strategy" in
-        skip)
-            # Caller promises binaries are at target/debug or target/<triple>/debug.
-            local triple_dir="${REPO_ROOT}/target/debug"
-            if [[ "$os" == "macos" ]]; then
-                local triple
-                triple="$(detect_linux_triple)"
-                triple_dir="${REPO_ROOT}/target/${triple}/debug"
-            fi
-            [[ -x "${triple_dir}/moraine" ]] || \
-                die "--skip-build: no moraine binary at ${triple_dir}/moraine"
-            printf '%s' "$triple_dir"
-            ;;
-        in-container)
-            local out_dir
-            out_dir="/tmp/${PROJECT_PREFIX}${id}/bin"
-            mkdir -p "$out_dir"
-            # Shared rolling tag: layer cache (plus cargo registry/target cache
-            # mounts inside the Dockerfile) means re-runs from the same worktree
-            # reuse prior work, and switching between worktrees just updates
-            # the tag — no accumulating per-id images.
-            log "building binaries in container (--build-in-container)"
-            docker build \
-                --target builder \
-                -f "$DOCKERFILE" \
-                -t "moraine-sandbox-builder:latest" \
-                "$REPO_ROOT"
-            docker run --rm \
-                -v "${out_dir}:/out" \
-                "moraine-sandbox-builder:latest" \
-                sh -c 'cp target/release/moraine target/release/moraine-ingest target/release/moraine-monitor target/release/moraine-mcp /out/'
-            printf '%s' "$out_dir"
-            ;;
-        use-host)
-            local want_dir
-            if [[ "$os" == "linux" ]]; then
-                want_dir="${REPO_ROOT}/target/debug"
-            else
-                local triple
-                triple="$(detect_linux_triple)"
-                want_dir="${REPO_ROOT}/target/${triple}/debug"
-            fi
-            if [[ ! -x "${want_dir}/moraine" ]]; then
-                if [[ "$os" == "linux" ]]; then
-                    die "--use-host-binaries: no binary at ${want_dir}/moraine; build first with 'cargo build --workspace --locked'"
-                else
-                    die "--use-host-binaries: no binary at ${want_dir}/moraine; cross-build first (e.g. 'cross build --workspace --locked --target $(detect_linux_triple)')"
-                fi
-            fi
-            printf '%s' "$want_dir"
-            ;;
-        default)
-            if [[ "$os" == "linux" ]]; then
-                log "host-building moraine (cargo build --workspace --locked)"
-                (
-                    cd "$REPO_ROOT"
-                    cargo build --workspace --locked
-                )
-                printf '%s' "${REPO_ROOT}/target/debug"
-            else
-                if have_cmd cross; then
-                    local triple
-                    triple="$(detect_linux_triple)"
-                    log "host-building moraine with 'cross' for ${triple}"
-                    (
-                        cd "$REPO_ROOT"
-                        cross build --workspace --locked --target "$triple"
-                    )
-                    printf '%s' "${REPO_ROOT}/target/${triple}/debug"
-                else
-                    die "On macOS, host builds require \`cross\` (cargo install cross). Alternatively re-run with --build-in-container."
-                fi
-            fi
-            ;;
-        *)
-            die "internal: unknown build strategy '${strategy}'"
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
 # Health wait
 # ---------------------------------------------------------------------------
 
@@ -577,9 +485,7 @@ host_port_for() {
 cmd_up() {
     local id=""
     local mount_sessions=0
-    local build_in_container=0
-    local use_host_binaries=0
-    local skip_build=0
+    local rebuild=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -589,23 +495,19 @@ cmd_up() {
                 shift 2
                 ;;
             --mount-host-sessions) mount_sessions=1; shift ;;
-            --build-in-container)  build_in_container=1; shift ;;
-            --use-host-binaries)   use_host_binaries=1; shift ;;
-            --skip-build)          skip_build=1; shift ;;
+            --rebuild)             rebuild=1; shift ;;
+            # Legacy flags from the pre-"build-on-boot" design — now no-ops.
+            # All builds happen inside the running container against the
+            # mounted worktree, with sccache caching. Accept-and-warn keeps
+            # stale scripts working during the transition.
+            --build-in-container|--use-host-binaries|--skip-build)
+                warn "$1 is deprecated and has no effect — builds always run inside the container now (see RFC #232 update)"
+                shift
+                ;;
             -h|--help)             print_help; exit 0 ;;
             *) die "unknown flag for 'up': $1" ;;
         esac
     done
-
-    # Mutual exclusion sanity check.
-    local strategy="default"
-    local selected=0
-    if [[ "$skip_build" == "1" ]]; then strategy="skip"; selected=$((selected+1)); fi
-    if [[ "$build_in_container" == "1" ]]; then strategy="in-container"; selected=$((selected+1)); fi
-    if [[ "$use_host_binaries" == "1" ]]; then strategy="use-host"; selected=$((selected+1)); fi
-    if (( selected > 1 )); then
-        die "--skip-build, --build-in-container, and --use-host-binaries are mutually exclusive"
-    fi
 
     if [[ -z "$id" ]]; then
         id="$(generate_sandbox_id)"
@@ -622,12 +524,9 @@ cmd_up() {
 
     log "starting sandbox ${id} (project ${project})"
 
-    # Binaries.
-    local bin_dir
-    bin_dir="$(prepare_binaries "$strategy" "$id")"
-    log "using binaries at ${bin_dir}"
-
-    # Web assets.
+    # Web assets — still built on the host for now (bun toolchain not in the
+    # runtime image). If/when we move the web build into the container too,
+    # this goes away.
     ensure_monitor_frontend
     local web_dir="${REPO_ROOT}/web/monitor/dist"
     [[ -f "${web_dir}/index.html" ]] || \
@@ -662,10 +561,10 @@ cmd_up() {
     export SANDBOX_CLICKHOUSE_HTTP_HOST_PORT="$ch_http_port"
     export SANDBOX_CLICKHOUSE_TCP_HOST_PORT="$ch_tcp_port"
     export SANDBOX_REPO_ROOT="$REPO_ROOT"
-    export SANDBOX_BIN_DIR="$bin_dir"
     export SANDBOX_WEB_DIR="$web_dir"
     export SANDBOX_CONFIG_DIR="$config_dir"
     export SANDBOX_ENTRYPOINT="${REPO_ROOT}/scripts/dev/sandbox/entrypoint.sh"
+    export SANDBOX_REBUILD="$rebuild"
 
     # sccache cache bind. Prefer the host's SCCACHE_DIR (what the developer
     # already uses), falling back to the XDG default. Created lazily so first
@@ -691,9 +590,15 @@ cmd_up() {
     log "starting container (docker compose up -d)"
     dc "$project" "$mount_sessions" up -d
 
-    # Wait for health.
-    log "waiting for container health (timeout 120s)"
-    if ! wait_for_healthy "$project" "$mount_sessions" 120; then
+    # Wait for health. The first boot of a sandbox runs `cargo build
+    # --workspace --locked` inside the container before moraine's /api/health
+    # comes online. With a cold sccache a from-scratch workspace build can
+    # take ~10 minutes; with the host's sccache warm it's seconds. Budget
+    # 900s and surface progress via the log hint so operators don't worry.
+    local health_timeout=900
+    log "waiting for container health (timeout ${health_timeout}s; initial boot runs cargo build inside container)"
+    log "follow live: scripts/dev/sandbox/moraine-sandbox logs ${id} -f"
+    if ! wait_for_healthy "$project" "$mount_sessions" "$health_timeout"; then
         die "sandbox ${id} did not become healthy; inspect logs with 'moraine-sandbox logs ${id}'"
     fi
 
@@ -877,22 +782,34 @@ print_help() {
     cat <<'EOF'
 moraine-sandbox — per-developer containerized moraine stack (RFC #232)
 
+A sandbox is a long-lived linux container that mounts your worktree at
+/repo, cargo-builds the workspace on first boot (wrapped by sccache sharing
+your host's cache dir), then runs the moraine stack. Agents iterate inside
+via `moraine-sandbox shell` — cargo build / test / clippy all just work
+against the volume-backed target dir.
+
 USAGE:
     moraine-sandbox <command> [args]
 
 COMMANDS:
-    up [--id <id>] [--mount-host-sessions]
-       [--build-in-container | --use-host-binaries | --skip-build]
+    up [--id <id>] [--mount-host-sessions] [--rebuild]
          Bring up a new sandbox. Picks random host ports and generates
-         a moraine.toml under /tmp/moraine-sandbox-<id>/.
+         a moraine.toml under /tmp/moraine-sandbox-<id>/. The first boot
+         compiles the workspace inside the container (takes a few minutes
+         cold, seconds warm). --rebuild forces a fresh cargo build even
+         when the binaries volume already has prior output.
 
     shell [<id>]       Exec an interactive bash as user 'moraine' inside
                        the container. If <id> is omitted and exactly one
                        sandbox exists, it is selected automatically.
+                       cargo / rustc / rustup / sccache are all on PATH;
+                       CARGO_TARGET_DIR points at a volume so builds are
+                       incremental across exec sessions.
 
-    logs [<id>] [-f]   Tail container logs (docker compose logs).
+    logs [<id>] [-f]   Tail container logs (docker compose logs). Includes
+                       the bootstrap cargo build output.
 
-    down <id>          Stop + remove the container, named volume, and
+    down <id>          Stop + remove the container, named volumes, and
                        the /tmp/moraine-sandbox-<id>/ config dir.
     down --all         Do the same for every sandbox owned by this user.
 
@@ -902,19 +819,12 @@ COMMANDS:
 
     --help, -h         Show this help.
 
-BUILD STRATEGIES (mutually exclusive, used by `up`):
-    --skip-build           Use the binaries already at target/debug (Linux)
-                           or target/<linux-triple>/debug (macOS).
-    --build-in-container   Run the builder stage of Dockerfile in Docker,
-                           extract release binaries, mount them read-only.
-    --use-host-binaries    Require caller-built binaries at the conventional
-                           target path. On macOS that means a Linux-cross
-                           build (cross/aarch64 or x86_64).
-    (default on Linux)     cargo build --workspace --locked.
-    (default on macOS)     Use `cross` for the host Linux triple, or error.
-
 ENVIRONMENT:
     PYTHON_BIN                  python3 interpreter used for port picking
+    SCCACHE_DIR                 host sccache cache dir (defaults to
+                                ~/.cache/sccache); bind-mounted rw into the
+                                container so container cargo builds share
+                                the developer's existing cache
     SANDBOX_CODEX_SESSIONS_DIR  override host codex sessions dir (for
                                 --mount-host-sessions; default ~/.codex/sessions)
     SANDBOX_CLAUDE_PROJECTS_DIR override host claude projects dir (default

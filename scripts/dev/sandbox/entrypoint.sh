@@ -2,12 +2,25 @@
 # Moraine dev sandbox — container entrypoint. See RFC #232.
 #
 # Run by tini as PID 1 child. Expects:
-#   /opt/moraine/bin   — Linux moraine* binaries (ro, host bind mount)
+#   /repo              — worktree source tree       (ro, host bind mount)
+#   /opt/moraine/bin   — named volume, populated by this script's initial
+#                        cargo build from /repo (or prior boot's output)
 #   /opt/moraine/web   — monitor dist assets       (ro, host bind mount)
 #   /sandbox           — generated moraine.toml    (ro, host bind mount)
 #   /home/moraine/.moraine — named volume for runtime state (rw)
+#   /home/moraine/.cargo   — named volume, cargo registry + git cache
+#   /home/moraine/target   — named volume, CARGO_TARGET_DIR
+#   /home/moraine/.cache/sccache — host bind mount, shared sccache disk cache
 # and that a sibling `clickhouse` service in the same compose project is up
 # and healthy on http://${SANDBOX_CLICKHOUSE_HOST:-clickhouse}:${SANDBOX_CLICKHOUSE_PORT:-8123}.
+#
+# Boot-build behavior:
+#   The sandbox is a dev environment — agents iterate on /repo inside a
+#   running container (cargo build / test / clippy etc.), with sccache
+#   backing the shared host cache dir. On first boot (or when SANDBOX_REBUILD=1),
+#   this script compiles the workspace before starting moraine services. On
+#   subsequent boots the binaries are still in the `binaries` named volume and
+#   the build is skipped unless SANDBOX_REBUILD=1.
 
 set -euo pipefail
 
@@ -49,25 +62,15 @@ graceful_shutdown() {
 trap graceful_shutdown TERM INT
 
 # ---------------------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight checks (worktree + config, not binaries)
 # ---------------------------------------------------------------------------
-
-if [[ ! -x "$MORAINE_BIN" ]]; then
-    die "moraine binary not found at $MORAINE_BIN — host CLI should bind-mount it"
-fi
 
 if [[ ! -f "$MORAINE_CONFIG_PATH" ]]; then
     die "sandbox config not found at $MORAINE_CONFIG_PATH — host CLI should generate and mount it"
 fi
 
-for helper in moraine-ingest moraine-monitor; do
-    if [[ ! -x "/opt/moraine/bin/$helper" ]]; then
-        die "$helper not found at /opt/moraine/bin/$helper — host CLI should bind-mount the full release dir"
-    fi
-done
-
-if [[ ! -x "/opt/moraine/bin/moraine-mcp" ]]; then
-    warn "moraine-mcp not found at /opt/moraine/bin/moraine-mcp (MCP is not started by default; ignoring)"
+if [[ ! -f /repo/Cargo.toml ]]; then
+    die "/repo/Cargo.toml missing — host CLI should bind-mount the worktree at /repo"
 fi
 
 if [[ ! -f "/opt/moraine/web/index.html" ]]; then
@@ -75,6 +78,57 @@ if [[ ! -f "/opt/moraine/web/index.html" ]]; then
 fi
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+# ---------------------------------------------------------------------------
+# Boot-build: compile the workspace if binaries aren't already present.
+#
+# On first boot the `binaries` named volume is empty. We cargo-build all four
+# workspace binaries and install them at /opt/moraine/bin/. Subsequent boots
+# reuse the volume's contents unless SANDBOX_REBUILD=1 is set. sccache wraps
+# rustc so even "cold" builds benefit from the shared host cache for entries
+# that target the same triple.
+#
+# CARGO_TARGET_DIR and CARGO_HOME are set in the image env; both are mapped
+# to named volumes so subsequent incremental builds from `moraine-sandbox
+# shell` are fast.
+# ---------------------------------------------------------------------------
+
+needs_build=0
+if [[ "${SANDBOX_REBUILD:-0}" == "1" ]]; then
+    log "SANDBOX_REBUILD=1 — forcing fresh cargo build"
+    needs_build=1
+elif [[ ! -x "$MORAINE_BIN" ]]; then
+    log "no prior binaries at /opt/moraine/bin — running initial cargo build"
+    needs_build=1
+else
+    log "reusing binaries from prior boot (set SANDBOX_REBUILD=1 to force rebuild)"
+fi
+
+if (( needs_build )); then
+    log "cd /repo && cargo build --workspace --locked"
+    log "(cold sccache can take several minutes; warm cache is seconds)"
+    build_log="$LOG_DIR/bootstrap-build.log"
+    : >"$build_log"
+    if ! ( cd /repo && cargo build --workspace --locked ) 2>&1 | tee -a "$build_log"; then
+        warn "cargo build failed — tail of $build_log:"
+        tail -n 40 "$build_log" >&2 || true
+        die "initial cargo build failed; resolve errors and relaunch the sandbox"
+    fi
+    log "installing built binaries to /opt/moraine/bin"
+    install -m 0755 \
+        "${CARGO_TARGET_DIR}/debug/moraine" \
+        "${CARGO_TARGET_DIR}/debug/moraine-ingest" \
+        "${CARGO_TARGET_DIR}/debug/moraine-monitor" \
+        "${CARGO_TARGET_DIR}/debug/moraine-mcp" \
+        /opt/moraine/bin/ || die "failed to install binaries from ${CARGO_TARGET_DIR}/debug/"
+    log "initial build complete"
+fi
+
+for helper in moraine-ingest moraine-monitor moraine-mcp; do
+    if [[ ! -x "/opt/moraine/bin/$helper" ]]; then
+        die "$helper still missing from /opt/moraine/bin after build"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Wait for the compose-managed ClickHouse to be reachable
