@@ -1,0 +1,870 @@
+#!/usr/bin/env bash
+# Moraine dev sandbox — host CLI. See RFC #232.
+#
+# Orchestrates a per-developer containerized moraine stack. The container
+# image, compose files, and entrypoint live next to this script; this CLI
+# picks ports, generates moraine.toml, builds host binaries (or delegates to
+# a builder image), and drives `docker compose` for up/down/shell/etc.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/compose.yaml"
+SESSIONS_COMPOSE_FILE="${SCRIPT_DIR}/compose.sessions.yaml"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+DEFAULT_CONFIG_PATH="${REPO_ROOT}/config/moraine.toml"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+SANDBOX_ID_REGEX='^sb-[a-f0-9]{6}$'
+PROJECT_PREFIX="moraine-sandbox-"
+
+# compose.yaml / compose.sessions.yaml reference these at parse time, even
+# for read-only commands like `docker compose ps|logs|port|down`. When a
+# subcommand is invoked outside of `up` (fresh shell, agent teardown, etc.)
+# the caller has not set them, which breaks compose var interpolation. Seed
+# benign placeholders here; `cmd_up` overrides them with real values before
+# building / starting the stack.
+: "${SANDBOX_REPO_ROOT:=/dev/null}"
+: "${SANDBOX_BIN_DIR:=/dev/null}"
+: "${SANDBOX_WEB_DIR:=/dev/null}"
+: "${SANDBOX_CONFIG_DIR:=/dev/null}"
+: "${SANDBOX_CODEX_SESSIONS_DIR:=/dev/null}"
+: "${SANDBOX_CLAUDE_PROJECTS_DIR:=/dev/null}"
+: "${SANDBOX_MONITOR_HOST_PORT:=0}"
+: "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
+: "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
+: "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
+export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
+export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR
+export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
+export SANDBOX_CLICKHOUSE_IMAGE
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+# All three write to stderr so they never contaminate command-substitution
+# captures. Stdout is reserved for values (e.g. prepare_binaries returning a
+# path, list_sandbox_ids emitting ids).
+log()  { printf '[sandbox] %s\n' "$*" >&2; }
+warn() { printf '[sandbox] WARN: %s\n' "$*" >&2; }
+die()  { printf '[sandbox] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux)  printf 'linux' ;;
+        Darwin) printf 'macos' ;;
+        *)      printf 'other' ;;
+    esac
+}
+
+detect_linux_triple() {
+    # Used when cross-compiling from macOS to a Linux container target.
+    case "$(uname -m)" in
+        arm64|aarch64) printf 'aarch64-unknown-linux-gnu' ;;
+        x86_64|amd64)  printf 'x86_64-unknown-linux-gnu' ;;
+        *) die "unsupported host arch for cross build: $(uname -m)" ;;
+    esac
+}
+
+generate_sandbox_id() {
+    printf 'sb-%s' "$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+}
+
+validate_sandbox_id() {
+    local id="$1"
+    [[ "$id" =~ $SANDBOX_ID_REGEX ]] || \
+        die "invalid sandbox id '${id}' (expected ${SANDBOX_ID_REGEX})"
+}
+
+project_name_for() {
+    printf '%s%s' "$PROJECT_PREFIX" "${1#sb-}"
+    # NOTE: we intentionally keep the full sb- prefix-stripped form out of the
+    # project name path: the spec calls for project `moraine-sandbox-<id>`
+    # where <id> is the full `sb-xxxxxx`. Override below.
+}
+
+# The spec says: COMPOSE_PROJECT_NAME = moraine-sandbox-<id> where <id> is
+# the full `sb-xxxxxx`. Implement that directly.
+project_name_for() {
+    printf '%s%s' "$PROJECT_PREFIX" "$1"
+}
+
+config_dir_for() {
+    printf '/tmp/%s%s' "$PROJECT_PREFIX" "$1"
+}
+
+check_docker() {
+    need_cmd docker
+    if ! docker compose version >/dev/null 2>&1; then
+        die "'docker compose' plugin not available — install Docker Desktop or compose v2"
+    fi
+}
+
+check_repo_root() {
+    local cargo_toml="${REPO_ROOT}/Cargo.toml"
+    [[ -f "$cargo_toml" ]] || \
+        die "repo root missing Cargo.toml at ${cargo_toml}"
+    if ! grep -q 'moraine-ingest' "$cargo_toml"; then
+        die "repo root does not look like moraine workspace (no moraine-ingest in Cargo.toml)"
+    fi
+}
+
+pick_open_port() {
+    "$PYTHON_BIN" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+
+pick_clickhouse_http_port() {
+    "$PYTHON_BIN" -c '
+import random
+import socket
+import sys
+
+TCP_OFFSET = 877
+INTERSERVER_OFFSET = 886
+
+for _ in range(500):
+    http_port = random.randint(20000, 60000 - INTERSERVER_OFFSET)
+    ports = [http_port, http_port + TCP_OFFSET, http_port + INTERSERVER_OFFSET]
+    sockets = []
+    try:
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", port))
+            sockets.append(sock)
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        continue
+    for sock in sockets:
+        sock.close()
+    print(http_port)
+    sys.exit(0)
+
+print("failed to find available ClickHouse ports", file=sys.stderr)
+sys.exit(1)
+'
+}
+
+clickhouse_version_from_default_config() {
+    local cfg="$DEFAULT_CONFIG_PATH"
+    [[ -f "$cfg" ]] || die "default config not found at ${cfg}"
+    local line
+    line="$(grep -E '^[[:space:]]*clickhouse_version[[:space:]]*=' "$cfg" | head -n1 || true)"
+    [[ -n "$line" ]] || die "clickhouse_version not found in ${cfg}"
+    # Strip key + whitespace + quotes.
+    local value
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"
+    value="${value#\"}"
+    [[ -n "$value" ]] || die "could not parse clickhouse_version from ${cfg}"
+    printf '%s' "$value"
+}
+
+monitor_frontend_needs_build() {
+    local dist_index="${REPO_ROOT}/web/monitor/dist/index.html"
+    if [[ ! -f "$dist_index" ]]; then
+        return 0
+    fi
+    local watch_paths=(
+        "${REPO_ROOT}/web/monitor/src"
+        "${REPO_ROOT}/web/monitor/index.html"
+        "${REPO_ROOT}/web/monitor/package.json"
+        "${REPO_ROOT}/web/monitor/tsconfig.app.json"
+        "${REPO_ROOT}/web/monitor/tsconfig.node.json"
+        "${REPO_ROOT}/web/monitor/vite.config.ts"
+    )
+    local path
+    for path in "${watch_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            if find "$path" -type f -newer "$dist_index" -print -quit | grep -q .; then
+                return 0
+            fi
+        elif [[ -f "$path" && "$path" -nt "$dist_index" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_monitor_frontend() {
+    local dist_dir="${REPO_ROOT}/web/monitor/dist"
+    if ! monitor_frontend_needs_build; then
+        log "monitor frontend up to date (${dist_dir})"
+        return 0
+    fi
+    if ! have_cmd bun; then
+        if [[ -f "${dist_dir}/index.html" ]]; then
+            warn "bun not found but ${dist_dir}/index.html already exists; skipping rebuild"
+            return 0
+        fi
+        die "monitor frontend needs a build but 'bun' is not installed (install bun or prebuild web/monitor/dist)"
+    fi
+    log "building monitor frontend (web/monitor)"
+    (
+        cd "${REPO_ROOT}/web/monitor"
+        bun install --frozen-lockfile
+        bun run build
+    )
+}
+
+docker_compose_files_args() {
+    local mount_sessions="$1"
+    local args=(-f "$COMPOSE_FILE")
+    if [[ "$mount_sessions" == "1" ]]; then
+        args+=(-f "$SESSIONS_COMPOSE_FILE")
+    fi
+    printf '%s\n' "${args[@]}"
+}
+
+# Read lines from stdin into the named array. Portable replacement for
+# mapfile/readarray (bash 3.2 — macOS /bin/bash). Usage:
+#   read_lines_into arr < <(cmd)
+read_lines_into() {
+    local __arr_name="$1"
+    local __line
+    eval "$__arr_name=()"
+    while IFS= read -r __line; do
+        eval "$__arr_name+=(\"\$__line\")"
+    done
+}
+
+# Run docker compose for a project with the right -f flags.
+# Usage: dc <project> <mount_sessions 0|1> <args...>
+# Placeholder env defaults so compose can always parse compose.yaml even for
+# read-only/teardown subcommands that don't set real values. `up` overrides
+# these with real values *before* calling any compose helper. Other commands
+# (down, shell, logs, status, list) identify containers by project name and
+# don't use the volume specs, but compose still needs to parse the file —
+# without fallbacks it chokes on empty strings inside the volume specs
+# ("invalid spec: :/repo:ro").
+ensure_compose_env() {
+    : "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
+    : "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
+    : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
+    : "${SANDBOX_MONITOR_HOST_PORT:=0}"
+    : "${SANDBOX_REPO_ROOT:=/tmp}"
+    : "${SANDBOX_WEB_DIR:=/tmp}"
+    : "${SANDBOX_CONFIG_DIR:=/tmp}"
+    : "${SANDBOX_ENTRYPOINT:=/dev/null}"
+    : "${SANDBOX_CODEX_SESSIONS_DIR:=/tmp}"
+    : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
+    : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
+    : "${SANDBOX_REBUILD:=0}"
+    export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
+        SANDBOX_CLICKHOUSE_TCP_HOST_PORT SANDBOX_MONITOR_HOST_PORT \
+        SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
+        SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
+        SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
+}
+
+dc() {
+    local project="$1"; shift
+    local mount_sessions="$1"; shift
+    local files=()
+    read_lines_into files < <(docker_compose_files_args "$mount_sessions")
+    ensure_compose_env
+    docker compose -p "$project" "${files[@]}" "$@"
+}
+
+# Resolve <id>: if given validate; else find exactly one existing sandbox.
+resolve_sandbox_id() {
+    local given="${1-}"
+    if [[ -n "$given" ]]; then
+        validate_sandbox_id "$given"
+        printf '%s' "$given"
+        return 0
+    fi
+    local ids
+    read_lines_into ids < <(list_sandbox_ids)
+    if [[ "${#ids[@]}" -eq 0 ]]; then
+        die "no running sandboxes; nothing to operate on"
+    elif [[ "${#ids[@]}" -gt 1 ]]; then
+        {
+            echo "multiple sandboxes running; specify one explicitly:"
+            for id in "${ids[@]}"; do
+                echo "  ${id}"
+            done
+        } >&2
+        exit 1
+    fi
+    printf '%s' "${ids[0]}"
+}
+
+list_sandbox_projects_json() {
+    docker compose ls --all --format json 2>/dev/null || printf '[]'
+}
+
+list_sandbox_ids() {
+    list_sandbox_projects_json | "$PYTHON_BIN" -c '
+import json, sys
+prefix = "'"$PROJECT_PREFIX"'"
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for proj in data:
+    name = proj.get("Name", "")
+    if name.startswith(prefix):
+        print(name[len(prefix):])
+'
+}
+
+# ---------------------------------------------------------------------------
+# Config generation
+# ---------------------------------------------------------------------------
+
+# Generate a moraine.toml in $1 (config dir) for the given id / options.
+# Arguments:
+#   $1 config_dir
+#   $2 id
+#   $3 mount_host_sessions (0/1)
+#   $4 codex_sessions_dir (host) — may be ""
+#   $5 claude_projects_dir (host) — may be ""
+#   $6 clickhouse_version
+generate_moraine_toml() {
+    local config_dir="$1"
+    local id="$2"
+    local mount_sessions="$3"
+    local codex_dir="$4"
+    local claude_dir="$5"
+    local ch_version="$6"
+
+    mkdir -p "$config_dir"
+
+    local codex_src_block=""
+    local claude_src_block=""
+
+    if [[ "$mount_sessions" == "1" ]]; then
+        if [[ -n "$codex_dir" && -d "$codex_dir" ]]; then
+            codex_src_block=$'[[ingest.sources]]\nname = "host-codex"\nharness = "codex"\nenabled = true\nglob = "/host/codex/sessions/**/*.jsonl"\nwatch_root = "/host/codex/sessions"\n'
+        else
+            warn "host codex sessions dir not found (${codex_dir}); skipping that source"
+        fi
+        if [[ -n "$claude_dir" && -d "$claude_dir" ]]; then
+            claude_src_block=$'[[ingest.sources]]\nname = "host-claude"\nharness = "claude"\nenabled = true\nglob = "/host/claude/projects/**/*.jsonl"\nwatch_root = "/host/claude/projects"\n'
+        else
+            warn "host claude projects dir not found (${claude_dir}); skipping that source"
+        fi
+    else
+        # Fixture-based sources. Create empty dirs under config dir that will
+        # be mounted at /sandbox inside the container.
+        mkdir -p "${config_dir}/fixtures/codex/sessions"
+        mkdir -p "${config_dir}/fixtures/claude/projects"
+        codex_src_block=$'[[ingest.sources]]\nname = "fixture-codex"\nharness = "codex"\nenabled = true\nglob = "/sandbox/fixtures/codex/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/codex/sessions"\n'
+        claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
+    fi
+
+    local toml_path="${config_dir}/moraine.toml"
+    cat >"$toml_path" <<EOF
+# Generated by scripts/dev/sandbox/moraine-sandbox for ${id}
+# Do not edit — regenerated on each 'up'.
+
+[clickhouse]
+url = "http://clickhouse:8123"
+database = "moraine"
+
+[ingest]
+backfill_on_start = true
+reconcile_interval_seconds = 5.0
+heartbeat_interval_seconds = 2.0
+flush_interval_seconds = 0.5
+state_dir = "/home/moraine/.moraine/ingestor"
+
+${codex_src_block}
+${claude_src_block}
+[monitor]
+host = "0.0.0.0"
+port = 8080
+
+[runtime]
+root_dir = "/home/moraine/.moraine"
+service_bin_dir = "/opt/moraine/bin"
+managed_clickhouse_dir = "/home/moraine/.moraine/clickhouse"
+# ClickHouse is managed by docker compose as a sibling service (see
+# scripts/dev/sandbox/compose.yaml). The entrypoint pre-registers a sentinel
+# pid so 'moraine up' never attempts its own CH install/start.
+clickhouse_auto_install = false
+clickhouse_version = "${ch_version}"
+start_monitor_on_up = true
+start_mcp_on_up = false
+EOF
+    log "wrote config ${toml_path}"
+}
+
+# ---------------------------------------------------------------------------
+# Health wait
+# ---------------------------------------------------------------------------
+
+wait_for_healthy() {
+    local project="$1"
+    local mount_sessions="$2"
+    local timeout_seconds="${3:-120}"
+    local started
+    started="$(date +%s)"
+    while true; do
+        local now
+        now="$(date +%s)"
+        if (( now - started >= timeout_seconds )); then
+            warn "container did not report healthy within ${timeout_seconds}s; dumping last 80 lines of logs"
+            dc "$project" "$mount_sessions" logs --tail 80 >&2 || true
+            return 1
+        fi
+        local state
+        state="$(docker inspect --format='{{.State.Health.Status}}' "$project" 2>/dev/null || true)"
+        if [[ "$state" == "healthy" ]]; then
+            return 0
+        fi
+        # Abort early if the container has exited.
+        local running
+        running="$(docker inspect --format='{{.State.Status}}' "$project" 2>/dev/null || true)"
+        if [[ "$running" == "exited" || "$running" == "dead" ]]; then
+            warn "container exited while waiting for health; dumping last 80 lines of logs"
+            dc "$project" "$mount_sessions" logs --tail 80 >&2 || true
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Summary printing
+# ---------------------------------------------------------------------------
+
+print_summary() {
+    local id="$1"
+    local monitor_port="$2"
+    local ch_http_port="$3"
+    local config_path="$4"
+    printf '[sandbox] up: %s\n' "$id"
+    printf '[sandbox] project: %s%s\n' "$PROJECT_PREFIX" "$id"
+    printf '[sandbox] monitor: http://127.0.0.1:%s\n' "$monitor_port"
+    printf '[sandbox] clickhouse: http://127.0.0.1:%s\n' "$ch_http_port"
+    printf '[sandbox] config: %s\n' "$config_path"
+    printf '[sandbox] stop with: scripts/dev/sandbox/moraine-sandbox down %s\n' "$id"
+}
+
+# Given a project, discover its host port for a given container service+port
+# via `docker compose port`. Returns empty string if not found.
+host_port_for() {
+    local project="$1"
+    local service="$2"
+    local container_port="$3"
+    ensure_compose_env
+    # `docker compose port <service> <port>` prints e.g. 0.0.0.0:53421
+    local line
+    line="$(docker compose -p "$project" -f "$COMPOSE_FILE" port "$service" "$container_port" 2>/dev/null || true)"
+    if [[ -n "$line" ]]; then
+        printf '%s' "${line##*:}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: up
+# ---------------------------------------------------------------------------
+
+cmd_up() {
+    local id=""
+    local mount_sessions=0
+    local rebuild=0
+    local quiet=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)
+                id="${2-}"
+                [[ -n "$id" ]] || die "--id requires an argument"
+                shift 2
+                ;;
+            --mount-host-sessions) mount_sessions=1; shift ;;
+            --rebuild)             rebuild=1; shift ;;
+            -q|--quiet)            quiet=1; shift ;;
+            -h|--help)             print_help; exit 0 ;;
+            *) die "unknown flag for 'up': $1" ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        id="$(generate_sandbox_id)"
+    fi
+    validate_sandbox_id "$id"
+
+    # In quiet mode, redirect all progress noise to stderr and only emit the
+    # sandbox id to the real stdout at the very end — so callers can do:
+    #   id=$(moraine-sandbox up --quiet)
+    # and pipes/truncation like `| tail -30` can never swallow the id, which
+    # was a real footgun that caused agents to leak orphan sandboxes.
+    if (( quiet )); then
+        exec 3>&1   # save original stdout
+        exec 1>&2   # redirect stdout → stderr for the rest of this function
+    fi
+
+    check_docker
+    check_repo_root
+
+    local project
+    project="$(project_name_for "$id")"
+    local config_dir
+    config_dir="$(config_dir_for "$id")"
+
+    log "starting sandbox ${id} (project ${project})"
+
+    # Web assets — still built on the host for now (bun toolchain not in the
+    # runtime image). If/when we move the web build into the container too,
+    # this goes away.
+    ensure_monitor_frontend
+    local web_dir="${REPO_ROOT}/web/monitor/dist"
+    [[ -f "${web_dir}/index.html" ]] || \
+        warn "monitor assets missing at ${web_dir}/index.html — UI will 404"
+
+    # Ports.
+    local monitor_port ch_http_port ch_tcp_port
+    monitor_port="$(pick_open_port)"
+    ch_http_port="$(pick_clickhouse_http_port)"
+    ch_tcp_port=$(( ch_http_port + 877 ))
+    log "ports: monitor=${monitor_port} clickhouse-http=${ch_http_port} clickhouse-tcp=${ch_tcp_port}"
+
+    # Config.
+    local codex_dir="${SANDBOX_CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}"
+    local claude_dir="${SANDBOX_CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}"
+    local ch_version
+    ch_version="$(clickhouse_version_from_default_config)"
+    generate_moraine_toml "$config_dir" "$id" "$mount_sessions" "$codex_dir" "$claude_dir" "$ch_version"
+    local config_path="${config_dir}/moraine.toml"
+
+    # Translate moraine's clickhouse_version (e.g. "v25.12.5.44-stable") to
+    # the docker tag format on Docker Hub ("25.12.5.44"). Strip the leading
+    # "v" and any "-stable" / "-lts" suffix.
+    local ch_tag="${ch_version#v}"
+    ch_tag="${ch_tag%-stable}"
+    ch_tag="${ch_tag%-lts}"
+
+    # Export compose env.
+    export COMPOSE_PROJECT_NAME="$project"
+    export SANDBOX_CLICKHOUSE_IMAGE="clickhouse/clickhouse-server:${ch_tag}"
+    export SANDBOX_MONITOR_HOST_PORT="$monitor_port"
+    export SANDBOX_CLICKHOUSE_HTTP_HOST_PORT="$ch_http_port"
+    export SANDBOX_CLICKHOUSE_TCP_HOST_PORT="$ch_tcp_port"
+    export SANDBOX_REPO_ROOT="$REPO_ROOT"
+    export SANDBOX_WEB_DIR="$web_dir"
+    export SANDBOX_CONFIG_DIR="$config_dir"
+    export SANDBOX_ENTRYPOINT="${REPO_ROOT}/scripts/dev/sandbox/entrypoint.sh"
+    export SANDBOX_REBUILD="$rebuild"
+
+    # sccache cache bind. Prefer the host's SCCACHE_DIR (what the developer
+    # already uses), falling back to the XDG default. Created lazily so first
+    # use inside the sandbox doesn't fail on a missing directory, and so
+    # docker doesn't create it as root on the host.
+    local host_sccache_dir="${SCCACHE_DIR:-${HOME}/.cache/sccache}"
+    if [[ ! -d "$host_sccache_dir" ]]; then
+        mkdir -p "$host_sccache_dir"
+        log "created host sccache dir ${host_sccache_dir} (first use)"
+    fi
+    export SANDBOX_SCCACHE_HOST_DIR="$host_sccache_dir"
+    log "sccache: sharing ${host_sccache_dir} with container (RUSTC_WRAPPER=sccache)"
+    if [[ "$mount_sessions" == "1" ]]; then
+        export SANDBOX_CODEX_SESSIONS_DIR="$codex_dir"
+        export SANDBOX_CLAUDE_PROJECTS_DIR="$claude_dir"
+    fi
+
+    # Build runtime image.
+    log "building runtime image (docker compose build)"
+    dc "$project" "$mount_sessions" build
+
+    # Up.
+    log "starting container (docker compose up -d)"
+    dc "$project" "$mount_sessions" up -d
+
+    # Wait for health. The first boot of a sandbox runs `cargo build
+    # --workspace --locked` inside the container before moraine's /api/health
+    # comes online. With a cold sccache a from-scratch workspace build can
+    # take ~10 minutes; with the host's sccache warm it's seconds. Budget
+    # 900s and surface progress via the log hint so operators don't worry.
+    local health_timeout=900
+    log "waiting for container health (timeout ${health_timeout}s; initial boot runs cargo build inside container)"
+    log "follow live: scripts/dev/sandbox/moraine-sandbox logs ${id} -f"
+    if ! wait_for_healthy "$project" "$mount_sessions" "$health_timeout"; then
+        die "sandbox ${id} did not become healthy; inspect logs with 'moraine-sandbox logs ${id}'"
+    fi
+
+    print_summary "$id" "$monitor_port" "$ch_http_port" "$config_path"
+
+    # Only the id to the real stdout in quiet mode — everything above went
+    # to stderr thanks to the exec 1>&2 up top.
+    if (( quiet )); then
+        printf '%s\n' "$id" >&3
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: shell
+# ---------------------------------------------------------------------------
+
+cmd_shell() {
+    local id
+    id="$(resolve_sandbox_id "${1-}")"
+    check_docker
+    local project
+    project="$(project_name_for "$id")"
+    export COMPOSE_PROJECT_NAME="$project"
+    # We don't know whether sessions overlay was used, but -f list only affects
+    # service discovery, not exec against a running container. Use base file.
+    ensure_compose_env
+    exec docker compose -p "$project" -f "$COMPOSE_FILE" exec -u moraine moraine bash
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: logs
+# ---------------------------------------------------------------------------
+
+cmd_logs() {
+    local follow=0
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow) follow=1; shift ;;
+            -h|--help)   print_help; exit 0 ;;
+            *)
+                if [[ -z "$id" ]]; then id="$1"; shift
+                else die "unexpected argument to 'logs': $1"
+                fi
+                ;;
+        esac
+    done
+    check_docker
+    id="$(resolve_sandbox_id "$id")"
+    local project
+    project="$(project_name_for "$id")"
+    export COMPOSE_PROJECT_NAME="$project"
+    ensure_compose_env
+    if (( follow )); then
+        exec docker compose -p "$project" -f "$COMPOSE_FILE" logs -f
+    else
+        exec docker compose -p "$project" -f "$COMPOSE_FILE" logs
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: down
+# ---------------------------------------------------------------------------
+
+down_one() {
+    local id="$1"
+    local project
+    project="$(project_name_for "$id")"
+    local config_dir
+    config_dir="$(config_dir_for "$id")"
+    log "tearing down ${id} (project ${project})"
+    # Route through dc() so env-var fallbacks are applied; don't silence output
+    # so compose failures surface to the operator.
+    dc "$project" 0 down -v --remove-orphans || \
+        warn "docker compose down reported non-zero exit for ${project}"
+    if [[ -d "$config_dir" ]]; then
+        rm -rf "$config_dir"
+        log "removed ${config_dir}"
+    fi
+}
+
+cmd_down() {
+    check_docker
+    if [[ "${1-}" == "--all" ]]; then
+        local ids
+        read_lines_into ids < <(list_sandbox_ids)
+        if [[ "${#ids[@]}" -eq 0 ]]; then
+            log "no sandboxes to tear down"
+        else
+            for id in "${ids[@]}"; do
+                down_one "$id"
+            done
+        fi
+        # Sweep any stray /tmp/moraine-sandbox-* dirs (e.g. from failed ups).
+        shopt -s nullglob
+        local leftover=(/tmp/${PROJECT_PREFIX}*)
+        shopt -u nullglob
+        if [[ "${#leftover[@]}" -gt 0 ]]; then
+            for d in "${leftover[@]}"; do
+                rm -rf "$d" && log "removed ${d}"
+            done
+        fi
+        return 0
+    fi
+
+    local id
+    id="$(resolve_sandbox_id "${1-}")"
+    down_one "$id"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: list
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+    check_docker
+    local ids
+    read_lines_into ids < <(list_sandbox_ids)
+    if [[ "${#ids[@]}" -eq 0 ]]; then
+        log "no sandboxes running"
+        return 0
+    fi
+    printf '%-14s %-12s %s\n' "ID" "STATUS" "MONITOR"
+    local json
+    json="$(list_sandbox_projects_json)"
+    local id
+    for id in "${ids[@]}"; do
+        local project
+        project="$(project_name_for "$id")"
+        local status
+        status="$(printf '%s' "$json" | "$PYTHON_BIN" -c "
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for proj in data:
+    if proj.get('Name') == name:
+        print(proj.get('Status', ''))
+        break
+" "$project")"
+        local host_port
+        host_port="$(host_port_for "$project" moraine 8080)"
+        local url="-"
+        if [[ -n "$host_port" ]]; then
+            url="http://127.0.0.1:${host_port}"
+        fi
+        printf '%-14s %-12s %s\n' "$id" "${status:-unknown}" "$url"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: status
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    check_docker
+    local id
+    id="$(resolve_sandbox_id "${1-}")"
+    local project
+    project="$(project_name_for "$id")"
+    local config_dir
+    config_dir="$(config_dir_for "$id")"
+    local config_path="${config_dir}/moraine.toml"
+
+    local monitor_port ch_http_port
+    monitor_port="$(host_port_for "$project" moraine 8080)"
+    ch_http_port="$(host_port_for "$project" clickhouse 8123)"
+
+    if [[ -n "$monitor_port" && -n "$ch_http_port" ]]; then
+        print_summary "$id" "$monitor_port" "$ch_http_port" "$config_path"
+    else
+        warn "could not read published ports for project ${project}; container may be stopped"
+    fi
+
+    echo
+    ensure_compose_env
+    docker compose -p "$project" -f "$COMPOSE_FILE" ps
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+print_help() {
+    cat <<'EOF'
+moraine-sandbox — per-developer containerized moraine stack (RFC #232)
+
+A sandbox is a long-lived linux container that mounts your worktree at
+/repo, cargo-builds the workspace on first boot (wrapped by sccache sharing
+your host's cache dir), then runs the moraine stack. Agents iterate inside
+via `moraine-sandbox shell` — cargo build / test / clippy all just work
+against the volume-backed target dir.
+
+USAGE:
+    moraine-sandbox <command> [args]
+
+COMMANDS:
+    up [--id <id>] [--mount-host-sessions] [--rebuild] [--quiet|-q]
+         Bring up a new sandbox. Picks random host ports and generates
+         a moraine.toml under /tmp/moraine-sandbox-<id>/. The first boot
+         compiles the workspace inside the container (takes a few minutes
+         cold, seconds warm). --rebuild forces a fresh cargo build even
+         when the binaries volume already has prior output. --quiet emits
+         only the sandbox id on stdout (progress/summary go to stderr), so
+         callers can capture the id without piping/tailing:
+             id=$(moraine-sandbox up --quiet)
+
+    shell [<id>]       Exec an interactive bash as user 'moraine' inside
+                       the container. If <id> is omitted and exactly one
+                       sandbox exists, it is selected automatically.
+                       cargo / rustc / rustup / sccache are all on PATH;
+                       CARGO_TARGET_DIR points at a volume so builds are
+                       incremental across exec sessions.
+
+    logs [<id>] [-f]   Tail container logs (docker compose logs). Includes
+                       the bootstrap cargo build output.
+
+    down <id>          Stop + remove the container, named volumes, and
+                       the /tmp/moraine-sandbox-<id>/ config dir.
+    down --all         Do the same for every sandbox owned by this user.
+
+    list               List sandboxes with their status and monitor URL.
+
+    status [<id>]      Print the summary block + docker compose ps.
+
+    --help, -h         Show this help.
+
+ENVIRONMENT:
+    PYTHON_BIN                  python3 interpreter used for port picking
+    SCCACHE_DIR                 host sccache cache dir (defaults to
+                                ~/.cache/sccache); bind-mounted rw into the
+                                container so container cargo builds share
+                                the developer's existing cache
+    SANDBOX_CODEX_SESSIONS_DIR  override host codex sessions dir (for
+                                --mount-host-sessions; default ~/.codex/sessions)
+    SANDBOX_CLAUDE_PROJECTS_DIR override host claude projects dir (default
+                                ~/.claude/projects)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        print_help
+        exit 1
+    fi
+    local cmd="$1"; shift
+    case "$cmd" in
+        up)      cmd_up "$@" ;;
+        shell)   cmd_shell "$@" ;;
+        logs)    cmd_logs "$@" ;;
+        down)    cmd_down "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        status)  cmd_status "$@" ;;
+        -h|--help|help) print_help ;;
+        *)       die "unknown subcommand: ${cmd} (try --help)" ;;
+    esac
+}
+
+main "$@"
