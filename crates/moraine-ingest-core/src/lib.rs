@@ -8,7 +8,7 @@ mod sink;
 mod watch;
 
 use crate::checkpoint::checkpoint_key;
-use crate::dispatch::{complete_work, enqueue_work, process_file, spawn_debounce_task};
+use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
 use crate::sink::spawn_sink_task;
@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
-use tracing::{error, info};
+use tracing::info;
 
 pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
 pub(crate) const WATCHER_BACKEND_NATIVE: u64 = 1;
@@ -149,42 +149,16 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                     Err(_) => break,
                 };
 
-                let sink_tx_worker = sink_tx_clone.clone();
-                let process_tx_worker = process_tx_clone.clone();
-                let checkpoints_worker = checkpoints_clone.clone();
-                let dispatch_worker = dispatch_clone.clone();
-                let cfg_worker = cfg_clone.clone();
-                let metrics_worker = metrics_clone.clone();
-
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(exc) = process_file(
-                        &cfg_worker,
-                        &work,
-                        checkpoints_worker,
-                        sink_tx_worker,
-                        &metrics_worker,
-                    )
-                    .await
-                    {
-                        error!(
-                            "failed processing {}:{}: {exc}",
-                            work.source_name, work.path
-                        );
-                        *metrics_worker
-                            .last_error
-                            .lock()
-                            .expect("metrics last_error mutex poisoned") = exc.to_string();
-                    }
-
-                    let reschedule = complete_work(&key, &dispatch_worker);
-
-                    if let Some(item) = reschedule {
-                        if process_tx_worker.send(item).await.is_ok() {
-                            metrics_worker.queue_depth.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
+                tokio::spawn(run_work_item(
+                    cfg_clone.clone(),
+                    work,
+                    permit,
+                    checkpoints_clone.clone(),
+                    sink_tx_clone.clone(),
+                    process_tx_clone.clone(),
+                    dispatch_clone.clone(),
+                    metrics_clone.clone(),
+                ));
             }
         })
     };
