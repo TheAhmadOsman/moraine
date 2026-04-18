@@ -31,7 +31,55 @@ Use Rust 2021 idioms and keep code `rustfmt`-clean.
 ## Testing Guidelines
 Run `cargo test --workspace --locked` before opening a PR. CI also runs `scripts/ci/e2e-stack.sh`, so changes affecting ingest, monitor, MCP, or ClickHouse flows should be validated with that script locally when possible. Place tests close to the code they verify (`#[cfg(test)]` modules or crate-level integration tests).
 
-For changes that touch ingest, MCP, monitor, or ClickHouse schema, run them inside a dev sandbox rather than against your host install: `scripts/dev/sandbox/moraine-sandbox up` (see [docs/development/sandbox.md](docs/development/sandbox.md)), verify via the printed monitor URL, and always `scripts/dev/sandbox/moraine-sandbox down <id>` when finished. The sandbox is isolated from your live `~/.moraine/`; the host stack is not.
+For changes that touch ingest, MCP, monitor, or ClickHouse schema, run them inside a dev sandbox rather than against your host install. The sandbox is isolated from your live `~/.moraine/`; the host stack is not.
+
+## Dev sandbox (required for QA of ingest/monitor/MCP/schema)
+
+The sandbox is a long-lived linux container that mounts your current worktree at `/repo` read-only, `cargo build`s the workspace on first boot (wrapped by sccache sharing the host's cache), then runs the moraine stack against a sibling-compose ClickHouse. Iterate inside via `moraine-sandbox shell` — cargo / rustc / rustup / sccache are all on `PATH`, and `CARGO_TARGET_DIR` is volume-backed so subsequent builds are incremental. See [docs/development/sandbox.md](docs/development/sandbox.md) for the full reference.
+
+### Typical agent flow
+
+```bash
+# 1. Boot. First time from a cold sccache takes ~2 min; warm cache is ~30 s.
+#    Picks random host ports, prints monitor URL + id.
+scripts/dev/sandbox/moraine-sandbox up
+
+# 2. Shell in and iterate. cargo check / cargo test / cargo clippy all just
+#    work. sccache is RUSTC_WRAPPER, so builds share a cache with every
+#    other sandbox and with host cargo (for matching target triples).
+scripts/dev/sandbox/moraine-sandbox shell         # auto-selects if only one sandbox
+# inside the container:
+#   cd /repo
+#   cargo check --workspace --locked
+#   cargo test -p <crate> --locked
+#   cargo clippy --workspace --all-targets -- -D warnings
+
+# 3. Validate behavior against the printed monitor URL.
+curl -fsS http://127.0.0.1:<monitor-port>/api/health
+
+# 4. Tear down before reporting task complete. Leftover sandboxes leak
+#    ClickHouse data and consume host ports.
+scripts/dev/sandbox/moraine-sandbox down <id>     # or: down --all
+```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `moraine-sandbox up [--id <id>] [--rebuild] [--mount-host-sessions]` | Boot. Builds the workspace on first run; `--rebuild` forces re-compile even when binaries already exist in the volume. |
+| `moraine-sandbox shell [<id>]` | `docker exec` an interactive bash as user `moraine`. |
+| `moraine-sandbox logs [<id>] [-f]` | Tail container logs (includes the bootstrap cargo build output). |
+| `moraine-sandbox status [<id>]` | Summary block + `docker compose ps`. |
+| `moraine-sandbox list` | One-line-per-sandbox table. |
+| `moraine-sandbox down <id>` / `down --all` | Stop, remove the container + all named volumes + the `/tmp/moraine-sandbox-<id>/` config dir. |
+
+### Things to know
+
+- `/repo` is **read-only**. Cargo writes go to a `CARGO_TARGET_DIR` volume at `/home/moraine/target`, not into your worktree.
+- Each sandbox has its own set of named volumes (`binaries`, `cargo-home`, `cargo-target`, `state`, `clickhouse-data`). Two sandboxes from two worktrees run in parallel with no coordination.
+- The host's `$SCCACHE_DIR` (`~/.cache/sccache` by default) is bind-mounted rw. Cache entries are content-addressed by compiler + target + source, so darwin (host cargo) and linux (container cargo) entries coexist without conflict, and one sandbox's cache hits every other sandbox's lookups.
+- ClickHouse runs as a **sibling** compose service reachable at `http://clickhouse:8123` from inside moraine; moraine does not manage it inside its own container.
+- Exactly one shared runtime image (`moraine-sandbox-runtime:latest`, ~2.2 GB) serves every sandbox on the host. Rebuilding it is only needed when `scripts/dev/sandbox/{Dockerfile,entrypoint.sh}` change — normal code edits in the worktree just get picked up by `--rebuild` (or a fresh `up`).
 
 ## Development: Worktrees
 When the user asks you to take on new development work, 

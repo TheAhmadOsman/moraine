@@ -7,10 +7,13 @@ Orchestrated by `scripts/dev/sandbox/moraine-sandbox`. Background: RFC #232.
 
 - Isolate dev testing from the host's live moraine install. No shared
   ports, no shared `~/.moraine/`, no shared ClickHouse data dir.
-- Exercise the **current worktree's binaries** against optionally real
-  host session archives, read-only.
+- Build and run the **current worktree's binaries** against optionally-real
+  host session archives (read-only).
+- Give agents a full rust dev environment inside the container — cargo,
+  rustc, rustup, sccache, native build deps — so they can iterate on the
+  workspace without round-tripping through the host.
 - One command up, one command down. Multi-sandbox friendly: two worktrees
-  can run two sandboxes simultaneously.
+  can run two sandboxes simultaneously with zero coordination.
 
 ## When to use this vs. `scripts/ci/e2e-stack.sh`
 
@@ -20,121 +23,209 @@ routes / MCP smoke, tears itself down. Run it before opening a PR for
 changes to ingest, monitor, MCP, or schema.
 
 The sandbox is the dev loop. It keeps the stack running for hand-poking,
-uses the worktree binaries, and can optionally expose the host's real
-`~/.codex/sessions` and `~/.claude/projects` read-only so ingest
-exercises real-shaped data. Use it to reproduce bugs on real corpus
-shape or iterate on UI/UX without round-tripping through the CI script.
+builds the worktree's binaries *inside* the container (so linux-only
+behavior gets exercised from a macOS host), and can optionally expose
+the host's real `~/.codex/sessions` and `~/.claude/projects` read-only
+so ingest exercises real-shaped data. Use it to reproduce bugs on real
+corpus shape or iterate on UI/UX without round-tripping through the CI
+script.
 
-## Bringup
+## Architecture
 
-```bash
-scripts/dev/sandbox/moraine-sandbox up [flags]
+One shared runtime image, one container per sandbox, zero per-id image
+tags.
+
+### Image
+
+One shared `moraine-sandbox-runtime:latest`, built from a single-stage
+`FROM rust:1-bookworm` Dockerfile. Contains:
+
+- Rust toolchain (cargo, rustc, rustup — pinned by the `rust:1-bookworm`
+  tag, currently 1.95.x).
+- sccache binary (linux-musl, matching `TARGETARCH`). Same version as
+  the host's `sccache` — entries are wire-compatible.
+- Native build dependencies: `pkg-config`, `libssl-dev`, `cmake`,
+  `build-essential`.
+- Runtime utilities: `tini` (PID 1), `curl`, `ca-certificates`, `tzdata`.
+- A `moraine:moraine` (uid/gid 1000) non-root user.
+
+Everything that varies per sandbox — worktree source, built binaries,
+cargo target dir, cargo home, generated config, entrypoint.sh — arrives
+via bind mount or named volume, so the image is built once on first
+`up` and reused for every subsequent sandbox on the host.
+
+### Volumes (per sandbox)
+
+| Volume | Mount point | Purpose |
+|---|---|---|
+| `binaries` | `/opt/moraine/bin` | The four binaries produced by the boot-build. Survives container restart; cleared by `down`. |
+| `cargo-home` | `/home/moraine/.cargo` | Cargo registry + git cache. |
+| `cargo-target` | `/home/moraine/target` | `CARGO_TARGET_DIR`. Incremental across exec sessions. |
+| `state` | `/home/moraine/.moraine` | moraine runtime state (ingest state, logs). |
+| `clickhouse-data` | `/var/lib/clickhouse` | ClickHouse storage (on the sibling service). |
+
+All are scoped to the compose project (`moraine-sandbox-<id>_<volume>`)
+and removed on `down`.
+
+### Bind mounts
+
+| Host path | Container path | Mode | Notes |
+|---|---|---|---|
+| `$SANDBOX_REPO_ROOT` (active worktree) | `/repo` | ro | cargo reads from here; target dir is elsewhere |
+| `$SCCACHE_DIR` (host, default `~/.cache/sccache`) | `/home/moraine/.cache/sccache` | rw | shared with host and all other sandboxes |
+| `web/monitor/dist` | `/opt/moraine/web` | ro | built on the host (bun); currently not in-container |
+| Generated config dir (`/tmp/moraine-sandbox-<id>/`) | `/sandbox` | ro | `moraine.toml` + fixture dirs |
+| `scripts/dev/sandbox/entrypoint.sh` | `/usr/local/bin/entrypoint.sh` | ro | so edits to the entrypoint don't require an image rebuild |
+
+`--mount-host-sessions` layers on `compose.sessions.yaml` to also
+bind-mount `~/.codex/sessions` and `~/.claude/projects` read-only.
+
+## Boot flow
+
+```
+moraine-sandbox up
+        ▼
+1. validate docker, compose v2, worktree root
+2. generate sandbox id (sb-xxxxxx) unless --id
+3. ensure monitor frontend is built (bun build on host)
+4. pick random host ports (monitor :8080, CH :8123 / :9000)
+5. write /tmp/moraine-sandbox-<id>/moraine.toml
+6. export env, `docker compose up -d`
+        ▼
+7. inside moraine container, entrypoint.sh:
+   a. wait for sibling ClickHouse health at http://clickhouse:8123
+   b. register sentinel pid for managed-CH suppression
+   c. if /opt/moraine/bin is empty OR SANDBOX_REBUILD=1:
+        cd /repo && cargo build --workspace --locked
+        install the four binaries into /opt/moraine/bin
+      (else: reuse the volume's prior output)
+   d. moraine up --config /sandbox/moraine.toml
+   e. tail logs (keeps PID 1 alive)
+        ▼
+8. host CLI waits on docker health (up to 900s); prints summary
 ```
 
-The `up` flow:
+The cargo build step is what makes the first boot slow. Subsequent
+boots of the same sandbox id skip the build entirely; fresh sandboxes
+from the same (or any) worktree hit the shared sccache and finish in
+~30 s.
 
-1. Validate docker + compose v2, and that the current directory is the
-   moraine workspace root.
-2. Generate a sandbox id (`sb-xxxxxx`) unless one is passed with `--id`.
-3. Produce Linux binaries via the selected build strategy (see below)
-   and bind-mount them at `/opt/moraine/bin`.
-4. Rebuild `web/monitor/dist/` with `bun` if stale, bind-mount at
-   `/opt/moraine/web`.
-5. Pick random host ports for the monitor (`:8080` in-container) and
-   the ClickHouse HTTP / TCP / interserver trio.
-6. Write `/tmp/moraine-sandbox-<id>/moraine.toml` and mount it at
-   `/sandbox`.
-7. `docker compose build`, `docker compose up -d`, then wait up to 120s
-   for the container healthcheck (monitor `/api/health`) to pass.
-8. Print the summary block (monitor URL, ClickHouse URL, config path,
-   teardown command).
+## Commands
 
-### `up` flags
+### `up [--id <sb-xxxxxx>] [--rebuild] [--mount-host-sessions]`
+
+Bring up a sandbox.
 
 - `--id <sb-xxxxxx>` — reuse a specific id. Must match `^sb-[a-f0-9]{6}$`.
-  Useful when re-upping after an iterative rebuild or when scripting.
-- `--mount-host-sessions` — layer on `compose.sessions.yaml`, which
-  bind-mounts `~/.codex/sessions` at `/host/codex/sessions:ro` and
-  `~/.claude/projects` at `/host/claude/projects:ro`. Overridable with
-  `SANDBOX_CODEX_SESSIONS_DIR` / `SANDBOX_CLAUDE_PROJECTS_DIR`. Without
-  this flag, ingest sources are pointed at empty fixture dirs under the
-  generated config dir so you can drop in your own `.jsonl` files.
-- `--build-in-container` — build release binaries inside the Dockerfile
-  `builder` stage (`FROM rust:1-bookworm`) and copy them out. Hermetic;
-  slower; no host Rust toolchain required.
-- `--use-host-binaries` — trust pre-built binaries at
-  `target/debug` (Linux host) or `target/<linux-triple>/debug` (macOS
-  host). Errors with a pointer to `cargo build --workspace --locked` or
-  `cross build --workspace --locked --target <triple>` when missing.
-- `--skip-build` — same as `--use-host-binaries` in spirit but quieter;
-  just asserts the binary exists.
+  Useful when scripting or re-upping after `down`.
+- `--rebuild` — force a fresh `cargo build` on boot even if the
+  `binaries` volume already has output from a prior boot. Exported to
+  the container as `SANDBOX_REBUILD=1`.
+- `--mount-host-sessions` — layer on `compose.sessions.yaml` to mount
+  `~/.codex/sessions` and `~/.claude/projects` read-only inside the
+  container. Overridable with `$SANDBOX_CODEX_SESSIONS_DIR` /
+  `$SANDBOX_CLAUDE_PROJECTS_DIR`. Without this flag, ingest sources
+  point at empty fixture dirs under the generated config dir so you
+  can drop in your own `.jsonl` files.
 
-The three build-strategy flags are mutually exclusive.
+### `shell [<id>]`
 
-## Build strategies
+`docker exec -it -u moraine ... bash`. Agents live here. cargo,
+rustc, rustup, sccache are all on `PATH`; `CARGO_TARGET_DIR` and
+`CARGO_HOME` point at the per-sandbox volumes so builds are
+incremental across exec sessions and shell exits.
 
-- **Linux default** — `cargo build --workspace --locked` on the host,
-  mounted from `target/debug`. Fast; reuses your rustup/sccache state.
-- **macOS default** — `cross build --workspace --locked --target
-  <aarch64|x86_64>-unknown-linux-gnu`. If `cross` is not installed, the
-  CLI errors with `On macOS, host builds require `cross` (cargo install
-  cross). Alternatively re-run with --build-in-container.` Fix: install
-  cross, or re-run with `--build-in-container`.
-- **`--build-in-container`** — multi-stage Dockerfile `builder` stage.
-  No host toolchain needed. Slow first run (rust image + cold cache).
-- **`--use-host-binaries` / `--skip-build`** — trust caller-built
-  binaries. On macOS these must be Linux ELFs from `cross`; native
-  macOS binaries will not run. Missing binaries produce an error
-  pointing at the expected path.
+If `<id>` is omitted and exactly one sandbox is running, it's
+selected automatically.
 
-## What gets mounted
+### `logs [<id>] [-f]`
 
-Always, from `compose.yaml`:
+`docker compose logs`. Includes the bootstrap cargo build output on
+first boot, which is the easiest way to watch a long compile.
 
-- `$SANDBOX_REPO_ROOT` → `/repo` (ro) — source visibility for debugging.
-- `$SANDBOX_BIN_DIR` → `/opt/moraine/bin` (ro) — `moraine`,
-  `moraine-ingest`, `moraine-monitor`, `moraine-mcp`.
-- `$SANDBOX_WEB_DIR` → `/opt/moraine/web` (ro) — monitor frontend dist.
-- `$SANDBOX_CONFIG_DIR` → `/sandbox` (ro) — generated `moraine.toml`
-  plus, without `--mount-host-sessions`, empty fixture dirs.
-- Named volume `state` → `/home/moraine/.moraine` (rw) — ClickHouse
-  data, ingest state, logs. Project-prefixed, tied to `down -v`.
+### `status [<id>]`
 
-Optionally, from `compose.sessions.yaml` when `--mount-host-sessions`:
+Prints the summary block (URLs, config path) plus `docker compose ps`.
 
-- `$SANDBOX_CODEX_SESSIONS_DIR` → `/host/codex/sessions` (ro).
-- `$SANDBOX_CLAUDE_PROJECTS_DIR` → `/host/claude/projects` (ro).
+### `list`
+
+One-line-per-sandbox table: id, status, monitor URL. Used internally
+for id disambiguation.
+
+### `down <id>` / `down --all`
+
+`docker compose down -v --remove-orphans` for the project, plus
+`rm -rf /tmp/moraine-sandbox-<id>/`. `--all` iterates over every
+sandbox owned by the current Docker context and sweeps any stray
+`/tmp/moraine-sandbox-*` dirs left by failed ups.
+
+**Agents must `down` before reporting task complete.** Leftover
+sandboxes leak ClickHouse data (not small) and can exhaust ports
+across many iterations.
+
+## sccache
+
+The host's `$SCCACHE_DIR` (`~/.cache/sccache` by default) is
+bind-mounted rw at `/home/moraine/.cache/sccache`. Inside the
+container, `RUSTC_WRAPPER=sccache`, `SCCACHE_CACHE_SIZE=20G`, and the
+sccache binary is pinned to the same version as the host's so cache
+entries are wire-compatible.
+
+sccache keys entries by `{compiler, target, flags, source hash}`, so:
+
+- Host cargo (darwin target) and container cargo (linux-aarch64 or
+  linux-amd64) write to the **same directory** with **different keys**.
+  No collision, no cross-target reuse (physically impossible anyway),
+  but they share one sccache quota.
+- Two sandboxes from two worktrees with the same `Cargo.lock` state
+  hit each other's cache entries perfectly.
+- Two sandboxes from the same worktree skip the build entirely on the
+  second boot (reuse the `binaries` volume) or get 100% sccache hits
+  if the volume is cleared.
+
+Set `SCCACHE_CACHE_SIZE` on the host to change the budget; the
+container inherits `20G` from its env unless overridden.
 
 ## Config generation
 
 `moraine-sandbox up` writes `/tmp/moraine-sandbox-<id>/moraine.toml`.
 It is regenerated on every `up` and never edited by hand. Keys:
 
-- `[clickhouse] url = "http://127.0.0.1:8123"`, `database = "moraine"` —
-  container-local ClickHouse; the host sees it via the published port.
+- `[clickhouse] url = "http://clickhouse:8123"`, `database = "moraine"` —
+  compose-DNS address of the sibling ClickHouse service.
 - `[ingest]` — `backfill_on_start = true`,
   `reconcile_interval_seconds = 5.0`, `heartbeat_interval_seconds = 2.0`,
-  `flush_interval_seconds = 0.5`, `state_dir =
-  "/home/moraine/.moraine/ingestor"`.
+  `flush_interval_seconds = 0.5`,
+  `state_dir = "/home/moraine/.moraine/ingestor"`.
 - `[[ingest.sources]]` — either `host-codex` / `host-claude` pointing at
   `/host/...` (with `--mount-host-sessions`) or `fixture-codex` /
   `fixture-claude` pointing at `/sandbox/fixtures/...` (default).
 - `[monitor] host = "0.0.0.0"`, `port = 8080`.
 - `[runtime]` — `root_dir = "/home/moraine/.moraine"`, `service_bin_dir
-  = "/opt/moraine/bin"`, `managed_clickhouse_dir =
-  "/home/moraine/.moraine/clickhouse"`, `clickhouse_auto_install = true`,
-  `clickhouse_version` copied from `config/moraine.toml`,
-  `start_monitor_on_up = true`, `start_mcp_on_up = false`.
+  = "/opt/moraine/bin"`, `clickhouse_auto_install = false` (the sibling
+  container owns CH), `clickhouse_version` copied from
+  `config/moraine.toml`, `start_monitor_on_up = true`,
+  `start_mcp_on_up = false`.
 
 The canonical key set and defaults live in `config/moraine.toml`; the
 sandbox's generated file is a minimal per-id specialization of it.
 
+## ClickHouse topology
+
+ClickHouse runs as a sibling compose service pinned to the version in
+`config/moraine.toml` (`runtime.clickhouse_version`, e.g.
+`v25.12.5.44-stable` → image tag `25.12.5.44`). It publishes three
+random host ports (HTTP 8123, TCP 9000, interserver-offset) and exposes
+`clickhouse` as the container DNS name inside the compose network.
+moraine connects via `http://clickhouse:8123`; managed-CH auto-install
+is explicitly suppressed in the generated config plus a sentinel
+pidfile the entrypoint pre-registers.
+
 ## Ports
 
-Each `up` picks fresh random host ports: one for the monitor, and a
-ClickHouse HTTP port (plus offset TCP and interserver ports, so the
-trio is contiguous and free). Container-internal ports are fixed
-(`8080`, `8123`, `9000`). This is what lets two worktrees run two
+Each `up` picks fresh random host ports: one for the monitor, one for
+ClickHouse HTTP, and an offset for ClickHouse TCP. Container-internal
+ports are fixed (`8080`, `8123`, `9000`). Two worktrees can run two
 sandboxes at once without negotiating.
 
 ## Host sessions mount — caveats
@@ -150,21 +241,17 @@ sandboxes at once without negotiating.
 ## Lifecycle / cleanup
 
 - Everything lives in two places on the host: `/tmp/moraine-sandbox-<id>/`
-  and the `moraine-sandbox-<id>_state` named volume (plus the project's
-  container).
+  (generated config) and the project's named volumes.
 - `moraine-sandbox down <id>` runs `docker compose down -v` for the
   project and `rm -rf` on the config dir.
-- `moraine-sandbox down --all` does the same for every sandbox prefixed
-  `moraine-sandbox-` owned by the current Docker context, and sweeps
-  stray `/tmp/moraine-sandbox-*` dirs left by failed ups.
+- `moraine-sandbox down --all` does the same for every sandbox and
+  sweeps stray `/tmp/moraine-sandbox-*` dirs left by failed ups.
 - Agents **must** call `down` before reporting their task complete.
-  Leftover sandboxes leak disk (ClickHouse data is not small) and can
-  exhaust ports across many iterations.
 
 ## Multi-sandbox
 
 Each sandbox has its own random host ports, compose project name,
-config dir, and named volume, so two worktrees can each run
+config dir, and named volumes, so two worktrees can each run
 `moraine-sandbox up` with no coordination. `moraine-sandbox list`
 shows everything currently running.
 
@@ -182,15 +269,23 @@ real", stop — reach for `install.sh`, not a container.
   is not supported.
 - **`monitor frontend needs a build but 'bun' is not installed`** —
   install bun (`curl -fsSL https://bun.sh/install | bash`) or prebuild
-  `web/monitor/dist/` and re-run.
-- **`--use-host-binaries: no binary at .../moraine`** on macOS — the
-  sandbox needs Linux ELFs. Run `cross build --workspace --locked
-  --target <triple>` and re-up, or drop the flag to use the default
-  cross strategy.
-- **`sandbox <id> did not become healthy`** — inspect with
-  `moraine-sandbox logs <id>`. Usual causes: ClickHouse tarball
-  download failed (container needs outbound HTTPS), mounted binaries
-  are the wrong arch, or a stale `state` volume (run `down <id>` then
-  re-up).
+  `web/monitor/dist/` and re-run. (Monitor frontend is still built on
+  the host; moving it in-container is a potential follow-up.)
+- **`sandbox <id> did not become healthy`** — `moraine-sandbox logs
+  <id> -f` to watch the build + startup. Usual causes: cargo build
+  error (surface and resolve), sibling ClickHouse failed to start
+  (rarer), or an unusually slow cold sccache compile (wait; health
+  timeout is 900 s).
+- **`cargo build` fails on a missing native dep** — the runtime image
+  includes `pkg-config`, `libssl-dev`, `cmake`, `build-essential`. If a
+  new crate needs something else, add it to the Dockerfile `apt-get
+  install` block and rebuild the shared image:
+  `docker build -f scripts/dev/sandbox/Dockerfile -t moraine-sandbox-runtime:latest scripts/dev/sandbox`.
 - **Ports exhausted / bind errors** — `moraine-sandbox list` then
-  `down --all` to clear stragglers. Port picking retries 500 times.
+  `moraine-sandbox down --all` to clear stragglers. Port picking
+  retries 500 times before giving up.
+- **Stale binaries after a code change** — `moraine-sandbox up
+  --rebuild`, or `moraine-sandbox shell` in and run `cargo build
+  --workspace --locked` manually (the monitor/ingest services keep
+  running against the old binaries until you restart them; for a
+  clean swap, `down` and re-up).
