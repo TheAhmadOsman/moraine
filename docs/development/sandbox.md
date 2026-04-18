@@ -78,7 +78,11 @@ and removed on `down`.
 | `scripts/dev/sandbox/entrypoint.sh` | `/usr/local/bin/entrypoint.sh` | ro | so edits to the entrypoint don't require an image rebuild |
 
 `--mount-host-sessions` layers on `compose.sessions.yaml` to also
-bind-mount `~/.codex/sessions` and `~/.claude/projects` read-only.
+bind-mount `~/.codex/sessions`, `~/.claude/projects`, and
+`~/.hermes/sessions` read-only. The Hermes mount points the generated
+config at `/host/hermes/sessions/session_*.json` with
+`format = "session_json"` so the sandbox exercises the
+rewrite-in-place live-session path against real host data.
 
 ## Boot flow
 
@@ -122,11 +126,12 @@ Bring up a sandbox.
   `binaries` volume already has output from a prior boot. Exported to
   the container as `SANDBOX_REBUILD=1`.
 - `--mount-host-sessions` — layer on `compose.sessions.yaml` to mount
-  `~/.codex/sessions` and `~/.claude/projects` read-only inside the
-  container. Overridable with `$SANDBOX_CODEX_SESSIONS_DIR` /
-  `$SANDBOX_CLAUDE_PROJECTS_DIR`. Without this flag, ingest sources
+  `~/.codex/sessions`, `~/.claude/projects`, and `~/.hermes/sessions`
+  read-only inside the container. Overridable with
+  `$SANDBOX_CODEX_SESSIONS_DIR` / `$SANDBOX_CLAUDE_PROJECTS_DIR` /
+  `$SANDBOX_HERMES_SESSIONS_DIR`. Without this flag, ingest sources
   point at empty fixture dirs under the generated config dir so you
-  can drop in your own `.jsonl` files.
+  can drop in your own `.jsonl` or `session_*.json` files.
 - `--quiet` / `-q` — redirect all progress output (log lines, docker
   compose build + up chatter, the summary block) to stderr, and emit
   only the sandbox id on stdout. Designed for scripting and agents:
