@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS moraine.search_documents (
   session_id String,
   session_date Date,
   source_name LowCardinality(String) DEFAULT '',
-  provider LowCardinality(String) DEFAULT '',
+  harness LowCardinality(String) DEFAULT '',
   source_file String,
   source_generation UInt32,
   source_line_no UInt64,
@@ -37,7 +37,7 @@ ORDER BY (event_uid);
 ALTER TABLE moraine.search_documents
   ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_date;
 ALTER TABLE moraine.search_documents
-  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
+  ADD COLUMN IF NOT EXISTS harness LowCardinality(String) DEFAULT '' AFTER source_name;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_documents_from_events
 TO moraine.search_documents
@@ -50,7 +50,7 @@ SELECT
   session_id,
   session_date,
   source_name,
-  provider,
+  harness,
   source_file,
   source_generation,
   source_line_no,
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS moraine.search_postings (
   doc_id String,
   session_id String,
   source_name LowCardinality(String) DEFAULT '',
-  provider LowCardinality(String) DEFAULT '',
+  harness LowCardinality(String) DEFAULT '',
   event_class LowCardinality(String),
   payload_type LowCardinality(String),
   actor_role LowCardinality(String),
@@ -91,7 +91,7 @@ ORDER BY (term, doc_id);
 ALTER TABLE moraine.search_postings
   ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_id;
 ALTER TABLE moraine.search_postings
-  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
+  ADD COLUMN IF NOT EXISTS harness LowCardinality(String) DEFAULT '' AFTER source_name;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_postings
 TO moraine.search_postings
@@ -102,7 +102,7 @@ SELECT
   d.event_uid AS doc_id,
   d.session_id,
   d.source_name,
-  d.provider,
+  d.harness,
   d.event_class,
   d.payload_type,
   d.actor_role,
@@ -118,7 +118,7 @@ FROM
     event_uid,
     session_id,
     source_name,
-    provider,
+    harness,
     event_class,
     payload_type,
     actor_role,
@@ -137,7 +137,7 @@ GROUP BY
   d.event_uid,
   d.session_id,
   d.source_name,
-  d.provider,
+  d.harness,
   d.event_class,
   d.payload_type,
   d.actor_role,
@@ -195,7 +195,7 @@ CREATE TABLE IF NOT EXISTS moraine.search_hit_log (
   event_uid String,
   session_id String,
   source_name LowCardinality(String) DEFAULT '',
-  provider LowCardinality(String) DEFAULT '',
+  harness LowCardinality(String) DEFAULT '',
   score Float64,
   matched_terms UInt16,
   doc_len UInt32,
@@ -212,7 +212,7 @@ ORDER BY (query_id, rank, ts);
 ALTER TABLE moraine.search_hit_log
   ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_id;
 ALTER TABLE moraine.search_hit_log
-  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
+  ADD COLUMN IF NOT EXISTS harness LowCardinality(String) DEFAULT '' AFTER source_name;
 
 CREATE TABLE IF NOT EXISTS moraine.search_interaction_log (
   ts DateTime64(3) DEFAULT now64(3),

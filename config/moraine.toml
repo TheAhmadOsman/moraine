@@ -20,14 +20,14 @@ heartbeat_interval_seconds = 5.0
 
 [[ingest.sources]]
 name = "codex"
-provider = "codex"
+harness = "codex"
 enabled = true
 glob = "~/.codex/sessions/**/*.jsonl"
 watch_root = "~/.codex/sessions"
 
 [[ingest.sources]]
 name = "claude"
-provider = "claude"
+harness = "claude"
 enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"

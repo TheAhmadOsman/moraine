@@ -8,7 +8,7 @@ pub struct IngestSource {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub provider: String,
+    pub harness: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -259,14 +259,14 @@ fn default_sources() -> Vec<IngestSource> {
     vec![
         IngestSource {
             name: "codex".to_string(),
-            provider: "codex".to_string(),
+            harness: "codex".to_string(),
             enabled: true,
             glob: "~/.codex/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.codex/sessions".to_string(),
         },
         IngestSource {
             name: "claude".to_string(),
-            provider: "claude".to_string(),
+            harness: "claude".to_string(),
             enabled: true,
             glob: "~/.claude/projects/**/*.jsonl".to_string(),
             watch_root: "~/.claude/projects".to_string(),
@@ -526,22 +526,22 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
     Path::new(root).join(path).to_string_lossy().to_string()
 }
 
-fn normalize_provider(provider: &str, source_idx: usize, source_name: &str) -> Result<String> {
-    let normalized = provider.trim().to_ascii_lowercase();
+fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
+    let normalized = harness.trim().to_ascii_lowercase();
     if normalized == "codex" || normalized == "claude" {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].provider `{}` for source `{}`; expected one of: codex, claude",
-        provider.trim(),
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude",
+        harness.trim(),
         source_name
     ))
 }
 
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
-        source.provider = normalize_provider(&source.provider, source_idx, &source.name)?;
+        source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
         source.glob = expand_path(&source.glob);
         source.watch_root = if source.watch_root.trim().is_empty() {
             watch_root_from_glob(&source.glob)
@@ -715,7 +715,7 @@ enabled = true
             r#"
 [[ingest.sources]]
 name = "codex"
-provider = "codex"
+harness = "codex"
 enabled = true
 glob = "~/.codex/sessions/**/*.jsonl"
 watch_root = "~/.codex/sessions"
@@ -732,19 +732,19 @@ extra = "not-allowed"
     }
 
     #[test]
-    fn load_config_errors_on_unknown_ingest_provider() {
+    fn load_config_errors_on_unknown_ingest_harness() {
         let path = write_temp_config(
             r#"
 [[ingest.sources]]
 name = "custom"
-provider = "openai"
+harness = "openai"
 enabled = true
 glob = "~/.custom/sessions/**/*.jsonl"
 watch_root = "~/.custom/sessions"
 "#,
-            "unknown-provider",
+            "unknown-harness",
         );
-        let err = load_config(&path).expect_err("unknown ingest provider should fail");
+        let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains("expected one of: codex, claude"),

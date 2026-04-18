@@ -352,7 +352,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "first_event_unix_ms": 1767434400000_i64,
                         "last_event_time": "2026-01-03 10:10:00",
                         "last_event_unix_ms": 1767435000000_i64,
-                        "provider": "codex",
+                        "harness": "codex",
                         "score": 12.5,
                         "matched_terms": 2_u16,
                         "event_count_considered": 3_u32,
@@ -365,7 +365,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "first_event_unix_ms": 1767261600000_i64,
                         "last_event_time": "2026-01-01 10:10:00",
                         "last_event_unix_ms": 1767262200000_i64,
-                        "provider": "codex",
+                        "harness": "codex",
                         "score": 7.0,
                         "matched_terms": 1_u16,
                         "event_count_considered": 2_u32,
@@ -386,7 +386,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "event_uid": "evt-c-42",
                         "session_id": "sess_c",
                         "source_name": "codex",
-                        "provider": "codex",
+                        "harness": "codex",
                         "event_class": "message",
                         "payload_type": "text",
                         "actor_role": "assistant",
@@ -404,7 +404,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "event_uid": "evt-a-11",
                         "session_id": "sess_a",
                         "source_name": "codex",
-                        "provider": "codex",
+                        "harness": "codex",
                         "event_class": "message",
                         "payload_type": "text",
                         "actor_role": "assistant",
@@ -458,13 +458,13 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                 json_each_row(json!([
                     {
                         "session_id": "sess_c",
-                        "provider": "codex",
+                        "harness": "codex",
                         "session_slug": "project-c",
                         "session_summary": "Session C summary"
                     },
                     {
                         "session_id": "sess_a",
-                        "provider": "codex",
+                        "harness": "codex",
                         "session_slug": "",
                         "session_summary": ""
                     }
@@ -949,7 +949,7 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         Some("2026-01-03 10:10:00")
     );
     assert_eq!(result.hits[0].last_event_unix_ms, Some(1767435000000_i64));
-    assert_eq!(result.hits[0].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[0].harness.as_deref(), Some("codex"));
     assert_eq!(result.hits[0].session_slug.as_deref(), Some("project-c"));
     assert_eq!(
         result.hits[0].session_summary.as_deref(),
@@ -973,7 +973,7 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         result.hits[1].first_event_time.as_deref(),
         Some("2026-01-01 10:00:00")
     );
-    assert_eq!(result.hits[1].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[1].harness.as_deref(), Some("codex"));
     assert_eq!(result.hits[1].session_slug, None);
     assert_eq!(result.hits[1].session_summary, None);
     assert_eq!(

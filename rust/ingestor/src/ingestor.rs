@@ -21,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 #[derive(Debug, Clone)]
 struct WorkItem {
     source_name: String,
-    provider: String,
+    harness: String,
     path: String,
 }
 
@@ -212,7 +212,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                 enqueue_work(
                     WorkItem {
                         source_name: source.name.clone(),
-                        provider: source.provider.clone(),
+                        harness: source.harness.clone(),
                         path,
                     },
                     &process_tx,
@@ -253,15 +253,15 @@ fn spawn_watcher_threads(
 
     for source in sources {
         let source_name = source.name.clone();
-        let provider = source.provider.clone();
+        let harness = source.harness.clone();
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
 
         info!(
-            "starting watcher on {} (source={}, provider={})",
+            "starting watcher on {} (source={}, harness={})",
             watch_root.display(),
             source_name,
-            provider
+            harness
         );
 
         let handle = std::thread::spawn(move || {
@@ -295,7 +295,7 @@ fn spawn_watcher_threads(
                         for path in event.paths {
                             let _ = tx_clone.send(WorkItem {
                                 source_name: source_name.clone(),
-                                provider: provider.clone(),
+                                harness: harness.clone(),
                                 path: path.to_string_lossy().to_string(),
                             });
                         }
@@ -395,7 +395,7 @@ fn spawn_reconcile_task(
                             enqueue_work(
                                 WorkItem {
                                     source_name: source.name.clone(),
-                                    provider: source.provider.clone(),
+                                    harness: source.harness.clone(),
                                     path,
                                 },
                                 &process_tx,
@@ -767,7 +767,7 @@ async fn process_file(
             Ok(_) => {
                 batch.error_rows.push(json!({
                     "source_name": work.source_name,
-                    "provider": work.provider,
+                    "harness": work.harness,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -782,7 +782,7 @@ async fn process_file(
             Err(exc) => {
                 batch.error_rows.push(json!({
                     "source_name": work.source_name,
-                    "provider": work.provider,
+                    "harness": work.harness,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -799,7 +799,7 @@ async fn process_file(
         let normalized = normalize_record(
             &parsed,
             &work.source_name,
-            &work.provider,
+            &work.harness,
             source_file,
             inode,
             checkpoint.source_generation,

@@ -11,7 +11,7 @@ This page maps raw Codex and Claude Code trace fields into the unified `moraine.
 | `session_id` | `session_meta.payload.id` when present; otherwise session hint or UUID parsed from source filename stem. | `sessionId`; fallback is session hint or UUID parsed from source filename stem. |
 | `session_date` | Derived from source path date (`.../sessions/YYYY/MM/DD/...`) else from parsed `timestamp` date. | Derived from source path date (`.../projects/YYYY/MM/DD/...`) else from parsed `timestamp` date. |
 | `source_name` | Not from trace. Ingest source config label. | Not from trace. Ingest source config label. |
-| `provider` | Not from trace. Ingest source provider, set to `codex`. | Not from trace. Ingest source provider, set to `claude`. |
+| `harness` | Not from trace. Ingest source harness (CLI/agent that wrote the trace), set to `codex`. | Not from trace. Ingest source harness (CLI/agent that wrote the trace), set to `claude`. |
 | `source_file` | Not from trace. Absolute/relative file path being ingested. | Not from trace. Absolute/relative file path being ingested. |
 | `source_inode` | Not from trace. File inode captured by watcher/reconcile loop. | Not from trace. File inode captured by watcher/reconcile loop. |
 | `source_generation` | Not from trace. Generation counter for truncation/rotation handling. | Not from trace. Generation counter for truncation/rotation handling. |

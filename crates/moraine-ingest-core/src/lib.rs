@@ -31,7 +31,7 @@ pub(crate) const WATCHER_BACKEND_MIXED: u64 = 3;
 #[derive(Debug, Clone)]
 pub(crate) struct WorkItem {
     pub(crate) source_name: String,
-    pub(crate) provider: String,
+    pub(crate) harness: String,
     pub(crate) path: String,
 }
 
@@ -220,7 +220,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                 enqueue_work(
                     WorkItem {
                         source_name: source.name.clone(),
-                        provider: source.provider.clone(),
+                        harness: source.harness.clone(),
                         path,
                     },
                     &process_tx,
