@@ -12,9 +12,9 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, error};
 
 #[cfg(not(unix))]
 use same_file::Handle;
@@ -124,6 +124,43 @@ pub(crate) fn complete_work(key: &str, dispatch: &Arc<Mutex<DispatchState>>) -> 
     }
 
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_work_item(
+    config: AppConfig,
+    work: WorkItem,
+    permit: OwnedSemaphorePermit,
+    checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    sink_tx: mpsc::Sender<crate::SinkMessage>,
+    process_tx: mpsc::Sender<WorkItem>,
+    dispatch: Arc<Mutex<DispatchState>>,
+    metrics: Arc<Metrics>,
+) {
+    let key = work.key();
+
+    if let Err(exc) = process_file(&config, &work, checkpoints, sink_tx, &metrics).await {
+        error!(
+            "failed processing {}:{}: {exc}",
+            work.source_name, work.path
+        );
+        *metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned") = exc.to_string();
+    }
+
+    let reschedule = complete_work(&key, &dispatch);
+
+    // Release before the reschedule `send`; holding it across a full
+    // `process_tx` would deadlock the processor loop (issue #215).
+    drop(permit);
+
+    if let Some(item) = reschedule {
+        if process_tx.send(item).await.is_ok() {
+            metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub(crate) async fn process_file(
@@ -391,12 +428,16 @@ fn truncate(input: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_work, source_inode_for_file};
-    use crate::{DispatchState, WorkItem};
+    use super::{complete_work, run_work_item, source_inode_for_file};
+    use crate::model::Checkpoint;
+    use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::{mpsc, RwLock, Semaphore};
+    use tokio::time::timeout;
 
     fn sample_work(path: &str) -> WorkItem {
         WorkItem {
@@ -519,5 +560,72 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         assert_ne!(original_id, replaced_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_work_item_releases_permit_before_reschedule_send() {
+        let path = unique_test_file("reschedule-no-deadlock");
+        fs::write(&path, "").expect("write empty jsonl");
+        let work = WorkItem {
+            source_name: "test-source".to_string(),
+            provider: "test-provider".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let key = work.key();
+
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.inflight.insert(key.clone());
+            state.dirty.insert(key.clone());
+            state.item_by_key.insert(key.clone(), work.clone());
+        }
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let (sink_tx, _sink_rx) = mpsc::channel::<SinkMessage>(8);
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(1);
+        process_tx
+            .send(work.clone())
+            .await
+            .expect("prime process_tx so reschedule send will block");
+
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("acquire initial permit");
+
+        let task = tokio::spawn(run_work_item(
+            config,
+            work,
+            permit,
+            checkpoints,
+            sink_tx,
+            process_tx,
+            dispatch,
+            metrics,
+        ));
+
+        let released = timeout(Duration::from_millis(500), sem.acquire()).await;
+        assert!(
+            released.is_ok(),
+            "permit must be released before the reschedule `send` blocks on a full channel"
+        );
+
+        process_rx.recv().await.expect("priming item");
+
+        let rescheduled = timeout(Duration::from_millis(500), process_rx.recv())
+            .await
+            .expect("rescheduled send should complete once channel drains")
+            .expect("rescheduled work item delivered");
+        assert_eq!(rescheduled.key(), key);
+
+        task.await.expect("run_work_item task should finish");
+
+        let _ = fs::remove_file(&path);
     }
 }
