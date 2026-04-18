@@ -276,7 +276,7 @@ watch_root = "${fixtures_root}/codex/sessions"
 
 [[ingest.sources]]
 name = "ci-claude"
-harness = "claude"
+harness = "claude-code"
 enabled = true
 glob = "${fixtures_root}/claude/projects/**/*.jsonl"
 watch_root = "${fixtures_root}/claude/projects"
