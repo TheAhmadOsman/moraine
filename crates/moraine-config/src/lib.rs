@@ -266,7 +266,7 @@ fn default_sources() -> Vec<IngestSource> {
         },
         IngestSource {
             name: "claude".to_string(),
-            harness: "claude".to_string(),
+            harness: "claude-code".to_string(),
             enabled: true,
             glob: "~/.claude/projects/**/*.jsonl".to_string(),
             watch_root: "~/.claude/projects".to_string(),
@@ -528,12 +528,12 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
 
 fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
     let normalized = harness.trim().to_ascii_lowercase();
-    if normalized == "codex" || normalized == "claude" {
+    if normalized == "codex" || normalized == "claude-code" {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code",
         harness.trim(),
         source_name
     ))
@@ -747,8 +747,53 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude"),
+            format!("{err:#}").contains("expected one of: codex, claude-code"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn load_config_rejects_legacy_claude_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "claude"
+harness = "claude"
+enabled = true
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+"#,
+            "legacy-claude-harness",
+        );
+        let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("expected one of: codex, claude-code"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_claude_code_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "claude"
+harness = "claude-code"
+enabled = true
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+"#,
+            "claude-code-harness",
+        );
+        let cfg = load_config(&path).expect("claude-code harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|s| s.name == "claude")
+            .expect("claude source should be present");
+        assert_eq!(source.harness, "claude-code");
     }
 }
