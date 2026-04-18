@@ -15,6 +15,13 @@ pub struct IngestSource {
     pub glob: String,
     #[serde(default)]
     pub watch_root: String,
+    /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
+    /// the default used by Codex, Claude Code, and Hermes ShareGPT dumps) or
+    /// `"session_json"` (single-file-per-session JSON rewritten in place via
+    /// atomic rename — used by live Hermes agent sessions). Empty means
+    /// "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
+    #[serde(default)]
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,6 +270,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.codex/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.codex/sessions".to_string(),
+            format: String::new(),
         },
         IngestSource {
             name: "claude".to_string(),
@@ -270,8 +278,65 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.claude/projects/**/*.jsonl".to_string(),
             watch_root: "~/.claude/projects".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "hermes".to_string(),
+            harness: "hermes".to_string(),
+            enabled: true,
+            glob: "~/.hermes/sessions/session_*.json".to_string(),
+            watch_root: "~/.hermes/sessions".to_string(),
+            format: String::new(),
         },
     ]
+}
+
+pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
+pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
+
+fn infer_source_format(harness: &str, glob: &str) -> &'static str {
+    let glob_lower = glob.to_ascii_lowercase();
+    let looks_like_json = !glob_lower.ends_with(".jsonl")
+        && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
+    if harness == "hermes" && looks_like_json {
+        SOURCE_FORMAT_SESSION_JSON
+    } else {
+        SOURCE_FORMAT_JSONL
+    }
+}
+
+fn normalize_source_format(
+    format: &str,
+    harness: &str,
+    glob: &str,
+    source_idx: usize,
+    source_name: &str,
+) -> Result<String> {
+    let trimmed = format.trim().to_ascii_lowercase();
+    let resolved = if trimmed.is_empty() {
+        infer_source_format(harness, glob).to_string()
+    } else {
+        trimmed
+    };
+    match resolved.as_str() {
+        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON => Ok(resolved),
+        _ => Err(anyhow::anyhow!(
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}",
+            format.trim(),
+            source_name
+        )),
+    }
+}
+
+impl IngestSource {
+    /// Returns the file extension (without leading `.`) this source's format
+    /// records are stored in: `jsonl` or `json`.
+    pub fn tracked_extension(&self) -> &'static str {
+        match self.format.as_str() {
+            SOURCE_FORMAT_SESSION_JSON => "json",
+            _ => "jsonl",
+        }
+    }
 }
 
 fn default_batch_size() -> usize {
@@ -548,6 +613,13 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         } else {
             expand_path(&source.watch_root)
         };
+        source.format = normalize_source_format(
+            &source.format,
+            &source.harness,
+            &source.glob,
+            source_idx,
+            &source.name,
+        )?;
     }
 
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);

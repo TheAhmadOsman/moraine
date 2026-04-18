@@ -1,5 +1,5 @@
 use crate::dispatch::enqueue_work;
-use crate::watch::enumerate_jsonl_files;
+use crate::watch::enumerate_tracked_files;
 use crate::{DispatchState, Metrics, WorkItem};
 use moraine_config::{AppConfig, IngestSource};
 use std::sync::{Arc, Mutex};
@@ -22,18 +22,20 @@ pub(crate) fn spawn_reconcile_task(
         loop {
             ticker.tick().await;
             for source in &sources {
-                match enumerate_jsonl_files(&source.glob) {
+                match enumerate_tracked_files(&source.glob, source.tracked_extension()) {
                     Ok(paths) => {
                         debug!(
-                            "reconcile scanning {} files for source={}",
+                            "reconcile scanning {} files for source={} (format={})",
                             paths.len(),
-                            source.name
+                            source.name,
+                            source.format
                         );
                         for path in paths {
                             enqueue_work(
                                 WorkItem {
                                     source_name: source.name.clone(),
                                     harness: source.harness.clone(),
+                                    format: source.format.clone(),
                                     path,
                                 },
                                 &process_tx,

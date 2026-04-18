@@ -1182,6 +1182,375 @@ fn normalize_hermes_trajectory(
     (events, links, tools)
 }
 
+/// Normalize a synthetic `session_meta` record emitted by the session_json
+/// processor for Hermes live sessions. The record carries the session header
+/// (session_id, model, base_url, platform, session_start, last_updated,
+/// system_prompt, tools, message_count). We emit a single `session_meta` event.
+fn normalize_hermes_session_meta(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let tools = Vec::<Value>::new();
+
+    let mut events = events;
+    let base_dt = parse_record_ts(ctx.record_ts);
+    let platform = to_str(record.get("platform"));
+    let base_url = to_str(record.get("base_url"));
+    let model_raw = to_str(record.get("model"));
+    let (_vendor, model) = split_hermes_vendor_model(&model_raw);
+
+    let mut meta_payload = Map::<String, Value>::new();
+    meta_payload.insert(
+        "session_id".to_string(),
+        Value::String(to_str(record.get("session_id"))),
+    );
+    meta_payload.insert("model".to_string(), Value::String(model.clone()));
+    meta_payload.insert("base_url".to_string(), Value::String(base_url.clone()));
+    meta_payload.insert("platform".to_string(), Value::String(platform.clone()));
+    meta_payload.insert(
+        "session_start".to_string(),
+        Value::String(to_str(record.get("session_start"))),
+    );
+    meta_payload.insert(
+        "last_updated".to_string(),
+        Value::String(to_str(record.get("last_updated"))),
+    );
+    if let Some(system_prompt) = record.get("system_prompt") {
+        meta_payload.insert("system_prompt".to_string(), system_prompt.clone());
+    }
+    if let Some(tools_value) = record.get("tools") {
+        meta_payload.insert("tools".to_string(), tools_value.clone());
+    }
+    if let Some(message_count) = record.get("message_count") {
+        meta_payload.insert("message_count".to_string(), message_count.clone());
+    }
+
+    let payload_json = compact_json(&Value::Object(meta_payload));
+
+    let uid = event_uid(
+        ctx.source_file,
+        ctx.source_generation,
+        ctx.source_line_no,
+        ctx.source_offset,
+        &payload_json,
+        "session_meta",
+    );
+    let _ = base_uid;
+
+    let mut row = Value::Object(base_event_obj(
+        ctx,
+        &uid,
+        "session_meta",
+        "session_meta",
+        "system",
+        "",
+        &payload_json,
+    ));
+    if !model.is_empty() {
+        update_string_field(&mut row, "model", &model);
+    }
+    if !platform.is_empty() {
+        update_string_field(&mut row, "agent_label", &platform);
+    }
+    hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, 0));
+    events.push(row);
+
+    (events, links, tools)
+}
+
+/// Normalize a synthetic `session_message` record: one OpenAI chat-completions
+/// message from a live Hermes session (role ∈ {user, assistant, tool, system},
+/// plus optional tool_calls / reasoning / tool_call_id). Tool call / result
+/// correlation travels through `tool_call_id` on each emitted row — the
+/// OpenAI schema carries it on both sides, so no in-record tracking is needed.
+#[allow(unused_assignments)]
+fn normalize_hermes_session_message(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+    let base_dt = parse_record_ts(ctx.record_ts);
+    let model = model.to_string();
+    let _ = base_uid;
+
+    let message = match record.get("message") {
+        Some(Value::Object(_)) => record.get("message").unwrap(),
+        _ => return (events, links, tools),
+    };
+
+    let message_index = record
+        .get("message_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let role = to_str(message.get("role"));
+    // For turn_index we use a 1-based message index: plenty for ordering, and
+    // ClickHouse schema uses UInt32.
+    let turn_index: u32 = ((message_index + 1).min(u32::MAX as u64)) as u32;
+
+    let compact_message = compact_json(message);
+    let next_uid = |suffix: &str| {
+        event_uid(
+            ctx.source_file,
+            ctx.source_generation,
+            ctx.source_line_no,
+            ctx.source_offset,
+            &compact_message,
+            &format!("hermes_session:{message_index}:{suffix}"),
+        )
+    };
+
+    let content_value = message.get("content").cloned().unwrap_or(Value::Null);
+
+    let mut sub_event_index = 0usize;
+
+    match role.as_str() {
+        "user" => {
+            let text = extract_message_text(&content_value);
+            let mut row = Value::Object(base_event_obj(
+                ctx,
+                &next_uid("user"),
+                "message",
+                "user_message",
+                "user",
+                &text,
+                &compact_json(message),
+            ));
+            if !model.is_empty() {
+                update_string_field(&mut row, "model", &model);
+            }
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "content_types".to_string(),
+                    json!(extract_content_types(&content_value)),
+                );
+                obj.insert("turn_index".to_string(), json!(turn_index));
+            }
+            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+            events.push(row);
+            sub_event_index += 1;
+        }
+        "assistant" => {
+            // Emit reasoning first if present — matches the wall-clock order of
+            // thinking → text → tool_calls in a single assistant turn.
+            let reasoning = message.get("reasoning").cloned().unwrap_or(Value::Null);
+            let reasoning_text = match &reasoning {
+                Value::Null => String::new(),
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if !reasoning_text.trim().is_empty() {
+                let mut row = Value::Object(base_event_obj(
+                    ctx,
+                    &next_uid("reasoning"),
+                    "reasoning",
+                    "thinking",
+                    "assistant",
+                    &reasoning_text,
+                    &compact_json(&json!({
+                        "role": "assistant",
+                        "reasoning": reasoning,
+                    })),
+                ));
+                if !model.is_empty() {
+                    update_string_field(&mut row, "model", &model);
+                }
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("content_types".to_string(), json!(["thinking"]));
+                    obj.insert("has_reasoning".to_string(), json!(1u8));
+                    obj.insert("turn_index".to_string(), json!(turn_index));
+                }
+                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+                events.push(row);
+                sub_event_index += 1;
+            }
+
+            let text = extract_message_text(&content_value);
+            if !text.trim().is_empty() {
+                let mut row = Value::Object(base_event_obj(
+                    ctx,
+                    &next_uid("assistant"),
+                    "message",
+                    "agent_message",
+                    "assistant",
+                    &text,
+                    &compact_json(&json!({
+                        "role": "assistant",
+                        "content": content_value,
+                    })),
+                ));
+                if !model.is_empty() {
+                    update_string_field(&mut row, "model", &model);
+                }
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert(
+                        "content_types".to_string(),
+                        json!(extract_content_types(&content_value)),
+                    );
+                    obj.insert("turn_index".to_string(), json!(turn_index));
+                }
+                let finish_reason = to_str(message.get("finish_reason"));
+                if !finish_reason.is_empty() {
+                    update_string_field(&mut row, "op_status", &finish_reason);
+                }
+                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+                events.push(row);
+                sub_event_index += 1;
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for (call_idx, call) in tool_calls.iter().enumerate() {
+                    let tool_call_id = to_str(call.get("id"));
+                    let function = call.get("function").cloned().unwrap_or(Value::Null);
+                    let tool_name = to_str(function.get("name"));
+                    let arguments_raw = to_str(function.get("arguments"));
+                    let arguments = parse_json_string(&arguments_raw).unwrap_or_else(|| {
+                        if arguments_raw.is_empty() {
+                            Value::Object(Map::new())
+                        } else {
+                            json!({ "raw": arguments_raw })
+                        }
+                    });
+                    let input_json = compact_json(&arguments);
+                    let input_text = {
+                        let extracted = extract_message_text(&arguments);
+                        if extracted.is_empty() {
+                            input_json.clone()
+                        } else {
+                            extracted
+                        }
+                    };
+
+                    let uid = next_uid(&format!("tool_call:{call_idx}"));
+                    let mut row = Value::Object(base_event_obj(
+                        ctx,
+                        &uid,
+                        "tool_call",
+                        "tool_use",
+                        "assistant",
+                        &input_text,
+                        &compact_json(call),
+                    ));
+                    if !model.is_empty() {
+                        update_string_field(&mut row, "model", &model);
+                    }
+                    update_string_field(&mut row, "tool_call_id", &tool_call_id);
+                    update_string_field(&mut row, "tool_name", &tool_name);
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("content_types".to_string(), json!(["tool_use"]));
+                        obj.insert("turn_index".to_string(), json!(turn_index));
+                    }
+                    hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+                    events.push(row);
+                    sub_event_index += 1;
+
+                    tools.push(build_tool_row(
+                        ctx,
+                        &uid,
+                        &tool_call_id,
+                        "",
+                        &tool_name,
+                        "request",
+                        0,
+                        &input_json,
+                        "",
+                        "",
+                    ));
+                }
+            }
+        }
+        "tool" => {
+            let tool_call_id = to_str(message.get("tool_call_id"));
+            let tool_name = to_str(message.get("name"));
+            let text = extract_message_text(&content_value);
+            let output_json = compact_json(&content_value);
+
+            let uid = next_uid("tool_result");
+            let mut row = Value::Object(base_event_obj(
+                ctx,
+                &uid,
+                "tool_result",
+                "tool_result",
+                "tool",
+                &text,
+                &compact_json(message),
+            ));
+            if !model.is_empty() {
+                update_string_field(&mut row, "model", &model);
+            }
+            update_string_field(&mut row, "tool_call_id", &tool_call_id);
+            update_string_field(&mut row, "tool_name", &tool_name);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(["tool_result"]));
+                obj.insert("turn_index".to_string(), json!(turn_index));
+            }
+            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+            events.push(row);
+            sub_event_index += 1;
+
+            tools.push(build_tool_row(
+                ctx,
+                &uid,
+                &tool_call_id,
+                "",
+                &tool_name,
+                "response",
+                0,
+                "",
+                &output_json,
+                &text,
+            ));
+        }
+        "system" => {
+            let text = extract_message_text(&content_value);
+            let mut row = Value::Object(base_event_obj(
+                ctx,
+                &next_uid("system"),
+                "system",
+                "system",
+                "system",
+                &text,
+                &compact_json(message),
+            ));
+            if !model.is_empty() {
+                update_string_field(&mut row, "model", &model);
+            }
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("turn_index".to_string(), json!(turn_index));
+            }
+            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+            events.push(row);
+            sub_event_index += 1;
+        }
+        _ => {
+            let text = extract_message_text(&content_value);
+            let mut row = Value::Object(base_event_obj(
+                ctx,
+                &next_uid("unknown"),
+                "unknown",
+                "unknown",
+                "system",
+                &text,
+                &compact_json(message),
+            ));
+            if !model.is_empty() {
+                update_string_field(&mut row, "model", &model);
+            }
+            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
+            events.push(row);
+            sub_event_index += 1;
+        }
+    }
+
+    (events, links, tools)
+}
+
 fn normalize_codex_event(
     record: &Value,
     ctx: &RecordContext<'_>,
@@ -2105,7 +2474,12 @@ pub fn normalize_record(
     let record_ts = to_str(record.get("timestamp"));
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = if harness == Harness::Hermes {
-        "trajectory".to_string()
+        let explicit = to_str(record.get("type"));
+        if explicit.is_empty() {
+            "trajectory".to_string()
+        } else {
+            explicit
+        }
     } else {
         to_str(record.get("type"))
     };
@@ -2143,7 +2517,12 @@ pub fn normalize_record(
         "raw",
     );
     if harness == Harness::Hermes {
-        session_id = hermes_session_id(&base_uid);
+        let explicit_session_id = to_str(record.get("session_id"));
+        session_id = if explicit_session_id.is_empty() {
+            hermes_session_id(&base_uid)
+        } else {
+            format!("hermes:{}", explicit_session_id)
+        };
     }
 
     let raw_row = json!({
@@ -2200,7 +2579,13 @@ pub fn normalize_record(
 
     let (event_rows, link_rows, tool_rows) = match harness {
         Harness::ClaudeCode => normalize_claude_event(record, &ctx, &top_type, &base_uid),
-        Harness::Hermes => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
+        Harness::Hermes => match top_type.as_str() {
+            "session_meta" => normalize_hermes_session_meta(record, &ctx, &base_uid),
+            "session_message" => {
+                normalize_hermes_session_message(record, &ctx, &base_uid, &hermes_model)
+            }
+            _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
+        },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
     };
 
