@@ -496,14 +496,6 @@ cmd_up() {
                 ;;
             --mount-host-sessions) mount_sessions=1; shift ;;
             --rebuild)             rebuild=1; shift ;;
-            # Legacy flags from the pre-"build-on-boot" design — now no-ops.
-            # All builds happen inside the running container against the
-            # mounted worktree, with sccache caching. Accept-and-warn keeps
-            # stale scripts working during the transition.
-            --build-in-container|--use-host-binaries|--skip-build)
-                warn "$1 is deprecated and has no effect — builds always run inside the container now (see RFC #232 update)"
-                shift
-                ;;
             -h|--help)             print_help; exit 0 ;;
             *) die "unknown flag for 'up': $1" ;;
         esac
