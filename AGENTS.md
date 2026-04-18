@@ -20,6 +20,7 @@ Prefer adding new runtime logic under `apps/` + `crates/` (not legacy `rust/` or
 - `bash scripts/ci/e2e-stack.sh`: run functional stack + MCP smoke test.
 - `bin/moraine up` / `bin/moraine status` / `bin/moraine down`: local stack lifecycle.
 - `make docs-build` / `make docs-serve`: MkDocs build/serve.
+- `make hooks-install`: enable the repo-managed git hooks (`.githooks/pre-commit` runs `cargo fmt --check` and the same clippy strict baseline CI uses). One-time per clone; bypass a single commit with `SKIP_PRECOMMIT=1 git commit ...` or `git commit --no-verify`.
 
 ## Coding Style & Naming Conventions
 Use Rust 2021 idioms and keep code `rustfmt`-clean.
