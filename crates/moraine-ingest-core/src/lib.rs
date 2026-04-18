@@ -12,7 +12,7 @@ use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
 use crate::sink::spawn_sink_task;
-use crate::watch::{enumerate_jsonl_files, spawn_watcher_threads};
+use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::{AppConfig, IngestSource};
@@ -32,6 +32,7 @@ pub(crate) const WATCHER_BACKEND_MIXED: u64 = 3;
 pub(crate) struct WorkItem {
     pub(crate) source_name: String,
     pub(crate) harness: String,
+    pub(crate) format: String,
     pub(crate) path: String,
 }
 
@@ -184,17 +185,19 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
 
     if config.ingest.backfill_on_start {
         for source in &enabled_sources {
-            let files = enumerate_jsonl_files(&source.glob)?;
+            let files = enumerate_tracked_files(&source.glob, source.tracked_extension())?;
             info!(
-                "startup backfill queueing {} files for source={}",
+                "startup backfill queueing {} files for source={} (format={})",
                 files.len(),
-                source.name
+                source.name,
+                source.format
             );
             for path in files {
                 enqueue_work(
                     WorkItem {
                         source_name: source.name.clone(),
                         harness: source.harness.clone(),
+                        format: source.format.clone(),
                         path,
                     },
                     &process_tx,

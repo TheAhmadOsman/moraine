@@ -3,7 +3,7 @@ use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::normalize_record;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 #[cfg(not(unix))]
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[cfg(not(unix))]
 use same_file::Handle;
@@ -22,6 +22,65 @@ use same_file::Handle;
 use std::os::unix::fs::MetadataExt;
 #[cfg(not(unix))]
 use std::time::UNIX_EPOCH;
+
+/// Session-json sources read whole-file snapshots that are atomically replaced
+/// every save, so the inode churns. We pin a stable synthetic identity here so
+/// the checkpoint key and `event_uid` derivation stay stable across saves.
+const SESSION_JSON_INODE: u64 = 0;
+const SESSION_JSON_GENERATION: u32 = 1;
+
+fn work_extension(work: &WorkItem) -> &'static str {
+    if work.format == SOURCE_FORMAT_SESSION_JSON {
+        "json"
+    } else {
+        "jsonl"
+    }
+}
+
+fn path_matches_extension(path: &str, extension: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        == Some(extension)
+}
+
+/// Best-effort mapping from a Hermes session `base_url` to an inference
+/// provider vendor. The session file only carries the bare model name (e.g.
+/// `claude-opus-4-6`), so we pre-prepend the vendor here to match the
+/// `vendor/model` convention the Hermes normalizer expects and downstream
+/// `inference_provider` queries need.
+fn infer_vendor_from_base_url(base_url: &str) -> &'static str {
+    let lower = base_url.to_ascii_lowercase();
+    if lower.contains("anthropic.com") {
+        "anthropic"
+    } else if lower.contains("openai.com") || lower.contains("openai.azure.com") {
+        "openai"
+    } else if lower.contains("openrouter") {
+        "openrouter"
+    } else if lower.contains("bedrock") {
+        "bedrock"
+    } else if lower.contains("googleapis") || lower.contains("google.com") {
+        "google"
+    } else {
+        ""
+    }
+}
+
+fn compose_hermes_model(model: &str, base_url: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    let vendor = infer_vendor_from_base_url(base_url);
+    if vendor.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{}/{}", vendor, trimmed)
+    }
+}
 
 pub(crate) fn spawn_debounce_task(
     config: AppConfig,
@@ -66,7 +125,7 @@ pub(crate) fn spawn_debounce_task(
 
                     for key in ready {
                         if let Some((work, _)) = pending.remove(&key) {
-                            if !work.path.ends_with(".jsonl") {
+                            if !path_matches_extension(&work.path, work_extension(&work)) {
                                 continue;
                             }
 
@@ -85,7 +144,7 @@ pub(crate) async fn enqueue_work(
     dispatch: &Arc<Mutex<DispatchState>>,
     metrics: &Arc<Metrics>,
 ) {
-    if !work.path.ends_with(".jsonl") {
+    if !path_matches_extension(&work.path, work_extension(&work)) {
         return;
     }
 
@@ -170,6 +229,10 @@ pub(crate) async fn process_file(
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
+    if work.format == SOURCE_FORMAT_SESSION_JSON {
+        return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
+    }
+
     let source_file = &work.path;
 
     let meta = match std::fs::metadata(source_file) {
@@ -373,6 +436,330 @@ pub(crate) async fn process_file(
     Ok(())
 }
 
+/// Process a Hermes live-session file (single JSON document, rewritten in
+/// place via atomic rename every save). Each message in `messages[]` is
+/// normalized independently, with the checkpoint's `last_line_no` acting as a
+/// "last-emitted message index" cursor. We pin a synthetic inode/generation so
+/// event_uids remain stable across saves, and rely on the ClickHouse
+/// ReplacingMergeTree on `events` to dedupe any re-emits.
+async fn process_session_json_file(
+    config: &AppConfig,
+    work: &WorkItem,
+    checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    sink_tx: mpsc::Sender<SinkMessage>,
+    metrics: &Arc<Metrics>,
+) -> Result<()> {
+    let source_file = &work.path;
+
+    let body = match std::fs::read_to_string(source_file) {
+        Ok(body) => body,
+        Err(exc) => {
+            debug!("session_json read skipped {}: {}", source_file, exc);
+            return Ok(());
+        }
+    };
+    let file_size = body.len() as u64;
+
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+
+    let session_doc: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(exc) => {
+            // Atomic-rename keeps the on-disk file consistent, so a parse error
+            // likely means the writer is still warming up or the file is
+            // corrupted. Emit an error row and move on — we'll try again on the
+            // next modify event.
+            warn!(source_file, "session_json parse failed; skipping: {}", exc);
+            let error_row = json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": SESSION_JSON_INODE,
+                "source_generation": SESSION_JSON_GENERATION,
+                "source_line_no": 0u64,
+                "source_offset": 0u64,
+                "error_kind": "json_parse_error",
+                "error_text": exc.to_string(),
+                "raw_fragment": truncate(&body, 20_000),
+            });
+            let mut batch = RowBatch::default();
+            batch.error_rows.push(error_row);
+            sink_tx
+                .send(SinkMessage::Batch(batch))
+                .await
+                .context("sink channel closed while sending session_json parse error")?;
+            return Ok(());
+        }
+    };
+
+    let messages = session_doc
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let message_count = messages.len() as u64;
+
+    let cp_key = checkpoint_key(&work.source_name, source_file);
+    let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+
+    let mut checkpoint = committed.unwrap_or(Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: SESSION_JSON_INODE,
+        source_generation: SESSION_JSON_GENERATION,
+        last_offset: 0,
+        last_line_no: 0,
+        status: "active".to_string(),
+    });
+
+    // Re-pin the synthetic identity on every run — older checkpoints written
+    // before this code path existed may carry real inode/generation values.
+    checkpoint.source_inode = SESSION_JSON_INODE;
+    checkpoint.source_generation = SESSION_JSON_GENERATION;
+
+    let already_emitted = checkpoint.last_line_no;
+    if message_count < already_emitted {
+        // Hermes's writer guards against this ("never overwrite a larger
+        // session log with fewer messages"), so we treat it as a spurious
+        // read. Don't rewind — leave the checkpoint alone.
+        debug!(
+            source_file,
+            current = message_count,
+            last_emitted = already_emitted,
+            "session_json shrank; ignoring",
+        );
+        return Ok(());
+    }
+
+    // On the very first run for a session file, also emit the session_meta
+    // pseudo-record so downstream consumers see harness/model/platform up front.
+    let mut synthetic_records: Vec<(u64, Value)> = Vec::new();
+    if already_emitted == 0 {
+        synthetic_records.push((0, build_session_meta_record(&session_doc)));
+    }
+    for idx in already_emitted..message_count {
+        let msg = &messages[idx as usize];
+        synthetic_records.push((
+            idx + 1,
+            build_session_message_record(&session_doc, msg, idx),
+        ));
+    }
+
+    if synthetic_records.is_empty() && file_size == checkpoint.last_offset {
+        return Ok(());
+    }
+
+    let mut batch = RowBatch::default();
+    let mut session_hint = String::new();
+    let mut model_hint = String::new();
+
+    for (line_no, record) in synthetic_records {
+        let raw_json = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
+        match normalize_record(
+            &record,
+            &work.source_name,
+            &work.harness,
+            source_file,
+            SESSION_JSON_INODE,
+            SESSION_JSON_GENERATION,
+            line_no,
+            0,
+            &session_hint,
+            &model_hint,
+        ) {
+            Ok(normalized) => {
+                session_hint = normalized.session_hint;
+                model_hint = normalized.model_hint;
+                batch.raw_rows.push(normalized.raw_row);
+                batch.event_rows.extend(normalized.event_rows);
+                batch.link_rows.extend(normalized.link_rows);
+                batch.tool_rows.extend(normalized.tool_rows);
+                batch.error_rows.extend(normalized.error_rows);
+                batch.lines_processed = batch.lines_processed.saturating_add(1);
+            }
+            Err(exc) => {
+                batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": source_file,
+                    "source_inode": SESSION_JSON_INODE,
+                    "source_generation": SESSION_JSON_GENERATION,
+                    "source_line_no": line_no,
+                    "source_offset": 0u64,
+                    "error_kind": "normalize_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&raw_json, 20_000),
+                }));
+            }
+        }
+
+        if batch.row_count() >= config.ingest.batch_size {
+            let mut chunk = RowBatch::default();
+            chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
+            chunk.event_rows = std::mem::take(&mut batch.event_rows);
+            chunk.link_rows = std::mem::take(&mut batch.link_rows);
+            chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
+            chunk.error_rows = std::mem::take(&mut batch.error_rows);
+            chunk.lines_processed = batch.lines_processed;
+            batch.lines_processed = 0;
+            sink_tx
+                .send(SinkMessage::Batch(chunk))
+                .await
+                .context("sink channel closed while sending session_json chunk")?;
+        }
+    }
+
+    let final_checkpoint = Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: SESSION_JSON_INODE,
+        source_generation: SESSION_JSON_GENERATION,
+        last_offset: file_size,
+        last_line_no: message_count,
+        status: "active".to_string(),
+    };
+
+    if batch.row_count() > 0
+        || message_count != already_emitted
+        || file_size != checkpoint.last_offset
+    {
+        batch.checkpoint = Some(final_checkpoint);
+        sink_tx
+            .send(SinkMessage::Batch(batch))
+            .await
+            .context("sink channel closed while sending final session_json batch")?;
+    }
+
+    if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
+        debug!(
+            "{}:{} session_json caught up at message_count={}",
+            work.source_name, source_file, message_count
+        );
+    }
+
+    Ok(())
+}
+
+fn build_session_meta_record(session_doc: &Value) -> Value {
+    let session_id = session_doc
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let base_url = session_doc
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model = compose_hermes_model(
+        session_doc
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        &base_url,
+    );
+    let platform = session_doc
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session_start = session_doc
+        .get("session_start")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let last_updated = session_doc
+        .get("last_updated")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let system_prompt = session_doc
+        .get("system_prompt")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let tools = session_doc.get("tools").cloned().unwrap_or(Value::Null);
+    let message_count = session_doc
+        .get("message_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    // `timestamp` is expected top-level by normalize_record for event_ts
+    // derivation. We prefer the session start; callers can always fall back to
+    // `record_ts` on the raw row if needed.
+    let timestamp = if !session_start.is_empty() {
+        session_start.clone()
+    } else {
+        last_updated.clone()
+    };
+
+    json!({
+        "type": "session_meta",
+        "timestamp": timestamp,
+        "session_id": session_id,
+        "model": model,
+        "base_url": base_url,
+        "platform": platform,
+        "session_start": session_start,
+        "last_updated": last_updated,
+        "system_prompt": system_prompt,
+        "tools": tools,
+        "message_count": message_count,
+    })
+}
+
+fn build_session_message_record(session_doc: &Value, message: &Value, message_index: u64) -> Value {
+    let session_id = session_doc
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let base_url = session_doc
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model = compose_hermes_model(
+        session_doc
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        &base_url,
+    );
+    let platform = session_doc
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let last_updated = session_doc
+        .get("last_updated")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session_start = session_doc
+        .get("session_start")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let timestamp = if !last_updated.is_empty() {
+        last_updated.clone()
+    } else {
+        session_start.clone()
+    };
+
+    json!({
+        "type": "session_message",
+        "timestamp": timestamp,
+        "session_id": session_id,
+        "model": model,
+        "base_url": base_url,
+        "platform": platform,
+        "message_index": message_index,
+        "message": message,
+    })
+}
+
 fn source_inode_for_file(source_file: &str, meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -428,9 +815,14 @@ fn truncate(input: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_work, run_work_item, source_inode_for_file};
+    use super::{
+        complete_work, compose_hermes_model, infer_vendor_from_base_url, path_matches_extension,
+        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
+        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+    };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+    use serde_json::Value;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -443,6 +835,7 @@ mod tests {
         WorkItem {
             source_name: "test-source".to_string(),
             harness: "test-harness".to_string(),
+            format: "jsonl".to_string(),
             path: path.to_string(),
         }
     }
@@ -569,6 +962,7 @@ mod tests {
         let work = WorkItem {
             source_name: "test-source".to_string(),
             harness: "test-harness".to_string(),
+            format: "jsonl".to_string(),
             path: path.to_string_lossy().to_string(),
         };
         let key = work.key();
@@ -625,6 +1019,283 @@ mod tests {
         assert_eq!(rescheduled.key(), key);
 
         task.await.expect("run_work_item task should finish");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn work_extension_matches_format() {
+        let jsonl = WorkItem {
+            source_name: "s".to_string(),
+            harness: "hermes".to_string(),
+            format: "jsonl".to_string(),
+            path: "/tmp/x.jsonl".to_string(),
+        };
+        assert_eq!(work_extension(&jsonl), "jsonl");
+        assert!(path_matches_extension(&jsonl.path, work_extension(&jsonl)));
+
+        let session = WorkItem {
+            source_name: "s".to_string(),
+            harness: "hermes".to_string(),
+            format: "session_json".to_string(),
+            path: "/tmp/session_x.json".to_string(),
+        };
+        assert_eq!(work_extension(&session), "json");
+        assert!(path_matches_extension(
+            &session.path,
+            work_extension(&session)
+        ));
+        // session_json format must NOT pick up .jsonl files
+        let wrong = WorkItem {
+            path: "/tmp/x.jsonl".to_string(),
+            ..session.clone()
+        };
+        assert!(!path_matches_extension(&wrong.path, work_extension(&wrong)));
+    }
+
+    #[test]
+    fn base_url_vendor_inference_covers_common_providers() {
+        assert_eq!(
+            infer_vendor_from_base_url("https://api.anthropic.com"),
+            "anthropic"
+        );
+        assert_eq!(
+            infer_vendor_from_base_url("https://api.openai.com/v1"),
+            "openai"
+        );
+        assert_eq!(
+            infer_vendor_from_base_url("https://openrouter.ai"),
+            "openrouter"
+        );
+        assert_eq!(infer_vendor_from_base_url(""), "");
+        assert_eq!(
+            infer_vendor_from_base_url("https://unknown.example.com"),
+            ""
+        );
+    }
+
+    #[test]
+    fn compose_hermes_model_prepends_vendor_when_bare() {
+        assert_eq!(
+            compose_hermes_model("claude-opus-4-6", "https://api.anthropic.com"),
+            "anthropic/claude-opus-4-6",
+        );
+        // Already vendor-qualified — leave it alone.
+        assert_eq!(
+            compose_hermes_model("openai/gpt-5", "https://api.anthropic.com"),
+            "openai/gpt-5",
+        );
+        // No vendor we can recognize — bare model survives.
+        assert_eq!(
+            compose_hermes_model("some-model", "https://weird.local/"),
+            "some-model",
+        );
+    }
+
+    fn write_session_file(path: &PathBuf, messages: &[serde_json::Value]) {
+        let doc = serde_json::json!({
+            "session_id": "20260418_live_test",
+            "model": "claude-opus-4-6",
+            "base_url": "https://api.anthropic.com",
+            "platform": "cli",
+            "session_start": "2026-04-18T12:00:00.000000",
+            "last_updated": "2026-04-18T12:00:00.000000",
+            "system_prompt": "you are a test agent",
+            "tools": [],
+            "message_count": messages.len(),
+            "messages": messages,
+        });
+        let body = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(path, body).expect("write session file");
+    }
+
+    fn unique_session_file(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("moraine-session-{name}-{suffix}.json"))
+    }
+
+    async fn drain_batches(rx: &mut mpsc::Receiver<SinkMessage>) -> Vec<crate::model::RowBatch> {
+        let mut out = Vec::new();
+        while let Ok(Some(SinkMessage::Batch(batch))) =
+            timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            out.push(batch);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_session_json_emits_only_new_messages_on_growth() {
+        let path = unique_session_file("growth");
+        let source_file = path.to_string_lossy().to_string();
+
+        // First snapshot: just a user turn.
+        let msgs_v1 = vec![serde_json::json!({
+            "role": "user",
+            "content": "hello"
+        })];
+        write_session_file(&path, &msgs_v1);
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        let work = WorkItem {
+            source_name: "hermes-live".to_string(),
+            harness: "hermes".to_string(),
+            format: "session_json".to_string(),
+            path: source_file.clone(),
+        };
+
+        process_session_json_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("first session_json run");
+
+        let batches_v1 = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches_v1.len(), 1, "single flushed batch on first run");
+        let b1 = &batches_v1[0];
+        // session_meta + user message = 2 event rows.
+        assert_eq!(b1.event_rows.len(), 2, "session_meta + user message events");
+        assert_eq!(
+            b1.checkpoint.as_ref().expect("checkpoint").last_line_no,
+            1,
+            "checkpoint advances to message_count=1",
+        );
+        // Apply the checkpoint like the sink would.
+        let cp = b1.checkpoint.as_ref().unwrap().clone();
+        {
+            let mut guard = checkpoints.write().await;
+            guard.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &source_file),
+                cp,
+            );
+        }
+
+        let first_uids: Vec<String> = b1
+            .event_rows
+            .iter()
+            .map(|r| {
+                r.get("event_uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+
+        // Grow the file to 2 messages. We intentionally rewrite via plain write
+        // (no atomic rename here since that's already covered by the fact that
+        // we pin SESSION_JSON_INODE=0).
+        let msgs_v2 = vec![
+            serde_json::json!({ "role": "user", "content": "hello" }),
+            serde_json::json!({ "role": "assistant", "content": "hi there" }),
+        ];
+        write_session_file(&path, &msgs_v2);
+
+        process_session_json_file(&config, &work, checkpoints.clone(), sink_tx, &metrics)
+            .await
+            .expect("second session_json run");
+
+        let batches_v2 = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches_v2.len(), 1, "second run flushed a single batch");
+        let b2 = &batches_v2[0];
+        // Only the newly-appeared assistant message should emit this time
+        // (session_meta was already emitted on the first run).
+        assert_eq!(
+            b2.event_rows.len(),
+            1,
+            "only the new assistant message emits on the second run",
+        );
+        assert_eq!(
+            b2.event_rows[0].get("actor_kind").and_then(Value::as_str),
+            Some("assistant"),
+        );
+        assert_eq!(
+            b2.checkpoint.as_ref().expect("checkpoint").last_line_no,
+            2,
+            "checkpoint advances to message_count=2",
+        );
+
+        // New row's uid must not collide with any of the first-run uids.
+        let new_uid = b2.event_rows[0]
+            .get("event_uid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !first_uids.contains(&new_uid),
+            "second-run uid collides with first-run",
+        );
+
+        // Sanity: pinned synthetic inode/generation preserved on the checkpoint.
+        let cp2 = b2.checkpoint.as_ref().unwrap();
+        assert_eq!(cp2.source_inode, SESSION_JSON_INODE);
+        assert_eq!(cp2.source_generation, SESSION_JSON_GENERATION);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_session_json_is_a_noop_when_nothing_changes() {
+        let path = unique_session_file("noop");
+        let source_file = path.to_string_lossy().to_string();
+        let msgs = vec![serde_json::json!({
+            "role": "user",
+            "content": "stable"
+        })];
+        write_session_file(&path, &msgs);
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        let work = WorkItem {
+            source_name: "hermes-live".to_string(),
+            harness: "hermes".to_string(),
+            format: "session_json".to_string(),
+            path: source_file.clone(),
+        };
+
+        process_session_json_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("first run");
+        let first = drain_batches(&mut sink_rx).await;
+        assert_eq!(first.len(), 1);
+        let cp = first[0].checkpoint.as_ref().unwrap().clone();
+        {
+            let mut guard = checkpoints.write().await;
+            guard.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &source_file),
+                cp,
+            );
+        }
+
+        // Second run on unchanged file → no batches sent.
+        process_session_json_file(&config, &work, checkpoints.clone(), sink_tx, &metrics)
+            .await
+            .expect("second run");
+        let second = drain_batches(&mut sink_rx).await;
+        assert!(
+            second.is_empty(),
+            "unchanged file should produce zero batches; got {} batches",
+            second.len(),
+        );
 
         let _ = fs::remove_file(&path);
     }

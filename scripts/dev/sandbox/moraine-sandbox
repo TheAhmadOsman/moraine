@@ -35,12 +35,13 @@ PROJECT_PREFIX="moraine-sandbox-"
 : "${SANDBOX_CONFIG_DIR:=/dev/null}"
 : "${SANDBOX_CODEX_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/dev/null}"
+: "${SANDBOX_HERMES_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_MONITOR_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
-export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR
+export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SESSIONS_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
 
@@ -268,12 +269,14 @@ ensure_compose_env() {
     : "${SANDBOX_ENTRYPOINT:=/dev/null}"
     : "${SANDBOX_CODEX_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
+    : "${SANDBOX_HERMES_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
     : "${SANDBOX_REBUILD:=0}"
     export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
         SANDBOX_CLICKHOUSE_TCP_HOST_PORT SANDBOX_MONITOR_HOST_PORT \
         SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
         SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
+        SANDBOX_HERMES_SESSIONS_DIR \
         SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
 }
 
@@ -340,19 +343,22 @@ for proj in data:
 #   $3 mount_host_sessions (0/1)
 #   $4 codex_sessions_dir (host) — may be ""
 #   $5 claude_projects_dir (host) — may be ""
-#   $6 clickhouse_version
+#   $6 hermes_sessions_dir (host) — may be ""
+#   $7 clickhouse_version
 generate_moraine_toml() {
     local config_dir="$1"
     local id="$2"
     local mount_sessions="$3"
     local codex_dir="$4"
     local claude_dir="$5"
-    local ch_version="$6"
+    local hermes_dir="$6"
+    local ch_version="$7"
 
     mkdir -p "$config_dir"
 
     local codex_src_block=""
     local claude_src_block=""
+    local hermes_src_block=""
 
     if [[ "$mount_sessions" == "1" ]]; then
         if [[ -n "$codex_dir" && -d "$codex_dir" ]]; then
@@ -361,17 +367,24 @@ generate_moraine_toml() {
             warn "host codex sessions dir not found (${codex_dir}); skipping that source"
         fi
         if [[ -n "$claude_dir" && -d "$claude_dir" ]]; then
-            claude_src_block=$'[[ingest.sources]]\nname = "host-claude"\nharness = "claude"\nenabled = true\nglob = "/host/claude/projects/**/*.jsonl"\nwatch_root = "/host/claude/projects"\n'
+            claude_src_block=$'[[ingest.sources]]\nname = "host-claude"\nharness = "claude-code"\nenabled = true\nglob = "/host/claude/projects/**/*.jsonl"\nwatch_root = "/host/claude/projects"\n'
         else
             warn "host claude projects dir not found (${claude_dir}); skipping that source"
+        fi
+        if [[ -n "$hermes_dir" && -d "$hermes_dir" ]]; then
+            hermes_src_block=$'[[ingest.sources]]\nname = "host-hermes"\nharness = "hermes"\nenabled = true\nglob = "/host/hermes/sessions/session_*.json"\nwatch_root = "/host/hermes/sessions"\nformat = "session_json"\n'
+        else
+            warn "host hermes sessions dir not found (${hermes_dir}); skipping that source"
         fi
     else
         # Fixture-based sources. Create empty dirs under config dir that will
         # be mounted at /sandbox inside the container.
         mkdir -p "${config_dir}/fixtures/codex/sessions"
         mkdir -p "${config_dir}/fixtures/claude/projects"
+        mkdir -p "${config_dir}/fixtures/hermes/sessions"
         codex_src_block=$'[[ingest.sources]]\nname = "fixture-codex"\nharness = "codex"\nenabled = true\nglob = "/sandbox/fixtures/codex/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/codex/sessions"\n'
-        claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
+        claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude-code"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
+        hermes_src_block=$'[[ingest.sources]]\nname = "fixture-hermes"\nharness = "hermes"\nenabled = true\nglob = "/sandbox/fixtures/hermes/sessions/session_*.json"\nwatch_root = "/sandbox/fixtures/hermes/sessions"\nformat = "session_json"\n'
     fi
 
     local toml_path="${config_dir}/moraine.toml"
@@ -392,6 +405,7 @@ state_dir = "/home/moraine/.moraine/ingestor"
 
 ${codex_src_block}
 ${claude_src_block}
+${hermes_src_block}
 [monitor]
 host = "0.0.0.0"
 port = 8080
@@ -543,12 +557,20 @@ cmd_up() {
     ch_tcp_port=$(( ch_http_port + 877 ))
     log "ports: monitor=${monitor_port} clickhouse-http=${ch_http_port} clickhouse-tcp=${ch_tcp_port}"
 
-    # Config.
-    local codex_dir="${SANDBOX_CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}"
-    local claude_dir="${SANDBOX_CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}"
+    # Config. The `:=/dev/null` placeholders at the top of this script keep
+    # the compose files parseable when nothing is mounted; here we want the
+    # user-facing defaults, so fall back whenever the env var is unset, empty,
+    # or still holds the placeholder.
+    local codex_dir="$SANDBOX_CODEX_SESSIONS_DIR"
+    [[ -z "$codex_dir" || "$codex_dir" == "/dev/null" ]] && codex_dir="${HOME}/.codex/sessions"
+    local claude_dir="$SANDBOX_CLAUDE_PROJECTS_DIR"
+    [[ -z "$claude_dir" || "$claude_dir" == "/dev/null" ]] && claude_dir="${HOME}/.claude/projects"
+    local hermes_dir="$SANDBOX_HERMES_SESSIONS_DIR"
+    [[ -z "$hermes_dir" || "$hermes_dir" == "/dev/null" ]] && hermes_dir="${HOME}/.hermes/sessions"
     local ch_version
     ch_version="$(clickhouse_version_from_default_config)"
-    generate_moraine_toml "$config_dir" "$id" "$mount_sessions" "$codex_dir" "$claude_dir" "$ch_version"
+    generate_moraine_toml "$config_dir" "$id" "$mount_sessions" \
+        "$codex_dir" "$claude_dir" "$hermes_dir" "$ch_version"
     local config_path="${config_dir}/moraine.toml"
 
     # Translate moraine's clickhouse_version (e.g. "v25.12.5.44-stable") to
@@ -584,6 +606,13 @@ cmd_up() {
     if [[ "$mount_sessions" == "1" ]]; then
         export SANDBOX_CODEX_SESSIONS_DIR="$codex_dir"
         export SANDBOX_CLAUDE_PROJECTS_DIR="$claude_dir"
+        # compose.sessions.yaml requires a value even when the dir is absent;
+        # fall back to a safe read-only placeholder.
+        if [[ -d "$hermes_dir" ]]; then
+            export SANDBOX_HERMES_SESSIONS_DIR="$hermes_dir"
+        else
+            export SANDBOX_HERMES_SESSIONS_DIR="/dev/null"
+        fi
     fi
 
     # Build runtime image.
@@ -842,6 +871,11 @@ ENVIRONMENT:
                                 --mount-host-sessions; default ~/.codex/sessions)
     SANDBOX_CLAUDE_PROJECTS_DIR override host claude projects dir (default
                                 ~/.claude/projects)
+    SANDBOX_HERMES_SESSIONS_DIR override host hermes live-session dir (default
+                                ~/.hermes/sessions). Files are
+                                session_*.json rewritten in place — the
+                                sandbox ingests them via the session_json
+                                format path.
 EOF
 }
 

@@ -72,3 +72,18 @@ Hermes Agent trajectories are stored as ShareGPT-compatible JSONL where one line
 - `conversations[].from == "gpt"` is segmented: plain text becomes `message`, `<think>...</think>` becomes `reasoning` with `payload_type=thinking`, and `<tool_call>...</tool_call>` becomes `tool_call` with `payload_type=tool_use`.
 - `conversations[].from == "tool"` is segmented on `<tool_response>...</tool_response>` and normalized into `tool_result` rows plus `tool_io` response rows.
 - When Hermes emits only one top-level timestamp for the entire rollout, Moraine preserves event order by assigning microsecond offsets per generated canonical event. This keeps `v_conversation_trace` chronological within the rollout while preserving the original raw JSON in `raw_events`.
+
+## Hermes Live-Session Mapping
+
+Live Hermes CLI / gateway sessions land at `~/.hermes/sessions/session_<ts>_<id>.json` — one file per conversation, rewritten in place via atomic rename on every turn. Sources with `format = "session_json"` dispatch to the live-session processor, which treats the file's `messages[]` array as the source of truth and uses the checkpoint's `last_line_no` cursor to emit only the messages that appeared since the last flush.
+
+- The synthetic session record carries `session_id = "hermes:<content-session_id>"`, where `<content-session_id>` is the agent's own id (e.g. `hermes:20260418_142200_live01`). This id is stable across every save, so all events from the same conversation share one session.
+- Event identity pins `source_inode = 0` and `source_generation = 1` regardless of on-disk inode churn from atomic renames. `source_line_no = message_index + 1` and `source_offset = 0`. `event_uid`s stay stable across reads, so re-emitted rows dedupe via the `events` `ReplacingMergeTree(event_version)`.
+- The inference provider is pre-prepended to the bare `model` field from `base_url` — `https://api.anthropic.com` → `anthropic`, `https://api.openai.com` → `openai`, etc. — so the Hermes vendor/model split produces the same canonical split used for trajectories.
+- The first time a session file is seen, the processor emits one `event_kind=session_meta` row carrying `model`, `platform`, `system_prompt`, and `tools[]`. Subsequent re-reads of the same file do not re-emit the meta row unless the processor's checkpoint has been reset.
+- OpenAI chat-completions messages map one-for-one:
+  - `role == "user"` → one `event_kind=message` row with `actor_kind=user`.
+  - `role == "assistant"` → optional `event_kind=reasoning` (when `reasoning` is non-empty, `payload_type=thinking`, `has_reasoning=1`) followed by optional `event_kind=message` (when `content` is non-empty, `payload_type=agent_message`, `op_status=<finish_reason>`) followed by one `event_kind=tool_call` per entry in `tool_calls[]` (function name from `function.name`, arguments parsed from `function.arguments`, `tool_call_id` from `id`).
+  - `role == "tool"` → one `event_kind=tool_result` row correlated to the originating call via `tool_call_id`, plus a matching `tool_io` response row.
+  - `role == "system"` → one `event_kind=system` row.
+- All rows emitted from one message share `turn_index = message_index + 1`, giving each conversation turn a monotonically increasing sequence for `v_conversation_trace`. Within a single message, sub-events are time-offset by microsecond so the reasoning row sorts before the tool_call row that follows it.
