@@ -493,6 +493,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "010_search_conversation_terms.sql",
             sql: include_str!("../../../sql/010_search_conversation_terms.sql"),
         },
+        Migration {
+            version: "011",
+            name: "011_rename_provider_to_harness.sql",
+            sql: include_str!("../../../sql/011_rename_provider_to_harness.sql"),
+        },
     ]
 }
 
@@ -756,6 +761,34 @@ mod tests {
         ));
         assert!(!has_explicit_json_each_row_format("SELECT 1"));
         assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
+    }
+
+    #[test]
+    fn bundled_migrations_registers_all_sql_files() {
+        let migrations = bundled_migrations();
+        assert_eq!(
+            migrations.len(),
+            11,
+            "expected 11 bundled migrations, got {}",
+            migrations.len()
+        );
+
+        let last = migrations.last().expect("migrations non-empty");
+        assert_eq!(last.version, "011");
+        assert!(
+            last.name.contains("011"),
+            "expected migration name to contain '011', got {}",
+            last.name
+        );
+        assert!(
+            last.name.contains("rename_provider_to_harness"),
+            "expected migration name to contain 'rename_provider_to_harness', got {}",
+            last.name
+        );
+        assert!(
+            !last.sql.is_empty(),
+            "expected migration 011 sql to be bundled via include_str!"
+        );
     }
 
     #[test]
