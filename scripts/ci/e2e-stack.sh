@@ -269,14 +269,14 @@ state_dir = "${tmp_root}/ingest-state"
 
 [[ingest.sources]]
 name = "ci-codex"
-provider = "codex"
+harness = "codex"
 enabled = true
 glob = "${fixtures_root}/codex/sessions/**/*.jsonl"
 watch_root = "${fixtures_root}/codex/sessions"
 
 [[ingest.sources]]
 name = "ci-claude"
-provider = "claude"
+harness = "claude"
 enabled = true
 glob = "${fixtures_root}/claude/projects/**/*.jsonl"
 watch_root = "${fixtures_root}/claude/projects"

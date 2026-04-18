@@ -293,7 +293,7 @@ async fn api_web_searches(
     #[derive(serde::Deserialize, serde::Serialize)]
     struct WebSearchRow {
         event_time: String,
-        provider: String,
+        harness: String,
         source_name: String,
         session_id: String,
         model: String,
@@ -314,7 +314,7 @@ async fn api_web_searches(
     let query = format!(
         "SELECT \
             toString(event_ts) AS event_time, \
-            provider, \
+            harness, \
             source_name, \
             session_id, \
             lowerUTF8(trim(BOTH ' ' FROM model)) AS model, \
@@ -361,7 +361,7 @@ async fn api_web_searches(
             "limit": limit,
             "schema": [
                 {"name": "event_time", "type": "String", "default_expression": ""},
-                {"name": "provider", "type": "String", "default_expression": ""},
+                {"name": "harness", "type": "String", "default_expression": ""},
                 {"name": "source_name", "type": "String", "default_expression": ""},
                 {"name": "session_id", "type": "String", "default_expression": ""},
                 {"name": "model", "type": "String", "default_expression": ""},
@@ -489,7 +489,7 @@ async fn api_analytics(
              SELECT \
                toUInt64(toUnixTimestamp(toStartOfInterval(event_ts_latest, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
                {model_expr_latest} AS model, \
-               provider_latest, \
+               harness_latest, \
                session_id_latest, \
                request_id_latest, \
                output_tokens_latest \
@@ -498,7 +498,7 @@ async fn api_analytics(
                  event_uid, \
                  argMax(event_ts, event_version) AS event_ts_latest, \
                  argMax(model, event_version) AS model_latest, \
-                 argMax(provider, event_version) AS provider_latest, \
+                 argMax(harness, event_version) AS harness_latest, \
                  argMax(session_id, event_version) AS session_id_latest, \
                  argMax(request_id, event_version) AS request_id_latest, \
                  argMax(output_tokens, event_version) AS output_tokens_latest \
@@ -506,7 +506,7 @@ async fn api_analytics(
                GROUP BY event_uid \
              ) WHERE {generation_latest_filter} \
            ) \
-           WHERE provider_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
+           WHERE harness_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
            GROUP BY bucket_unix, model, session_id_latest, request_id_latest \
            UNION ALL \
            SELECT \
@@ -518,14 +518,14 @@ async fn api_analytics(
                event_uid, \
                argMax(event_ts, event_version) AS event_ts_latest, \
                argMax(model, event_version) AS model_latest, \
-               argMax(provider, event_version) AS provider_latest, \
+               argMax(harness, event_version) AS harness_latest, \
                argMax(session_id, event_version) AS session_id_latest, \
                argMax(request_id, event_version) AS request_id_latest, \
                argMax(output_tokens, event_version) AS output_tokens_latest \
              FROM {table} \
              GROUP BY event_uid \
            ) WHERE {generation_latest_filter} \
-           AND NOT (provider_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
+           AND NOT (harness_latest = 'claude' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
          ) \
          GROUP BY bucket_unix, model \
          ORDER BY bucket_unix ASC, model ASC",
@@ -555,7 +555,7 @@ async fn api_analytics(
          FROM ( \
            SELECT \
              toUInt64(toUnixTimestamp(toStartOfInterval(event_ts, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-             if(provider = 'claude' AND length(trim(BOTH ' ' FROM agent_run_id)) > 0, concat(session_id, '::', agent_run_id), session_id) AS session_stream_key \
+             if(harness = 'claude' AND length(trim(BOTH ' ' FROM agent_run_id)) > 0, concat(session_id, '::', agent_run_id), session_id) AS session_stream_key \
            FROM {table} \
            WHERE {concurrent_filter} \
          ) \

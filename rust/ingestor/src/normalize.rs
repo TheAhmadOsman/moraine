@@ -75,7 +75,7 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
     }
 }
 
-fn canonicalize_model(provider: &str, raw_model: &str) -> String {
+fn canonicalize_model(harness: &str, raw_model: &str) -> String {
     let mut model = raw_model.trim().to_ascii_lowercase();
     if model.is_empty() {
         return String::new();
@@ -83,24 +83,24 @@ fn canonicalize_model(provider: &str, raw_model: &str) -> String {
 
     model = model.replace(' ', "-");
 
-    if provider == "codex" && model == "codex" {
+    if harness == "codex" && model == "codex" {
         return "gpt-5.3-codex-xhigh".to_string();
     }
 
     model
 }
 
-fn resolve_model_hint(event_rows: &[Value], provider: &str, fallback: &str) -> String {
+fn resolve_model_hint(event_rows: &[Value], harness: &str, fallback: &str) -> String {
     for row in event_rows.iter().rev() {
         if let Some(model) = row.get("model").and_then(Value::as_str) {
-            let normalized = canonicalize_model(provider, model);
+            let normalized = canonicalize_model(harness, model);
             if !normalized.is_empty() {
                 return normalized;
             }
         }
     }
 
-    canonicalize_model(provider, fallback)
+    canonicalize_model(harness, fallback)
 }
 
 fn compact_json(value: &Value) -> String {
@@ -244,7 +244,7 @@ fn io_hash(input_json: &str, output_json: &str) -> u64 {
 
 struct RecordContext<'a> {
     source_name: &'a str,
-    provider: &'a str,
+    harness: &'a str,
     session_id: &'a str,
     session_date: &'a str,
     source_file: &'a str,
@@ -284,8 +284,8 @@ fn base_event_obj(
         Value::String(ctx.source_name.to_string()),
     );
     obj.insert(
-        "provider".to_string(),
-        Value::String(ctx.provider.to_string()),
+        "harness".to_string(),
+        Value::String(ctx.harness.to_string()),
     );
     obj.insert(
         "source_file".to_string(),
@@ -391,7 +391,7 @@ fn build_link_row(
         "linked_event_uid": linked_event_uid,
         "link_type": link_type,
         "session_id": ctx.session_id,
-        "provider": ctx.provider,
+        "harness": ctx.harness,
         "source_name": ctx.source_name,
         "metadata_json": metadata_json,
         "event_version": event_version(),
@@ -417,7 +417,7 @@ fn build_tool_row(
     json!({
         "event_uid": event_uid,
         "session_id": ctx.session_id,
-        "provider": ctx.provider,
+        "harness": ctx.harness,
         "source_name": ctx.source_name,
         "tool_call_id": tool_call_id,
         "parent_tool_call_id": parent_tool_call_id,
@@ -1318,7 +1318,7 @@ fn normalize_claude_event(
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
-    provider: &str,
+    harness: &str,
     source_file: &str,
     source_inode: u64,
     source_generation: u32,
@@ -1331,7 +1331,7 @@ pub fn normalize_record(
     let event_ts = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if provider == "claude" {
+    let mut session_id = if harness == "claude" {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1344,7 +1344,7 @@ pub fn normalize_record(
         };
     }
 
-    if provider == "codex" && top_type == "session_meta" {
+    if harness == "codex" && top_type == "session_meta" {
         let payload = record.get("payload").cloned().unwrap_or(Value::Null);
         let payload_id = to_str(payload.get("id"));
         if !payload_id.is_empty() {
@@ -1366,7 +1366,7 @@ pub fn normalize_record(
 
     let raw_row = json!({
         "source_name": source_name,
-        "provider": provider,
+        "harness": harness,
         "source_file": source_file,
         "source_inode": source_inode,
         "source_generation": source_generation,
@@ -1382,7 +1382,7 @@ pub fn normalize_record(
 
     let ctx = RecordContext {
         source_name,
-        provider,
+        harness,
         session_id: &session_id,
         session_date: &session_date,
         source_file,
@@ -1394,12 +1394,12 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if provider == "claude" {
+    let (event_rows, link_rows, tool_rows) = if harness == "claude" {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
     };
-    let model_hint = resolve_model_hint(&event_rows, provider, model_hint);
+    let model_hint = resolve_model_hint(&event_rows, harness, model_hint);
 
     NormalizedRecord {
         raw_row,
@@ -1688,6 +1688,6 @@ mod tests {
             first.get("event_kind").unwrap().as_str().unwrap(),
             "tool_call"
         );
-        assert_eq!(first.get("provider").unwrap().as_str().unwrap(), "claude");
+        assert_eq!(first.get("harness").unwrap().as_str().unwrap(), "claude");
     }
 }

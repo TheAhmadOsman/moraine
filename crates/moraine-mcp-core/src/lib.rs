@@ -439,7 +439,7 @@ struct ConversationSearchProseHit {
     #[serde(default)]
     last_event_unix_ms: Option<i64>,
     #[serde(default)]
-    provider: Option<String>,
+    harness: Option<String>,
     #[serde(default)]
     session_slug: Option<String>,
     #[serde(default)]
@@ -1758,8 +1758,8 @@ fn format_conversation_search_prose(
             "\n{}) session={} score={:.4} matched_terms={} events={}\n",
             hit.rank, hit.session_id, hit.score, hit.matched_terms, hit.event_count_considered
         ));
-        if let Some(provider) = hit.provider.as_deref() {
-            out.push_str(&format!("   provider: {}\n", provider));
+        if let Some(harness) = hit.harness.as_deref() {
+            out.push_str(&format!("   harness: {}\n", harness));
         }
         if let (Some(first), Some(last)) = (
             hit.first_event_time.as_deref(),
@@ -2182,7 +2182,7 @@ mod tests {
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
-                    provider: "provider".to_string(),
+                    harness: "harness".to_string(),
                     score: 1.0,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2203,7 +2203,7 @@ mod tests {
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
-                    provider: "provider".to_string(),
+                    harness: "harness".to_string(),
                     score: 0.9,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2224,7 +2224,7 @@ mod tests {
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
-                    provider: "provider".to_string(),
+                    harness: "harness".to_string(),
                     score: 0.8,
                     matched_terms: 1,
                     doc_len: 1,
@@ -2278,7 +2278,7 @@ mod tests {
                 first_event_unix_ms: None,
                 last_event_time: None,
                 last_event_unix_ms: None,
-                provider: None,
+                harness: None,
                 session_slug: None,
                 session_summary: None,
                 score: 1.0,
@@ -2436,7 +2436,7 @@ mod tests {
                     "first_event_unix_ms": 1767434400000_i64,
                     "last_event_time": "2026-01-03 10:10:00",
                     "last_event_unix_ms": 1767435000000_i64,
-                    "provider": "codex",
+                    "harness": "codex",
                     "session_slug": "project-c",
                     "session_summary": "Session C summary",
                     "score": 12.5,
@@ -2449,7 +2449,7 @@ mod tests {
         });
 
         let text = format_conversation_search_prose(&payload, None).expect("format");
-        assert!(text.contains("provider: codex"));
+        assert!(text.contains("harness: codex"));
         assert!(text.contains("first_last: 2026-01-03 10:00:00 -> 2026-01-03 10:10:00"));
         assert!(text.contains("session_slug: project-c"));
         assert!(text.contains("session_summary: Session C summary"));

@@ -153,7 +153,7 @@ fn event_jsonl_paths(event: &Event) -> Vec<String> {
 fn queue_rescan(
     glob_pattern: &str,
     source_name: &str,
-    provider: &str,
+    harness: &str,
     tx: &mpsc::UnboundedSender<WorkItem>,
     metrics: &Arc<Metrics>,
 ) {
@@ -163,7 +163,7 @@ fn queue_rescan(
             for path in paths {
                 let _ = tx.send(WorkItem {
                     source_name: source_name.to_string(),
-                    provider: provider.to_string(),
+                    harness: harness.to_string(),
                     path,
                 });
             }
@@ -171,7 +171,7 @@ fn queue_rescan(
         Err(exc) => {
             warn!(
                 source = source_name,
-                provider,
+                harness,
                 glob_pattern,
                 error = %exc,
                 "watcher rescan failed to enumerate jsonl files"
@@ -179,7 +179,7 @@ fn queue_rescan(
             record_watcher_error(
                 metrics,
                 &format!(
-                    "rescan enumerate failed for source={source_name} provider={provider} glob={glob_pattern}: {exc}"
+                    "rescan enumerate failed for source={source_name} harness={harness} glob={glob_pattern}: {exc}"
                 ),
             );
         }
@@ -195,17 +195,17 @@ pub(crate) fn spawn_watcher_threads(
 
     for source in sources {
         let source_name = source.name.clone();
-        let provider = source.provider.clone();
+        let harness = source.harness.clone();
         let glob_pattern = source.glob.clone();
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
         let metrics_clone = metrics.clone();
 
         info!(
-            "starting watcher on {} (source={}, provider={})",
+            "starting watcher on {} (source={}, harness={})",
             watch_root.display(),
             source_name,
-            provider
+            harness
         );
 
         let handle = std::thread::spawn(move || {
@@ -258,7 +258,7 @@ pub(crate) fn spawn_watcher_threads(
                             queue_rescan(
                                 &glob_pattern,
                                 &source_name,
-                                &provider,
+                                &harness,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -285,7 +285,7 @@ pub(crate) fn spawn_watcher_threads(
                 queue_rescan(
                     &glob_pattern,
                     &source_name,
-                    &provider,
+                    &harness,
                     &tx_clone,
                     &metrics_clone,
                 );
@@ -300,7 +300,7 @@ pub(crate) fn spawn_watcher_threads(
                             queue_rescan(
                                 &glob_pattern,
                                 &source_name,
-                                &provider,
+                                &harness,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -314,7 +314,7 @@ pub(crate) fn spawn_watcher_threads(
                         for path in event_jsonl_paths(&event) {
                             let _ = tx_clone.send(WorkItem {
                                 source_name: source_name.clone(),
-                                provider: provider.clone(),
+                                harness: harness.clone(),
                                 path,
                             });
                         }
@@ -328,7 +328,7 @@ pub(crate) fn spawn_watcher_threads(
                         queue_rescan(
                             &glob_pattern,
                             &source_name,
-                            &provider,
+                            &harness,
                             &tx_clone,
                             &metrics_clone,
                         );
@@ -427,7 +427,7 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        queue_rescan("[", "source-alpha", "provider-alpha", &tx, &metrics);
+        queue_rescan("[", "source-alpha", "harness-alpha", &tx, &metrics);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
@@ -440,7 +440,7 @@ mod tests {
             .clone();
         assert!(last_error.contains("rescan enumerate failed"));
         assert!(last_error.contains("source=source-alpha"));
-        assert!(last_error.contains("provider=provider-alpha"));
+        assert!(last_error.contains("harness=harness-alpha"));
         assert!(last_error.contains("glob=["));
     }
 }

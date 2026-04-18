@@ -33,7 +33,7 @@ pub(crate) fn spawn_reconcile_task(
                             enqueue_work(
                                 WorkItem {
                                     source_name: source.name.clone(),
-                                    provider: source.provider.clone(),
+                                    harness: source.harness.clone(),
                                     path,
                                 },
                                 &process_tx,

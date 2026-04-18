@@ -251,7 +251,7 @@ pub(crate) async fn process_file(
             Ok(_) => {
                 batch.error_rows.push(json!({
                     "source_name": work.source_name,
-                    "provider": work.provider,
+                    "harness": work.harness,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -266,7 +266,7 @@ pub(crate) async fn process_file(
             Err(exc) => {
                 batch.error_rows.push(json!({
                     "source_name": work.source_name,
-                    "provider": work.provider,
+                    "harness": work.harness,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -283,7 +283,7 @@ pub(crate) async fn process_file(
         let normalized = match normalize_record(
             &parsed,
             &work.source_name,
-            &work.provider,
+            &work.harness,
             source_file,
             inode,
             checkpoint.source_generation,
@@ -296,7 +296,7 @@ pub(crate) async fn process_file(
             Err(exc) => {
                 batch.error_rows.push(json!({
                     "source_name": work.source_name,
-                    "provider": work.provider,
+                    "harness": work.harness,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -442,7 +442,7 @@ mod tests {
     fn sample_work(path: &str) -> WorkItem {
         WorkItem {
             source_name: "test-source".to_string(),
-            provider: "test-provider".to_string(),
+            harness: "test-harness".to_string(),
             path: path.to_string(),
         }
     }
@@ -568,7 +568,7 @@ mod tests {
         fs::write(&path, "").expect("write empty jsonl");
         let work = WorkItem {
             source_name: "test-source".to_string(),
-            provider: "test-provider".to_string(),
+            harness: "test-harness".to_string(),
             path: path.to_string_lossy().to_string(),
         };
         let key = work.key();
