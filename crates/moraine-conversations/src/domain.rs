@@ -20,6 +20,23 @@ impl ConversationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationListSort {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl ConversationListSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConversationListFilter {
     #[serde(default)]
@@ -28,6 +45,8 @@ pub struct ConversationListFilter {
     pub to_unix_ms: Option<i64>,
     #[serde(default)]
     pub mode: Option<ConversationMode>,
+    #[serde(default)]
+    pub sort: ConversationListSort,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

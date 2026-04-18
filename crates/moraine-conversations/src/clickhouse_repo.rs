@@ -17,11 +17,12 @@ use crate::cursor::{
 };
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
-    ConversationMode, ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
-    ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
-    PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
-    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, SessionEventsDirection,
-    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
+    ConversationSearchResults, ConversationSearchStats, ConversationSummary, OpenContext,
+    OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
+    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
+    SessionEventsDirection, SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter,
+    TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -578,13 +579,14 @@ GROUP BY session_id"
 
     fn conversation_filter_sig(filter: &ConversationListFilter) -> String {
         format!(
-            "from={:?};to={:?};mode={}",
+            "from={:?};to={:?};mode={};sort={}",
             filter.from_unix_ms,
             filter.to_unix_ms,
             filter
                 .mode
                 .map(ConversationMode::as_str)
-                .unwrap_or("__none__")
+                .unwrap_or("__none__"),
+            filter.sort.as_str(),
         )
     }
 
@@ -2788,12 +2790,18 @@ impl ConversationRepository for ClickHouseConversationRepository {
 
         let limit = page.normalized_limit(self.cfg.max_results);
         let filter_sig = Self::conversation_filter_sig(&filter);
+        let sort = filter.sort;
 
         let cursor = if let Some(token) = page.cursor.as_deref() {
             let cursor: ConversationCursor = decode_cursor(token)?;
             if cursor.filter_sig != filter_sig {
                 return Err(RepoError::invalid_cursor(
                     "cursor does not match current conversation filter",
+                ));
+            }
+            if cursor.sort != sort {
+                return Err(RepoError::invalid_cursor(
+                    "cursor sort does not match requested sort order",
                 ));
             }
             Some(cursor)
@@ -2821,8 +2829,12 @@ impl ConversationRepository for ClickHouseConversationRepository {
         }
 
         if let Some(cursor) = &cursor {
+            let (time_cmp, session_cmp) = match sort {
+                ConversationListSort::Desc => ("<", "<"),
+                ConversationListSort::Asc => (">", ">"),
+            };
             where_clauses.push(format!(
-                "(toUnixTimestamp64Milli(s.last_event_time) < {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id < {}))",
+                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
                 cursor.last_event_unix_ms,
                 cursor.last_event_unix_ms,
                 sql_quote(&cursor.session_id)
@@ -2830,6 +2842,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
         }
 
         let where_sql = where_clauses.join("\n  AND ");
+        let order_dir = match sort {
+            ConversationListSort::Desc => "DESC",
+            ConversationListSort::Asc => "ASC",
+        };
 
         let query = format!(
             "SELECT
@@ -2848,12 +2864,13 @@ impl ConversationRepository for ClickHouseConversationRepository {
 FROM {session_summary} AS s
 LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
 WHERE {where_sql}
-ORDER BY s.last_event_time DESC, s.session_id DESC
+ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
+            order_dir = order_dir,
             limit_plus = (limit as usize) + 1,
         );
 
@@ -2873,6 +2890,7 @@ FORMAT JSONEachRow",
                     last_event_unix_ms: last.last_event_unix_ms,
                     session_id: last.session_id.clone(),
                     filter_sig,
+                    sort,
                 })?)
             } else {
                 None
