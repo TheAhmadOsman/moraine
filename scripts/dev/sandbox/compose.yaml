@@ -1,21 +1,61 @@
 # Moraine dev sandbox — compose file. See RFC #232.
 #
+# Two services:
+#   * clickhouse — upstream clickhouse/clickhouse-server image at the pinned
+#     version (see config/moraine.toml runtime.clickhouse_version). Docker
+#     compose owns its lifecycle; moraine connects via compose DNS.
+#   * moraine   — runs the moraine stack (ingest + monitor, optional mcp).
+#     A bind-mounted `/opt/moraine/bin` supplies the binaries under test.
+#
 # This file is always loaded by `moraine-sandbox`. When the caller opts in to
 # mounting host session archives, the sibling `compose.sessions.yaml` overlay
 # is layered on top with `-f compose.sessions.yaml`.
 #
 # Environment variables the host CLI must export before `docker compose up`:
 #   COMPOSE_PROJECT_NAME              per-sandbox project name (container name)
-#   SANDBOX_MONITOR_HOST_PORT         host port published to container :8080
-#   SANDBOX_CLICKHOUSE_HTTP_HOST_PORT host port published to container :8123
-#   SANDBOX_CLICKHOUSE_TCP_HOST_PORT  host port published to container :9000
-#   SANDBOX_REPO_ROOT                 worktree root, mounted at /repo  (ro)
+#   SANDBOX_CLICKHOUSE_IMAGE          e.g. clickhouse/clickhouse-server:25.12.5.44
+#   SANDBOX_MONITOR_HOST_PORT         host port published to moraine :8080
+#   SANDBOX_CLICKHOUSE_HTTP_HOST_PORT host port published to clickhouse :8123
+#   SANDBOX_CLICKHOUSE_TCP_HOST_PORT  host port published to clickhouse :9000
+#   SANDBOX_REPO_ROOT                 worktree root, mounted at /repo        (ro)
 #   SANDBOX_BIN_DIR                   Linux binaries, mounted at /opt/moraine/bin (ro)
 #   SANDBOX_WEB_DIR                   monitor dist dir, mounted at /opt/moraine/web (ro)
 #   SANDBOX_CONFIG_DIR                generated config dir, mounted at /sandbox (ro)
+#   SANDBOX_ENTRYPOINT                path to entrypoint.sh in the worktree  (ro)
+#
+# The `moraine` service points at a single shared runtime image
+# (moraine-sandbox-runtime:latest) rather than a per-sandbox image. The runtime
+# image contains no per-sandbox content — everything that varies per sandbox
+# (binaries, web assets, config, entrypoint) arrives via bind mount. First `up`
+# builds the shared image; subsequent `up`s reuse it via Docker's layer cache.
 
 services:
+  clickhouse:
+    image: ${SANDBOX_CLICKHOUSE_IMAGE}
+    container_name: ${COMPOSE_PROJECT_NAME}-clickhouse
+    restart: "no"
+    environment:
+      CLICKHOUSE_DB: moraine
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - "clickhouse-data:/var/lib/clickhouse"
+    ports:
+      - "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"
+      - "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
   moraine:
+    image: moraine-sandbox-runtime:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -25,15 +65,20 @@ services:
     tty: true
     stdin_open: true
     restart: "no"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      SANDBOX_CLICKHOUSE_HOST: clickhouse
+      SANDBOX_CLICKHOUSE_PORT: "8123"
     ports:
       - "${SANDBOX_MONITOR_HOST_PORT}:8080"
-      - "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"
-      - "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"
     volumes:
       - "${SANDBOX_REPO_ROOT}:/repo:ro"
       - "${SANDBOX_BIN_DIR}:/opt/moraine/bin:ro"
       - "${SANDBOX_WEB_DIR}:/opt/moraine/web:ro"
       - "${SANDBOX_CONFIG_DIR}:/sandbox:ro"
+      - "${SANDBOX_ENTRYPOINT}:/usr/local/bin/entrypoint.sh:ro"
       - "state:/home/moraine/.moraine"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/health || exit 1"]
@@ -44,3 +89,4 @@ services:
 
 volumes:
   state: {}
+  clickhouse-data: {}

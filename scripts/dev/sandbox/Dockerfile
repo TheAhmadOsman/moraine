@@ -8,10 +8,13 @@
 #                Produces release artifacts in /build/target/release/. The host
 #                CLI can select this stage with `docker build --target builder`,
 #                extract binaries, then build the runtime image.
-#   * runtime  (FROM debian:bookworm-slim) — the default small image. Binaries
-#                arrive at runtime via bind mount at /opt/moraine/bin, so the
-#                runtime stage deliberately does NOT copy artifacts from the
-#                builder stage. Select with `docker build --target runtime`.
+#   * runtime  (FROM debian:bookworm-slim) — the default small image. A single
+#                shared moraine-sandbox-runtime:latest image is reused across
+#                every sandbox. Everything that varies per sandbox — binaries,
+#                web assets, generated config, and entrypoint.sh — arrives via
+#                bind mount from the active worktree (see compose.yaml). The
+#                runtime stage therefore does NOT copy any of those artifacts
+#                in. Select with `docker build --target runtime`.
 
 # ---------------------------------------------------------------------------
 # builder stage — optional, opt-in via --build-in-container
@@ -41,7 +44,8 @@ FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    PATH=/opt/moraine/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/opt/moraine/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    MORAINE_MONITOR_STATIC_DIR=/opt/moraine/web
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -72,7 +76,15 @@ RUN mkdir -p \
         /sandbox \
         /home/moraine
 
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+# entrypoint.sh is bind-mounted by compose at /usr/local/bin/entrypoint.sh from
+# the active worktree, so it always tracks the current scripts/dev/sandbox/
+# version. The placeholder here ensures the file exists (and is executable) if
+# someone runs the image without compose's bind mount, and also forces a rebuild
+# when the contract changes.
+RUN install -m 0755 /dev/null /usr/local/bin/entrypoint.sh \
+    && printf '#!/bin/sh\necho "entrypoint.sh bind-mount missing — start with moraine-sandbox, not bare docker run" >&2\nexit 1\n' \
+        > /usr/local/bin/entrypoint.sh \
+    && chmod 0755 /usr/local/bin/entrypoint.sh
 
 USER moraine
 WORKDIR /home/moraine
