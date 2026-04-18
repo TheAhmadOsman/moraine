@@ -1119,11 +1119,10 @@ mod tests {
 
     async fn drain_batches(rx: &mut mpsc::Receiver<SinkMessage>) -> Vec<crate::model::RowBatch> {
         let mut out = Vec::new();
-        loop {
-            match timeout(Duration::from_millis(50), rx.recv()).await {
-                Ok(Some(SinkMessage::Batch(batch))) => out.push(batch),
-                _ => break,
-            }
+        while let Ok(Some(SinkMessage::Batch(batch))) =
+            timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            out.push(batch);
         }
         out
     }
