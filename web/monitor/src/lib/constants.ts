@@ -1,6 +1,16 @@
 import type { AnalyticsRangeKey } from './types/api';
 
-export const ANALYTICS_RANGES: AnalyticsRangeKey[] = ['15m', '1h', '6h', '24h', '7d', '30d'];
+export const ANALYTICS_RANGES: AnalyticsRangeKey[] = [
+  '15m',
+  '1h',
+  '6h',
+  '24h',
+  '7d',
+  '30d',
+  '90d',
+  '180d',
+  '365d',
+];
 
 export const MODEL_COLORS = [
   '#155e75',

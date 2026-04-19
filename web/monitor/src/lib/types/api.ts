@@ -1,4 +1,13 @@
-export type AnalyticsRangeKey = '15m' | '1h' | '6h' | '24h' | '7d' | '30d';
+export type AnalyticsRangeKey =
+  | '15m'
+  | '1h'
+  | '6h'
+  | '24h'
+  | '7d'
+  | '30d'
+  | '90d'
+  | '180d'
+  | '365d';
 
 export interface ApiError {
   error?: string;

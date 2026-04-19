@@ -8,6 +8,9 @@ function analyticsFixture(range: string) {
     '24h': { label: 'Last 24h', bucket_seconds: 3600 },
     '7d': { label: 'Last 7d', bucket_seconds: 21600 },
     '30d': { label: 'Last 30d', bucket_seconds: 86400 },
+    '90d': { label: 'Last 90d', bucket_seconds: 259200 },
+    '180d': { label: 'Last 180d', bucket_seconds: 604800 },
+    '365d': { label: 'Last 365d', bucket_seconds: 1209600 },
   };
 
   const picked = rangeMap[range] || rangeMap['24h'];
@@ -137,6 +140,9 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
 
   await page.getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
+
+  await page.getByRole('button', { name: '365d' }).click();
+  await expect(page.locator('#analyticsMeta')).toContainText('Last 365d');
 
   const htmlThemeBefore = await page.locator('html').getAttribute('data-theme');
   await page.locator('#themeToggle').click();

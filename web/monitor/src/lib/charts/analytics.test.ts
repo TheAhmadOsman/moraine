@@ -40,14 +40,14 @@ describe('buildAnalyticsView', () => {
     expect(view.maxTicks).toBe(10);
   });
 
-  it('uses wider tick limit for 30d ranges', () => {
+  it('uses wider tick limit for long day ranges', () => {
     const view = buildAnalyticsView({
       ok: true,
       range: {
         ...baseRange,
-        key: '30d',
-        label: 'Last 30d',
-        bucket_seconds: 86400,
+        key: '365d',
+        label: 'Last 365d',
+        bucket_seconds: 14 * 86400,
       },
       series: {
         tokens: [],
@@ -57,6 +57,6 @@ describe('buildAnalyticsView', () => {
     });
 
     expect(view.maxTicks).toBe(12);
-    expect(view.metaText).toContain('Last 30d');
+    expect(view.metaText).toContain('Last 365d');
   });
 });

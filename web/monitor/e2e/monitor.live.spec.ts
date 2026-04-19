@@ -187,6 +187,10 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
 
   await page.getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
+
+  await page.getByRole('button', { name: '90d' }).click();
+  await expect(page.locator('#analyticsMeta')).toContainText('Last 90d');
+
   await expect(page.locator('#tokensChart')).toBeVisible();
   await expect(page.locator('#turnsChart')).toBeVisible();
   await expect(page.locator('#concurrentSessionsChart')).toBeVisible();

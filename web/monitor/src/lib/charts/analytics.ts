@@ -72,7 +72,16 @@ function mapConcurrent(points: ConcurrentSessionsPoint[]): Map<number, number> {
 }
 
 function maxTicksForRange(range: AnalyticsRange): number {
-  return range.key === '7d' || range.key === '30d' ? 12 : 10;
+  switch (range.key) {
+    case '7d':
+    case '30d':
+    case '90d':
+    case '180d':
+    case '365d':
+      return 12;
+    default:
+      return 10;
+  }
 }
 
 export function buildAnalyticsView(data: AnalyticsResponse): AnalyticsChartView {

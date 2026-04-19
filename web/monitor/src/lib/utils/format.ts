@@ -3,7 +3,7 @@ import type { AnalyticsRange, AnalyticsRangeKey } from '../types/api';
 export function formatBucketLabel(unixSeconds: number, rangeKey: AnalyticsRangeKey): string {
   const date = new Date(unixSeconds * 1000);
 
-  if (rangeKey === '30d') {
+  if (rangeKey === '30d' || rangeKey === '90d' || rangeKey === '180d' || rangeKey === '365d') {
     return date.toLocaleString([], { month: 'short', day: 'numeric' });
   }
   if (rangeKey === '7d' || rangeKey === '24h') {

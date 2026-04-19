@@ -422,6 +422,24 @@ fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
             window_seconds: 30 * 24 * 60 * 60,
             bucket_seconds: 24 * 60 * 60,
         },
+        "90d" => AnalyticsRange {
+            key: "90d",
+            label: "Last 90d",
+            window_seconds: 90 * 24 * 60 * 60,
+            bucket_seconds: 3 * 24 * 60 * 60,
+        },
+        "180d" => AnalyticsRange {
+            key: "180d",
+            label: "Last 180d",
+            window_seconds: 180 * 24 * 60 * 60,
+            bucket_seconds: 7 * 24 * 60 * 60,
+        },
+        "365d" => AnalyticsRange {
+            key: "365d",
+            label: "Last 365d",
+            window_seconds: 365 * 24 * 60 * 60,
+            bucket_seconds: 14 * 24 * 60 * 60,
+        },
         _ => AnalyticsRange {
             key: "24h",
             label: "Last 24h",
@@ -1095,6 +1113,24 @@ mod tests {
         let columns: Vec<String> = Vec::new();
         let query = table_preview_rows_query("analytics", "events", &columns, 5);
         assert_eq!(query, "SELECT * FROM `analytics`.`events` LIMIT 5");
+    }
+
+    #[test]
+    fn resolves_extended_analytics_ranges() {
+        let cases: [(&str, &str, u32, u32); 3] = [
+            ("90d", "Last 90d", 90 * 24 * 60 * 60, 3 * 24 * 60 * 60),
+            ("180d", "Last 180d", 180 * 24 * 60 * 60, 7 * 24 * 60 * 60),
+            ("365d", "Last 365d", 365 * 24 * 60 * 60, 14 * 24 * 60 * 60),
+        ];
+
+        for (key, label, window_seconds, bucket_seconds) in cases {
+            let range = resolve_analytics_range(Some(key));
+
+            assert_eq!(range.key, key);
+            assert_eq!(range.label, label);
+            assert_eq!(range.window_seconds, window_seconds);
+            assert_eq!(range.bucket_seconds, bucket_seconds);
+        }
     }
 
     #[test]
