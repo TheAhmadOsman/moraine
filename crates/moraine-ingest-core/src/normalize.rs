@@ -67,6 +67,7 @@ enum Harness {
     Codex,
     ClaudeCode,
     Hermes,
+    KimiCli,
 }
 
 impl Harness {
@@ -75,8 +76,9 @@ impl Harness {
             "codex" => Ok(Self::Codex),
             "claude-code" => Ok(Self::ClaudeCode),
             "hermes" => Ok(Self::Hermes),
+            "kimi-cli" => Ok(Self::KimiCli),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude-code, hermes",
+                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, kimi-cli",
                 raw.trim()
             )),
         }
@@ -87,6 +89,7 @@ impl Harness {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Hermes => "hermes",
+            Self::KimiCli => "kimi-cli",
         }
     }
 
@@ -98,6 +101,7 @@ impl Harness {
             Self::Codex => "openai",
             Self::ClaudeCode => "anthropic",
             Self::Hermes => "",
+            Self::KimiCli => "moonshot",
         }
     }
 }
@@ -184,7 +188,7 @@ fn extract_message_text(content: &Value) -> String {
                 }
             }
             Value::Object(map) => {
-                for key in ["text", "message", "output", "thinking", "summary"] {
+                for key in ["text", "message", "output", "thinking", "think", "summary"] {
                     if let Some(Value::String(s)) = map.get(key) {
                         if !s.trim().is_empty() {
                             out.push(s.clone());
@@ -739,6 +743,63 @@ fn parse_hermes_segments(input: &str) -> Vec<HermesSegment> {
 
 fn hermes_session_id(base_uid: &str) -> String {
     format!("hermes:{base_uid}")
+}
+
+fn kimi_session_id(source_file: &str, session_hint: &str) -> String {
+    if !session_hint.is_empty() {
+        return session_hint.to_string();
+    }
+    let path = std::path::Path::new(source_file);
+    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+        if !parent.is_empty() {
+            return format!("kimi-cli:{parent}");
+        }
+    }
+    infer_session_id_from_file(source_file)
+}
+
+fn parse_kimi_timestamp(record: &Value, source_line_no: u64) -> (String, String, bool) {
+    // Metadata line: no timestamp, no error
+    if record.get("type").and_then(Value::as_str) == Some("metadata")
+        && record.get("protocol_version").is_some()
+    {
+        return (
+            String::new(),
+            UNPARSEABLE_EVENT_TS.to_string(),
+            false,
+        );
+    }
+
+    // Numeric timestamp (wire.jsonl)
+    if let Some(ts_val) = record.get("timestamp") {
+        let ts_f64 = if let Some(n) = ts_val.as_f64() {
+            n
+        } else if let Some(n) = ts_val.as_u64() {
+            n as f64
+        } else if let Some(s) = ts_val.as_str() {
+            s.parse::<f64>().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        if ts_f64 > 0.0 {
+            let secs = ts_f64.trunc() as i64;
+            let nanos = (ts_f64.fract().abs() * 1_000_000_000.0) as u32;
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(secs, nanos) {
+                return (format_record_ts(&dt), format_event_ts(&dt), false);
+            }
+        }
+    }
+
+    // context.jsonl (has role, no timestamp)
+    if record.get("role").is_some() {
+        let base = DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch");
+        let dt = base + Duration::microseconds(source_line_no as i64);
+        return (format_record_ts(&dt), format_event_ts(&dt), false);
+    }
+
+    // Fallback
+    (String::new(), UNPARSEABLE_EVENT_TS.to_string(), false)
 }
 
 fn hermes_status(record: &Value) -> String {
@@ -2445,6 +2506,611 @@ fn normalize_claude_event(
     (events, links, tools)
 }
 
+fn normalize_kimi_context_record(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+
+    let role = to_str(record.get("role"));
+    let content = record.get("content").cloned().unwrap_or(Value::Null);
+    let record_json = compact_json(record);
+
+    match role.as_str() {
+        "_system_prompt" => {
+            let text = extract_message_text(&content);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "system",
+                "system",
+                "system",
+                &text,
+                &record_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "_usage" => {
+            let token_count = to_u32(record.get("token_count"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "token_count",
+                "system",
+                "",
+                &record_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("input_tokens".to_string(), json!(token_count));
+            }
+            events.push(Value::Object(row));
+        }
+        "_checkpoint" => {
+            let checkpoint_id = to_u32(record.get("id"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "checkpoint",
+                "system",
+                "",
+                &record_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("item_id".to_string(), json!(format!("{checkpoint_id}")));
+            }
+            events.push(Value::Object(row));
+        }
+        "user" => {
+            let text = extract_message_text(&content);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "message",
+                "user_message",
+                "user",
+                &text,
+                &record_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(extract_content_types(&content)));
+            }
+            events.push(Value::Object(row));
+        }
+        "assistant" => {
+            if let Value::Array(parts) = &content {
+                for (idx, part) in parts.iter().enumerate() {
+                    let part_type = to_str(part.get("type"));
+                    let part_text = extract_message_text(part);
+                    let part_json = compact_json(part);
+                    let suffix = format!("part:{idx}");
+                    let part_uid = event_uid(
+                        ctx.source_file,
+                        ctx.source_generation,
+                        ctx.source_line_no,
+                        ctx.source_offset,
+                        &part_json,
+                        &suffix,
+                    );
+
+                    let mut row = match part_type.as_str() {
+                        "think" => {
+                            let mut r = base_event_obj(
+                                ctx,
+                                &part_uid,
+                                "reasoning",
+                                "thinking",
+                                "assistant",
+                                &part_text,
+                                &part_json,
+                            );
+                            if let Some(obj) = r.as_object_mut() {
+                                obj.insert("has_reasoning".to_string(), json!(1u8));
+                                obj.insert("content_types".to_string(), json!(["thinking"]));
+                            }
+                            r
+                        }
+                        _ => {
+                            let mut r = base_event_obj(
+                                ctx,
+                                &part_uid,
+                                "message",
+                                "agent_message",
+                                "assistant",
+                                &part_text,
+                                &part_json,
+                            );
+                            if let Some(obj) = r.as_object_mut() {
+                                if !part_type.is_empty() {
+                                    obj.insert("content_types".to_string(), json!([part_type]));
+                                }
+                            }
+                            r
+                        }
+                    };
+                    events.push(Value::Object(row));
+                }
+            } else {
+                let text = extract_message_text(&content);
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "message",
+                    "agent_message",
+                    "assistant",
+                    &text,
+                    &record_json,
+                );
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("content_types".to_string(), json!(extract_content_types(&content)));
+                }
+                events.push(Value::Object(row));
+            }
+        }
+        "tool" => {
+            let tool_call_id = to_str(record.get("tool_call_id"));
+            let text = extract_message_text(&content);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "tool_result",
+                "tool_result",
+                "tool",
+                &text,
+                &record_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(["tool_result"]));
+            }
+            update_string_field(&mut row, "tool_call_id", &tool_call_id);
+            events.push(Value::Object(row));
+
+            tools.push(build_tool_row(
+                ctx,
+                base_uid,
+                &tool_call_id,
+                "",
+                "",
+                "response",
+                0,
+                "",
+                &compact_json(&content),
+                &text,
+            ));
+        }
+        _ => {
+            let text = extract_message_text(&content);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                &text,
+                &record_json,
+            );
+            events.push(Value::Object(row));
+        }
+    }
+
+    (events, links, tools)
+}
+
+fn normalize_kimi_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+
+    // context.jsonl records have a top-level `role` field.
+    if record.get("role").is_some() {
+        return normalize_kimi_context_record(record, ctx, base_uid);
+    }
+
+    // Metadata line (first line of wire.jsonl)
+    if record.get("type").and_then(Value::as_str) == Some("metadata") {
+        let mut row = base_event_obj(
+            ctx,
+            base_uid,
+            "session_meta",
+            "session_meta",
+            "system",
+            "",
+            &compact_json(record),
+        );
+        if let Some(obj) = row.as_object_mut() {
+            if let Some(pv) = record.get("protocol_version").and_then(Value::as_str) {
+                obj.insert("item_id".to_string(), json!(pv));
+            }
+        }
+        events.push(Value::Object(row));
+        return (events, links, tools);
+    }
+
+    let message = record.get("message").cloned().unwrap_or(Value::Null);
+    let msg_type = to_str(message.get("type"));
+    let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+    let payload_obj = payload.as_object().cloned().unwrap_or_else(Map::new);
+    let payload_json = compact_json(&payload);
+
+    match msg_type.as_str() {
+        "TurnBegin" | "SteerInput" => {
+            let user_input = payload_obj.get("user_input").cloned().unwrap_or(Value::Null);
+            let text = extract_message_text(&user_input);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "message",
+                "user_message",
+                "user",
+                &text,
+                &payload_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(extract_content_types(&user_input)));
+            }
+            events.push(Value::Object(row));
+        }
+        "TurnEnd" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "summary",
+                "task_complete",
+                "assistant",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "StepBegin" => {
+            let n = to_u32(payload_obj.get("n"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "task_started",
+                "system",
+                "",
+                &payload_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("turn_index".to_string(), json!(n));
+            }
+            events.push(Value::Object(row));
+        }
+        "StepInterrupted" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "turn_aborted",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "ContentPart" => {
+            let part_type = to_str(payload_obj.get("type"));
+            let text = extract_message_text(&payload);
+            match part_type.as_str() {
+                "think" => {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "reasoning",
+                        "thinking",
+                        "assistant",
+                        &text,
+                        &payload_json,
+                    );
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("has_reasoning".to_string(), json!(1u8));
+                        obj.insert("content_types".to_string(), json!(["thinking"]));
+                    }
+                    events.push(Value::Object(row));
+                }
+                _ => {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "message",
+                        "agent_message",
+                        "assistant",
+                        &text,
+                        &payload_json,
+                    );
+                    if let Some(obj) = row.as_object_mut() {
+                        if !part_type.is_empty() {
+                            obj.insert("content_types".to_string(), json!([part_type]));
+                        }
+                    }
+                    events.push(Value::Object(row));
+                }
+            }
+        }
+        "ToolCall" => {
+            let function = payload_obj.get("function").cloned().unwrap_or(Value::Null);
+            let tool_name = to_str(function.get("name"));
+            let arguments = to_str(function.get("arguments"));
+            let tool_call_id = to_str(payload_obj.get("id"));
+            let input_json = if arguments.is_empty() {
+                String::new()
+            } else {
+                parse_json_string(&arguments)
+                    .map(|v| compact_json(&v))
+                    .unwrap_or_else(|| arguments.clone())
+            };
+            let input_text = {
+                let parsed = parse_json_string(&arguments).unwrap_or(Value::Null);
+                let extracted = extract_message_text(&parsed);
+                if extracted.is_empty() {
+                    arguments.clone()
+                } else {
+                    extracted
+                }
+            };
+
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "tool_call",
+                "tool_use",
+                "assistant",
+                &input_text,
+                &payload_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(["tool_use"]));
+            }
+            update_string_field(&mut row, "tool_call_id", &tool_call_id);
+            update_string_field(&mut row, "tool_name", &tool_name);
+            events.push(Value::Object(row));
+
+            tools.push(build_tool_row(
+                ctx,
+                base_uid,
+                &tool_call_id,
+                "",
+                &tool_name,
+                "request",
+                0,
+                &input_json,
+                "",
+                "",
+            ));
+        }
+        "ToolCallPart" => {
+            let args_part = to_str(payload_obj.get("arguments_part"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "tool_use",
+                "assistant",
+                &args_part,
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "ToolResult" => {
+            let tool_call_id = to_str(payload_obj.get("tool_call_id"));
+            let return_value = payload_obj.get("return_value").cloned().unwrap_or(Value::Null);
+            let is_error = to_u8_bool(return_value.get("is_error"));
+            let output = to_str(return_value.get("output"));
+            let message_text = to_str(return_value.get("message"));
+
+            let output_text = if !output.is_empty() {
+                output.clone()
+            } else {
+                message_text.clone()
+            };
+            let output_json = compact_json(&return_value);
+
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "tool_result",
+                "tool_result",
+                "tool",
+                &output_text,
+                &payload_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("content_types".to_string(), json!(["tool_result"]));
+            }
+            update_string_field(&mut row, "tool_call_id", &tool_call_id);
+            update_u8_field(&mut row, "tool_error", is_error);
+            events.push(Value::Object(row));
+
+            tools.push(build_tool_row(
+                ctx,
+                base_uid,
+                &tool_call_id,
+                "",
+                "",
+                "response",
+                is_error,
+                "",
+                &output_json,
+                &output_text,
+            ));
+        }
+        "StatusUpdate" => {
+            let token_usage = payload_obj.get("token_usage").cloned().unwrap_or(Value::Null);
+            let input_other = to_u32(token_usage.get("input_other"));
+            let input_cache_read = to_u32(token_usage.get("input_cache_read"));
+            let input_cache_creation = to_u32(token_usage.get("input_cache_creation"));
+            let output = to_u32(token_usage.get("output"));
+
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "token_count",
+                "system",
+                "",
+                &payload_json,
+            );
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "input_tokens".to_string(),
+                    json!(input_other.saturating_add(input_cache_read)),
+                );
+                obj.insert("output_tokens".to_string(), json!(output));
+                obj.insert("cache_read_tokens".to_string(), json!(input_cache_read));
+                obj.insert("cache_write_tokens".to_string(), json!(input_cache_creation));
+                obj.insert("token_usage_json".to_string(), json!(compact_json(&token_usage)));
+            }
+            events.push(Value::Object(row));
+        }
+        "CompactionBegin" | "CompactionEnd" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "compacted",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "HookTriggered" | "HookResolved" => {
+            let event = to_str(payload_obj.get("event"));
+            let target = to_str(payload_obj.get("target"));
+            let text = if !event.is_empty() && !target.is_empty() {
+                format!("{event}: {target}")
+            } else {
+                event
+            };
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "event_msg",
+                "system",
+                &text,
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "MCPLoadingBegin" | "MCPLoadingEnd" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "MCPStatusSnapshot" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "system",
+                "system",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "BtwBegin" | "BtwEnd" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                if msg_type == "BtwBegin" {
+                    "task_started"
+                } else {
+                    "task_complete"
+                },
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "SubagentEvent" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "event_msg",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "Notification" => {
+            let title = to_str(payload_obj.get("title"));
+            let body = to_str(payload_obj.get("body"));
+            let text = if !body.is_empty() { body } else { title };
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "system",
+                "system",
+                "system",
+                &text,
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "PlanDisplay" => {
+            let content = to_str(payload_obj.get("content"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "summary",
+                "summary",
+                "assistant",
+                &content,
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        "ApprovalRequest" | "ApprovalResponse" | "QuestionRequest" | "QuestionResponse" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "event_msg",
+                "system",
+                "",
+                &payload_json,
+            );
+            events.push(Value::Object(row));
+        }
+        _ => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                "",
+                &payload_json,
+            )));
+        }
+    }
+
+    (events, links, tools)
+}
+
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
@@ -2471,8 +3137,13 @@ pub fn normalize_record(
         (harness.inference_provider().to_string(), String::new())
     };
 
-    let record_ts = to_str(record.get("timestamp"));
-    let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
+    let (record_ts, event_ts, event_ts_parse_failed) = if harness == Harness::KimiCli {
+        parse_kimi_timestamp(record, source_line_no)
+    } else {
+        let record_ts = to_str(record.get("timestamp"));
+        let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
+        (record_ts, event_ts, event_ts_parse_failed)
+    };
     let top_type = if harness == Harness::Hermes {
         let explicit = to_str(record.get("type"));
         if explicit.is_empty() {
@@ -2486,10 +3157,12 @@ pub fn normalize_record(
 
     let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
+    } else if harness == Harness::KimiCli {
+        kimi_session_id(source_file, session_hint)
     } else {
         String::new()
     };
-    if session_id.is_empty() && harness != Harness::Hermes {
+    if session_id.is_empty() && harness != Harness::Hermes && harness != Harness::KimiCli {
         session_id = if session_hint.is_empty() {
             infer_session_id_from_file(source_file)
         } else {
@@ -2587,6 +3260,7 @@ pub fn normalize_record(
             _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
+        Harness::KimiCli => normalize_kimi_event(record, &ctx, &base_uid),
     };
 
     // For Hermes, resolve_model_hint's fallback should be the already-split

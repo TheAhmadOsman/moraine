@@ -1,0 +1,6 @@
+{"role": "_system_prompt", "content": "You are Kimi, a helpful coding assistant."}
+{"role": "user", "content": "Explain ownership in Rust."}
+{"role": "assistant", "content": [{"type": "think", "think": "Ownership is Rust's core memory management concept. I should explain it clearly."}, {"type": "text", "text": "Ownership is Rust's most unique feature. Each value has a single owner, and when the owner goes out of scope, the value is dropped."}]}
+{"role": "tool", "tool_call_id": "tool_002", "content": "Rust ownership rules prevent data races at compile time."}
+{"role": "_usage", "token_count": 150}
+{"role": "_checkpoint", "id": 1}

@@ -1,0 +1,11 @@
+{"type": "metadata", "protocol_version": "1.9"}
+{"timestamp": 1745012400.0, "message": {"type": "TurnBegin", "payload": {"user_input": "Write a Rust function that reverses a string."}}}
+{"timestamp": 1745012401.0, "message": {"type": "StepBegin", "payload": {"n": 1}}}
+{"timestamp": 1745012402.0, "message": {"type": "ContentPart", "payload": {"type": "think", "think": "The user wants a simple string reversal in Rust. I'll use chars().rev().collect()."}}}
+{"timestamp": 1745012403.0, "message": {"type": "ContentPart", "payload": {"type": "text", "text": "Here's a simple Rust function to reverse a string:"}}}
+{"timestamp": 1745012404.0, "message": {"type": "ToolCall", "payload": {"type": "function", "id": "tool_001", "function": {"name": "Shell", "arguments": "{\"cmd\": \"echo 'fn reverse(s: &str) -> String { s.chars().rev().collect() }'\"}"}}}}
+{"timestamp": 1745012405.0, "message": {"type": "ToolResult", "payload": {"tool_call_id": "tool_001", "return_value": {"is_error": false, "output": "fn reverse(s: &str) -> String { s.chars().rev().collect() }\n", "message": "Command executed successfully", "display": []}}}}
+{"timestamp": 1745012406.0, "message": {"type": "StatusUpdate", "payload": {"context_usage": 0.05, "context_tokens": 512, "max_context_tokens": 262144, "token_usage": {"input_other": 100, "output": 50, "input_cache_read": 200, "input_cache_creation": 10}, "message_id": "chatcmpl-test-01", "plan_mode": false, "mcp_status": null}}}
+{"timestamp": 1745012407.0, "message": {"type": "StepBegin", "payload": {"n": 2}}}
+{"timestamp": 1745012408.0, "message": {"type": "ContentPart", "payload": {"type": "text", "text": "The function uses `chars().rev().collect()` to reverse the string efficiently."}}}
+{"timestamp": 1745012409.0, "message": {"type": "TurnEnd", "payload": {}}}
