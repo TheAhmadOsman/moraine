@@ -3,7 +3,7 @@ use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::normalize_record;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
-use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
+use moraine_config::{AppConfig, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 #[cfg(not(unix))]
@@ -32,6 +32,8 @@ const SESSION_JSON_GENERATION: u32 = 1;
 fn work_extension(work: &WorkItem) -> &'static str {
     if work.format == SOURCE_FORMAT_SESSION_JSON {
         "json"
+    } else if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        "db"
     } else {
         "jsonl"
     }
@@ -231,6 +233,9 @@ pub(crate) async fn process_file(
 ) -> Result<()> {
     if work.format == SOURCE_FORMAT_SESSION_JSON {
         return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
+    }
+    if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        return process_opencode_sqlite_file(config, work, checkpoints, sink_tx, metrics).await;
     }
 
     let source_file = &work.path;

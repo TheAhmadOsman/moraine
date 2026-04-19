@@ -67,6 +67,7 @@ enum Harness {
     Codex,
     ClaudeCode,
     Hermes,
+    OpenCode,
 }
 
 impl Harness {
@@ -75,8 +76,9 @@ impl Harness {
             "codex" => Ok(Self::Codex),
             "claude-code" => Ok(Self::ClaudeCode),
             "hermes" => Ok(Self::Hermes),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude-code, hermes",
+                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, opencode",
                 raw.trim()
             )),
         }
@@ -87,6 +89,7 @@ impl Harness {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Hermes => "hermes",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -98,6 +101,7 @@ impl Harness {
             Self::Codex => "openai",
             Self::ClaudeCode => "anthropic",
             Self::Hermes => "",
+            Self::OpenCode => "",
         }
     }
 }
@@ -2445,6 +2449,429 @@ fn normalize_claude_event(
     (events, links, tools)
 }
 
+fn normalize_opencode_session(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let session_id = to_str(record.get("session_id"));
+    let directory = to_str(record.get("directory"));
+    let title = to_str(record.get("title"));
+    let version = to_str(record.get("version"));
+    let share_url = to_str(record.get("share_url"));
+
+    let payload = json!({
+        "session_id": session_id,
+        "directory": directory,
+        "title": title,
+        "version": version,
+        "share_url": share_url,
+    });
+
+    let mut row = base_event_obj(
+        ctx,
+        base_uid,
+        "session_meta",
+        "session_meta",
+        "system",
+        "",
+        &compact_json(&payload),
+    );
+    if !session_id.is_empty() {
+        row.insert("session_id".to_string(), json!(session_id));
+    }
+    (vec![Value::Object(row)], vec![], vec![])
+}
+
+fn normalize_opencode_message(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let role = to_str(record.get("role"));
+    let model_id = to_str(record.get("model_id"));
+    let provider_id = to_str(record.get("provider_id"));
+    let agent = to_str(record.get("agent"));
+    let mode = to_str(record.get("mode"));
+
+    let payload = json!({
+        "message_id": to_str(record.get("message_id")),
+        "role": role,
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "agent": agent,
+        "mode": mode,
+        "path_cwd": to_str(record.get("path_cwd")),
+        "path_root": to_str(record.get("path_root")),
+    });
+
+    let actor = match role.as_str() {
+        "user" => "user",
+        "assistant" => "assistant",
+        _ => "system",
+    };
+
+    let mut row = base_event_obj(
+        ctx,
+        base_uid,
+        "progress",
+        "progress",
+        actor,
+        "",
+        &compact_json(&payload),
+    );
+    if !model_id.is_empty() {
+        update_string_field(&mut row, "model", &model_id);
+    }
+    if !agent.is_empty() {
+        update_string_field(&mut row, "agent_label", &agent);
+    }
+    (vec![Value::Object(row)], vec![], vec![])
+}
+
+fn normalize_opencode_part(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let part_data = record.get("part_data").cloned().unwrap_or(Value::Null);
+    let part_type = to_str(part_data.get("type"));
+    let message_role = to_str(record.get("message_role"));
+    let provider_id = to_str(record.get("provider_id"));
+    let model_id = to_str(record.get("model_id"));
+
+    let mut events = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+
+    match part_type.as_str() {
+        "text" => {
+            let text = to_str(part_data.get("text"));
+            let payload_type = if message_role == "user" {
+                "user_message"
+            } else {
+                "agent_message"
+            };
+            let actor = if message_role == "user" { "user" } else { "assistant" };
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "message",
+                payload_type,
+                actor,
+                &text,
+                &compact_json(&part_data),
+            );
+            if !model_id.is_empty() {
+                update_string_field(&mut row, "model", &model_id);
+            }
+            if !provider_id.is_empty() {
+                update_string_field(&mut row, "inference_provider", &provider_id);
+            }
+            events.push(Value::Object(row));
+        }
+        "reasoning" => {
+            let text = to_str(part_data.get("text"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "reasoning",
+                "thinking",
+                "assistant",
+                &text,
+                &compact_json(&part_data),
+            );
+            if !model_id.is_empty() {
+                update_string_field(&mut row, "model", &model_id);
+            }
+            if !provider_id.is_empty() {
+                update_string_field(&mut row, "inference_provider", &provider_id);
+            }
+            row.insert("has_reasoning".to_string(), json!(1u8));
+            events.push(Value::Object(row));
+        }
+        "tool" => {
+            let call_id = to_str(part_data.get("callID"));
+            let tool_name = to_str(part_data.get("tool"));
+            let state = part_data.get("state").cloned().unwrap_or(Value::Null);
+            let status = to_str(state.get("status"));
+            let input_json = compact_json(state.get("input").unwrap_or(&Value::Null));
+            let input_text = extract_message_text(state.get("input").unwrap_or(&Value::Null));
+
+            match status.as_str() {
+                "pending" | "running" => {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_call",
+                        "tool_use",
+                        "assistant",
+                        &input_text,
+                        &compact_json(&part_data),
+                    );
+                    update_string_field(&mut row, "tool_call_id", &call_id);
+                    update_string_field(&mut row, "tool_name", &tool_name);
+                    if !model_id.is_empty() {
+                        update_string_field(&mut row, "model", &model_id);
+                    }
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "request",
+                        0,
+                        &input_json,
+                        "",
+                        "",
+                    ));
+                }
+                "completed" => {
+                    let output_text = to_str(state.get("output"));
+                    let output_json = compact_json(state.get("output").unwrap_or(&Value::Null));
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_result",
+                        "tool_result",
+                        "tool",
+                        &output_text,
+                        &compact_json(&part_data),
+                    );
+                    update_string_field(&mut row, "tool_call_id", &call_id);
+                    update_string_field(&mut row, "tool_name", &tool_name);
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "response",
+                        0,
+                        &input_json,
+                        &output_json,
+                        &output_text,
+                    ));
+                }
+                "error" => {
+                    let error_text = to_str(state.get("error"));
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_result",
+                        "tool_result",
+                        "tool",
+                        &error_text,
+                        &compact_json(&part_data),
+                    );
+                    update_string_field(&mut row, "tool_call_id", &call_id);
+                    update_string_field(&mut row, "tool_name", &tool_name);
+                    row.insert("tool_error".to_string(), json!(1u8));
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "response",
+                        1,
+                        &input_json,
+                        &compact_json(&json!({"error": error_text})),
+                        &error_text,
+                    ));
+                }
+                _ => {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "unknown",
+                        "unknown",
+                        "system",
+                        "",
+                        &compact_json(&part_data),
+                    );
+                    events.push(Value::Object(row));
+                }
+            }
+        }
+        "step-start" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                "",
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "step-finish" => {
+            let tokens = part_data.get("tokens").cloned().unwrap_or(Value::Null);
+            let input_tokens = to_u32(tokens.get("input"));
+            let output_tokens = to_u32(tokens.get("output"));
+            let cache_read = to_u32(tokens.get("cache").and_then(|c| c.get("read")));
+            let cache_write = to_u32(tokens.get("cache").and_then(|c| c.get("write")));
+            let reason = to_str(part_data.get("reason"));
+
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                "",
+                &compact_json(&part_data),
+            );
+            row.insert("input_tokens".to_string(), json!(input_tokens));
+            row.insert("output_tokens".to_string(), json!(output_tokens));
+            row.insert("cache_read_tokens".to_string(), json!(cache_read));
+            row.insert("cache_write_tokens".to_string(), json!(cache_write));
+            if !reason.is_empty() {
+                row.insert("op_status".to_string(), json!(reason));
+            }
+            row.insert("token_usage_json".to_string(), json!(compact_json(&part_data)));
+            if !model_id.is_empty() {
+                update_string_field(&mut row, "model", &model_id);
+            }
+            events.push(Value::Object(row));
+        }
+        "compaction" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "summary",
+                "summary",
+                "system",
+                "",
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "patch" => {
+            let files = part_data.get("files").cloned().unwrap_or(Value::Null);
+            let text = extract_message_text(&files);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "file_history_snapshot",
+                "file-history-snapshot",
+                "system",
+                &text,
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "file" => {
+            let filename = to_str(part_data.get("filename"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "file_history_snapshot",
+                "file-history-snapshot",
+                "system",
+                &filename,
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "snapshot" => {
+            let snapshot = to_str(part_data.get("snapshot"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "file_history_snapshot",
+                "file-history-snapshot",
+                "system",
+                &snapshot,
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "agent" => {
+            let name = to_str(part_data.get("name"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                &name,
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "subtask" => {
+            let desc = to_str(part_data.get("description"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                &desc,
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        "retry" => {
+            let attempt = part_data.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                "system",
+                &format!("retry attempt {}", attempt),
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+        _ => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                "",
+                &compact_json(&part_data),
+            );
+            events.push(Value::Object(row));
+        }
+    }
+
+    (events, vec![], tools)
+}
+
+fn normalize_opencode_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let top_type = to_str(record.get("type"));
+    match top_type.as_str() {
+        "opencode_session" => normalize_opencode_session(record, ctx, base_uid),
+        "opencode_message" => normalize_opencode_message(record, ctx, base_uid),
+        "opencode_part" => normalize_opencode_part(record, ctx, base_uid),
+        _ => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                "",
+                &compact_json(record),
+            );
+            (vec![Value::Object(row)], vec![], vec![])
+        }
+    }
+}
+
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
@@ -2486,6 +2913,8 @@ pub fn normalize_record(
 
     let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
+    } else if harness == Harness::OpenCode {
+        to_str(record.get("session_id"))
     } else {
         String::new()
     };
@@ -2587,6 +3016,7 @@ pub fn normalize_record(
             _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
+        Harness::OpenCode => normalize_opencode_event(record, &ctx, &base_uid),
     };
 
     // For Hermes, resolve_model_hint's fallback should be the already-split

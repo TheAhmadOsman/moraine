@@ -288,14 +288,26 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.hermes/sessions".to_string(),
             format: String::new(),
         },
+        IngestSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            enabled: true,
+            glob: "~/.local/share/opencode/opencode.db".to_string(),
+            watch_root: "~/.local/share/opencode".to_string(),
+            format: String::new(),
+        },
     ]
 }
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
+pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
+    if harness == "opencode" && glob_lower.ends_with(".db") {
+        return SOURCE_FORMAT_OPENCODE_SQLITE;
+    }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
     if harness == "hermes" && looks_like_json {
@@ -319,9 +331,9 @@ fn normalize_source_format(
         trimmed
     };
     match resolved.as_str() {
-        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON => Ok(resolved),
+        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_OPENCODE_SQLITE => Ok(resolved),
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
             format.trim(),
             source_name
         )),
@@ -334,6 +346,7 @@ impl IngestSource {
     pub fn tracked_extension(&self) -> &'static str {
         match self.format.as_str() {
             SOURCE_FORMAT_SESSION_JSON => "json",
+            SOURCE_FORMAT_OPENCODE_SQLITE => "db",
             _ => "jsonl",
         }
     }
@@ -593,12 +606,12 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
 
 fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
     let normalized = harness.trim().to_ascii_lowercase();
-    if normalized == "codex" || normalized == "claude-code" || normalized == "hermes" {
+    if normalized == "codex" || normalized == "claude-code" || normalized == "hermes" || normalized == "opencode" {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, opencode",
         harness.trim(),
         source_name
     ))
