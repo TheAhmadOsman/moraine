@@ -15,6 +15,7 @@ tracing = "0.1"
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1.11"
+rusqlite = { version = "0.32", features = ["bundled"] }
 urlencoding = "2.1"
 walkdir = "2.5"
 same-file = "1.0"

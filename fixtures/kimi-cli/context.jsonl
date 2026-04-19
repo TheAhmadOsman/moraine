@@ -1,0 +1,6 @@
+{"role":"_system_prompt","content":"You are a concise coding assistant."}
+{"role":"user","content":"Summarize the sample."}
+{"role":"assistant","content":"The sample is ready."}
+{"role":"tool","tool_call_id":"tool_ctx","content":"Tool output text."}
+{"role":"_usage","token_count":42}
+{"role":"_checkpoint","id":1}

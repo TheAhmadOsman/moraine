@@ -11,6 +11,7 @@ target/
 # Local/editor/OS files
 .DS_Store
 .worktrees/
+.worker-runs/
 .vscode/
 .idea/
 
