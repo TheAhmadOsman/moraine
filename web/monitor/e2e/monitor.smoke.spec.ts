@@ -43,6 +43,12 @@ function analyticsFixture(range: string) {
 }
 
 test('loads dashboard and handles core interactions', async ({ page }) => {
+  let release365dAnalytics: (() => void) | null = null;
+  let saw365dAnalytics: () => void = () => {};
+  const saw365dAnalyticsRequest = new Promise<void>((resolve) => {
+    saw365dAnalytics = resolve;
+  });
+
   await page.route('**/api/health', async (route) => {
     await route.fulfill({
       json: {
@@ -120,6 +126,13 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
     const requestUrl = new URL(route.request().url());
     const range = requestUrl.searchParams.get('range') || '24h';
 
+    if (range === '365d') {
+      await new Promise<void>((resolve) => {
+        release365dAnalytics = resolve;
+        saw365dAnalytics();
+      });
+    }
+
     await route.fulfill({
       json: analyticsFixture(range),
     });
@@ -128,8 +141,13 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
-  await expect(page.locator('#healthCard .card')).toHaveCount(5);
-  await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
+  const healthCards = page.getByRole('heading', { name: 'Health', exact: true }).locator('xpath=..').locator('.card');
+  const ingestorCards = page
+    .getByRole('heading', { name: 'Ingestor Heartbeat', exact: true })
+    .locator('xpath=..')
+    .locator('.card');
+  await expect(healthCards).toHaveCount(5);
+  await expect(ingestorCards.first()).toContainText('Healthy');
 
   await page.selectOption('#tableSelect', 'web_searches');
   await expect(page.locator('#tableTitle')).toContainText('Table: web_searches');
@@ -142,6 +160,10 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
 
   await page.getByRole('button', { name: '365d' }).click();
+  await saw365dAnalyticsRequest;
+  await expect(page.locator('#analyticsMeta')).toContainText('Last 365d');
+  await expect(page.locator('#analyticsMeta')).toContainText('14d buckets');
+  release365dAnalytics?.();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 365d');
 
   const htmlThemeBefore = await page.locator('html').getAttribute('data-theme');

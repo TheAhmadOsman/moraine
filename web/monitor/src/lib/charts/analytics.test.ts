@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildAnalyticsView } from './analytics';
+import { buildAnalyticsView, buildPendingAnalyticsMeta } from './analytics';
 
 const baseRange = {
   key: '24h' as const,
@@ -58,5 +58,13 @@ describe('buildAnalyticsView', () => {
 
     expect(view.maxTicks).toBe(12);
     expect(view.metaText).toContain('Last 365d');
+  });
+
+  it('builds selected-range metadata while long analytics requests are pending', () => {
+    const metaText = buildPendingAnalyticsMeta('365d');
+
+    expect(metaText).toContain('Last 365d');
+    expect(metaText).toContain('14d buckets');
+    expect(metaText).toContain('updating');
   });
 });

@@ -2,7 +2,7 @@
   import { createEventDispatcher, onDestroy } from 'svelte';
   import type { Chart, ChartType } from 'chart.js';
   import { ANALYTICS_RANGES, DEFAULT_ANALYTICS_META } from '../constants';
-  import { buildAnalyticsView } from '../charts/analytics';
+  import { buildAnalyticsView, buildPendingAnalyticsMeta } from '../charts/analytics';
   import { createOrUpdateChart, destroyChart } from '../charts/chart';
   import { formatCompactNumber } from '../utils/format';
   import type { AnalyticsRangeKey, AnalyticsResponse } from '../types/api';
@@ -84,13 +84,14 @@
   }
 
   $: {
-    if (payload?.ok) {
+    if (payload?.ok && payload.range?.key === selectedRange) {
       chartView = buildAnalyticsView(payload);
       metaText = errorMessage ? `${chartView.metaText} | ${errorMessage}` : chartView.metaText;
     } else {
       resetCharts();
       chartView = null;
-      metaText = errorMessage || DEFAULT_ANALYTICS_META;
+      const pendingMetaText = buildPendingAnalyticsMeta(selectedRange);
+      metaText = errorMessage ? `${pendingMetaText} | ${errorMessage}` : pendingMetaText;
     }
   }
 

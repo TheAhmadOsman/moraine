@@ -125,10 +125,15 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
-  await expect(page.locator('#healthCard .card')).toHaveCount(5);
-  await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
+  const healthCards = page.getByRole('heading', { name: 'Health', exact: true }).locator('xpath=..').locator('.card');
+  const ingestorCards = page
+    .getByRole('heading', { name: 'Ingestor Heartbeat', exact: true })
+    .locator('xpath=..')
+    .locator('.card');
+  await expect(healthCards).toHaveCount(5);
+  await expect(ingestorCards.first()).toContainText('Healthy');
 
-  const connectionsCard = page.locator('#healthCard .card').filter({ hasText: 'Connections' });
+  const connectionsCard = healthCards.filter({ hasText: 'Connections' });
   await expect(connectionsCard).toContainText('Connections');
   const connectionsTotal = health.connections?.total;
   if (connectionsTotal !== null && connectionsTotal !== undefined) {
@@ -140,14 +145,10 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
 
   const latestIngestor = status.ingestor?.latest;
   if (latestIngestor?.queue_depth !== null && latestIngestor?.queue_depth !== undefined) {
-    await expect(page.locator('#ingestorCard .card').filter({ hasText: 'Queue depth' })).toContainText(
-      String(latestIngestor.queue_depth),
-    );
+    await expect(ingestorCards.filter({ hasText: 'Queue depth' })).toContainText(String(latestIngestor.queue_depth));
   }
   if (latestIngestor?.files_active !== null && latestIngestor?.files_active !== undefined) {
-    await expect(page.locator('#ingestorCard .card').filter({ hasText: 'Files' })).toContainText(
-      `${latestIngestor.files_active}`,
-    );
+    await expect(ingestorCards.filter({ hasText: 'Files' })).toContainText(`${latestIngestor.files_active}`);
   }
 
   const eventsOption = page.locator('#tableSelect option[value="events"]');

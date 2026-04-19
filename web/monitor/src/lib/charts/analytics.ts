@@ -1,7 +1,8 @@
 import type { ChartDataset } from 'chart.js';
-import { MODEL_COLORS } from '../constants';
+import { ANALYTICS_RANGE_DETAILS, MODEL_COLORS } from '../constants';
 import type {
   AnalyticsRange,
+  AnalyticsRangeKey,
   AnalyticsResponse,
   ConcurrentSessionsPoint,
   TokenPoint,
@@ -82,6 +83,11 @@ function maxTicksForRange(range: AnalyticsRange): number {
     default:
       return 10;
   }
+}
+
+export function buildPendingAnalyticsMeta(rangeKey: AnalyticsRangeKey): string {
+  const range = ANALYTICS_RANGE_DETAILS[rangeKey];
+  return `${range.label} • ${formatBucketSize(range.bucket_seconds)} buckets • updating...`;
 }
 
 export function buildAnalyticsView(data: AnalyticsResponse): AnalyticsChartView {

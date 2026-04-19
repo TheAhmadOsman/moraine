@@ -24,6 +24,7 @@
 
   let analyticsPayload: AnalyticsResponse | null = null;
   let analyticsError: string | null = null;
+  let analyticsRequestId = 0;
 
   function errorMessage(error: unknown): string {
     if (error instanceof Error) {
@@ -98,9 +99,27 @@
     await loadTable(active);
   }
 
-  async function loadAnalytics(): Promise<void> {
-    analyticsPayload = await fetchAnalytics(get(analyticsRangeStore));
-    analyticsError = null;
+  function isCurrentAnalyticsRequest(requestId: number, range: AnalyticsRangeKey): boolean {
+    return requestId === analyticsRequestId && get(analyticsRangeStore) === range;
+  }
+
+  async function loadAnalytics(range = get(analyticsRangeStore)): Promise<void> {
+    const requestId = ++analyticsRequestId;
+
+    try {
+      const payload = await fetchAnalytics(range);
+
+      if (!isCurrentAnalyticsRequest(requestId, range)) {
+        return;
+      }
+
+      analyticsPayload = payload;
+      analyticsError = null;
+    } catch (error) {
+      if (isCurrentAnalyticsRequest(requestId, range)) {
+        analyticsError = `Analytics unavailable: ${errorMessage(error)}`;
+      }
+    }
   }
 
   async function hydrateFast(): Promise<void> {
@@ -116,7 +135,7 @@
   }
 
   async function hydrateSlow(): Promise<void> {
-    const [tableResult, analyticsResult] = await Promise.allSettled([loadTablesAndSelection(), loadAnalytics()]);
+    const [tableResult] = await Promise.allSettled([loadTablesAndSelection(), loadAnalytics()]);
 
     if (tableResult.status === 'rejected') {
       tableTitle = 'Connection issue';
@@ -125,9 +144,6 @@
       schemaMuted = false;
     }
 
-    if (analyticsResult.status === 'rejected') {
-      analyticsError = `Analytics unavailable: ${errorMessage(analyticsResult.reason)}`;
-    }
   }
 
   async function hydrateAll(): Promise<void> {
@@ -135,12 +151,11 @@
   }
 
   async function handleRangeChange(event: CustomEvent<AnalyticsRangeKey>): Promise<void> {
-    analyticsRangeStore.set(event.detail);
-    try {
-      await loadAnalytics();
-    } catch (error) {
-      analyticsError = `Analytics unavailable: ${errorMessage(error)}`;
-    }
+    const range = event.detail;
+    analyticsRangeStore.set(range);
+    analyticsPayload = null;
+    analyticsError = null;
+    await loadAnalytics(range);
   }
 
   async function handleTableChange(event: CustomEvent<string>): Promise<void> {
