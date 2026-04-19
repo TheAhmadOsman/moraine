@@ -67,6 +67,8 @@ enum Harness {
     Codex,
     ClaudeCode,
     Hermes,
+    KimiCli,
+    OpenCode,
 }
 
 impl Harness {
@@ -75,8 +77,10 @@ impl Harness {
             "codex" => Ok(Self::Codex),
             "claude-code" => Ok(Self::ClaudeCode),
             "hermes" => Ok(Self::Hermes),
+            "kimi-cli" => Ok(Self::KimiCli),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude-code, hermes",
+                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, kimi-cli, opencode",
                 raw.trim()
             )),
         }
@@ -87,6 +91,8 @@ impl Harness {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Hermes => "hermes",
+            Self::KimiCli => "kimi-cli",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -98,6 +104,8 @@ impl Harness {
             Self::Codex => "openai",
             Self::ClaudeCode => "anthropic",
             Self::Hermes => "",
+            Self::KimiCli => "moonshot",
+            Self::OpenCode => "",
         }
     }
 }
@@ -252,6 +260,47 @@ pub fn infer_session_id_from_file(source_file: &str) -> String {
         .unwrap_or_default()
 }
 
+fn infer_parent_dir_session_id(source_file: &str, namespace: &str) -> String {
+    let id = std::path::Path::new(source_file)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if id.is_empty() {
+        String::new()
+    } else {
+        format!("{namespace}:{id}")
+    }
+}
+
+fn opencode_provider_model(record: &Value) -> (String, String) {
+    let message = record.get("message").unwrap_or(record);
+    let part = record.get("part").unwrap_or(&Value::Null);
+
+    let provider = to_str(message.get("providerID"))
+        .or_else_nonempty(|| to_str(message.get("model").and_then(|m| m.get("providerID"))))
+        .or_else_nonempty(|| to_str(part.get("model").and_then(|m| m.get("providerID"))));
+    let model = to_str(message.get("modelID"))
+        .or_else_nonempty(|| to_str(message.get("model").and_then(|m| m.get("modelID"))))
+        .or_else_nonempty(|| to_str(part.get("model").and_then(|m| m.get("modelID"))));
+
+    (provider, canonicalize_model("opencode", &model))
+}
+
+trait NonEmptyStringExt {
+    fn or_else_nonempty<F: FnOnce() -> String>(self, fallback: F) -> String;
+}
+
+impl NonEmptyStringExt for String {
+    fn or_else_nonempty<F: FnOnce() -> String>(self, fallback: F) -> String {
+        if self.is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
 pub fn infer_session_date_from_file(source_file: &str, record_ts: &str) -> String {
     if let Some(cap) = session_date_re().captures(source_file) {
         return format!("{}-{}-{}", &cap[1], &cap[2], &cap[3]);
@@ -275,6 +324,59 @@ fn parse_record_ts(record_ts: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
         .ok()
         .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+}
+
+fn format_unix_seconds_decimal(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['e', 'E']) {
+        return None;
+    }
+
+    let (secs_part, frac_part) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    let secs = secs_part.parse::<i64>().ok()?;
+    let mut nanos = frac_part
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(9)
+        .collect::<String>();
+    while nanos.len() < 9 {
+        nanos.push('0');
+    }
+    let nanos = nanos.parse::<u32>().ok()?.min(999_999_999);
+    DateTime::<Utc>::from_timestamp(secs, nanos).map(|dt| format_record_ts(&dt))
+}
+
+fn format_unix_seconds_ts(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    let secs = seconds.trunc() as i64;
+    let nanos = ((seconds.fract().abs()) * 1_000_000_000.0).round() as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos.min(999_999_999)).map(|dt| format_record_ts(&dt))
+}
+
+fn synthetic_record_ts(source_line_no: u64) -> String {
+    let base = DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch");
+    format_record_ts(&(base + Duration::microseconds(source_line_no as i64)))
+}
+
+fn record_timestamp(record: &Value, harness: Harness, source_line_no: u64) -> String {
+    match record.get("timestamp") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::Number(n)) => {
+            if let Some(formatted) = format_unix_seconds_decimal(&n.to_string()) {
+                return formatted;
+            }
+            if let Some(seconds) = n.as_f64() {
+                if let Some(formatted) = format_unix_seconds_ts(seconds) {
+                    return formatted;
+                }
+            }
+            to_str(record.get("timestamp"))
+        }
+        _ if harness == Harness::KimiCli => synthetic_record_ts(source_line_no),
+        _ => String::new(),
+    }
 }
 
 fn format_event_ts(dt: &DateTime<Utc>) -> String {
@@ -1551,6 +1653,579 @@ fn normalize_hermes_session_message(
     (events, links, tools)
 }
 
+fn normalize_kimi_cli_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    top_type: &str,
+    base_uid: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+    let message = record.get("message").unwrap_or(record);
+    let payload = message.get("payload").unwrap_or(record);
+    let payload_json = compact_json(payload);
+
+    let mut push_progress = |kind: &str, text: String, payload_type: &str| {
+        let mut row = base_event_obj(
+            ctx,
+            base_uid,
+            kind,
+            payload_type,
+            "system",
+            &text,
+            &payload_json,
+        );
+        row.insert("op_kind".to_string(), json!(top_type));
+        events.push(Value::Object(row));
+    };
+
+    if record.get("role").is_some() {
+        let role = to_str(record.get("role"));
+        match role.as_str() {
+            "user" | "assistant" => {
+                let content = record.get("content").unwrap_or(&Value::Null);
+                let actor = role.as_str();
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "message",
+                    if actor == "user" {
+                        "user_message"
+                    } else {
+                        "agent_message"
+                    },
+                    actor,
+                    &extract_message_text(content),
+                    &compact_json(record),
+                );
+                row.insert(
+                    "content_types".to_string(),
+                    json!(extract_content_types(content)),
+                );
+                events.push(Value::Object(row));
+            }
+            "tool" => {
+                let content = record.get("content").unwrap_or(&Value::Null);
+                let output_text = extract_message_text(content);
+                let call_id = to_str(record.get("tool_call_id"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "tool_result",
+                    "tool_result",
+                    "tool",
+                    &output_text,
+                    &compact_json(record),
+                );
+                row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+                events.push(Value::Object(row));
+                tools.push(build_tool_row(
+                    ctx,
+                    base_uid,
+                    &call_id,
+                    "",
+                    "",
+                    "response",
+                    0,
+                    "",
+                    &compact_json(content),
+                    &output_text,
+                ));
+            }
+            "_system_prompt" => {
+                let text = to_str(record.get("content"));
+                events.push(Value::Object(base_event_obj(
+                    ctx,
+                    base_uid,
+                    "system",
+                    "system",
+                    "system",
+                    &text,
+                    &compact_json(record),
+                )));
+            }
+            "_usage" => {
+                let tokens = to_u32(record.get("token_count"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "event_msg",
+                    "token_count",
+                    "system",
+                    "",
+                    &compact_json(record),
+                );
+                row.insert("input_tokens".to_string(), json!(tokens));
+                row.insert("token_usage_json".to_string(), json!(compact_json(record)));
+                events.push(Value::Object(row));
+            }
+            "_checkpoint" => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "progress",
+                    "progress",
+                    "system",
+                    "",
+                    &compact_json(record),
+                );
+                row.insert("item_id".to_string(), json!(to_str(record.get("id"))));
+                row.insert("op_kind".to_string(), json!("checkpoint"));
+                events.push(Value::Object(row));
+            }
+            _ => push_progress("unknown", extract_message_text(record), "unknown"),
+        }
+        return (events, links, tools);
+    }
+
+    match top_type {
+        "metadata" => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "session_meta",
+                "session_meta",
+                "system",
+                "",
+                &compact_json(record),
+            )));
+        }
+        "TurnBegin" | "SteerInput" => {
+            let input = payload.get("user_input").unwrap_or(&Value::Null);
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "message",
+                "user_message",
+                "user",
+                &extract_message_text(input),
+                &payload_json,
+            )));
+        }
+        "ContentPart" => {
+            let part_type = to_str(payload.get("type"));
+            if part_type == "think" {
+                let text = to_str(payload.get("think"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "reasoning",
+                    "thinking",
+                    "assistant",
+                    &text,
+                    &payload_json,
+                );
+                row.insert("has_reasoning".to_string(), json!(1u8));
+                row.insert("content_types".to_string(), json!(["thinking"]));
+                events.push(Value::Object(row));
+            } else {
+                let text = if let Some(text) = payload.get("text") {
+                    extract_message_text(text)
+                } else {
+                    extract_message_text(payload)
+                };
+                events.push(Value::Object(base_event_obj(
+                    ctx,
+                    base_uid,
+                    "message",
+                    "agent_message",
+                    "assistant",
+                    &text,
+                    &payload_json,
+                )));
+            }
+        }
+        "ToolCall" => {
+            let function = payload.get("function").unwrap_or(&Value::Null);
+            let call_id = to_str(payload.get("id"));
+            let name = to_str(function.get("name"));
+            let args_raw = to_str(function.get("arguments"));
+            let args = parse_json_string(&args_raw).unwrap_or_else(|| {
+                if args_raw.is_empty() {
+                    Value::Object(Map::new())
+                } else {
+                    json!({ "raw": args_raw })
+                }
+            });
+            let input_json = compact_json(&args);
+            let input_text = {
+                let extracted = extract_message_text(&args);
+                if extracted.is_empty() {
+                    input_json.clone()
+                } else {
+                    extracted
+                }
+            };
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "tool_call",
+                "tool_use",
+                "assistant",
+                &input_text,
+                &payload_json,
+            );
+            row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+            row.insert("tool_name".to_string(), json!(name.clone()));
+            events.push(Value::Object(row));
+            tools.push(build_tool_row(
+                ctx,
+                base_uid,
+                &call_id,
+                "",
+                &name,
+                "request",
+                0,
+                &input_json,
+                "",
+                "",
+            ));
+        }
+        "ToolCallPart" => {
+            let text = to_str(payload.get("arguments_part"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "tool_use",
+                "assistant",
+                &text,
+                &payload_json,
+            );
+            row.insert("op_kind".to_string(), json!("tool_call_part"));
+            events.push(Value::Object(row));
+        }
+        "ToolResult" => {
+            let ret = payload.get("return_value").unwrap_or(&Value::Null);
+            let call_id = to_str(payload.get("tool_call_id"));
+            let error = to_u8_bool(ret.get("is_error"));
+            let output = to_str(ret.get("output"));
+            let message = to_str(ret.get("message"));
+            let output_text = if !output.is_empty() { output } else { message };
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "tool_result",
+                "tool_result",
+                "tool",
+                &output_text,
+                &payload_json,
+            );
+            row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+            row.insert("tool_error".to_string(), json!(error));
+            events.push(Value::Object(row));
+            tools.push(build_tool_row(
+                ctx,
+                base_uid,
+                &call_id,
+                "",
+                "",
+                "response",
+                error,
+                "",
+                &compact_json(ret),
+                &output_text,
+            ));
+        }
+        "StatusUpdate" => {
+            let usage = payload.get("token_usage").unwrap_or(&Value::Null);
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "event_msg",
+                "token_count",
+                "system",
+                "",
+                &payload_json,
+            );
+            row.insert(
+                "input_tokens".to_string(),
+                json!(to_u32(usage.get("input_other"))),
+            );
+            row.insert(
+                "output_tokens".to_string(),
+                json!(to_u32(usage.get("output"))),
+            );
+            row.insert(
+                "cache_read_tokens".to_string(),
+                json!(to_u32(usage.get("input_cache_read"))),
+            );
+            row.insert(
+                "cache_write_tokens".to_string(),
+                json!(to_u32(usage.get("input_cache_creation"))),
+            );
+            row.insert("token_usage_json".to_string(), json!(compact_json(usage)));
+            row.insert(
+                "item_id".to_string(),
+                json!(to_str(payload.get("message_id"))),
+            );
+            events.push(Value::Object(row));
+        }
+        "CompactionBegin" | "CompactionEnd" => {
+            push_progress("summary", String::new(), "summary");
+        }
+        "TurnEnd" | "StepBegin" | "StepInterrupted" | "HookTriggered" | "HookResolved"
+        | "MCPLoadingBegin" | "MCPLoadingEnd" | "MCPStatusSnapshot" | "BtwBegin" | "BtwEnd"
+        | "SubagentEvent" => {
+            push_progress("progress", extract_message_text(payload), "progress");
+        }
+        _ => push_progress("unknown", extract_message_text(payload), "unknown"),
+    }
+
+    (events, links, tools)
+}
+
+fn normalize_opencode_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    top_type: &str,
+    base_uid: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+    let payload_json = compact_json(record);
+    let message = record.get("message").unwrap_or(&Value::Null);
+    let part = record.get("part").unwrap_or(&Value::Null);
+    let role = to_str(message.get("role"));
+    let actor = if role == "user" { "user" } else { "assistant" };
+    let stamp_model = |row: &mut Map<String, Value>| {
+        if !model.is_empty() {
+            row.insert("model".to_string(), json!(model));
+        }
+        row.insert("item_id".to_string(), json!(to_str(record.get("row_id"))));
+        row.insert(
+            "agent_label".to_string(),
+            json!(to_str(message.get("agent"))),
+        );
+        row.insert("op_kind".to_string(), json!(to_str(part.get("type"))));
+    };
+
+    match top_type {
+        "opencode_session" => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "session_meta",
+                "session_meta",
+                "system",
+                &to_str(record.get("title")),
+                &payload_json,
+            )));
+        }
+        "opencode_message" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                actor,
+                &extract_message_text(message),
+                &payload_json,
+            );
+            stamp_model(&mut row);
+            events.push(Value::Object(row));
+        }
+        "opencode_part" => match to_str(part.get("type")).as_str() {
+            "text" => {
+                let text = to_str(part.get("text"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "message",
+                    if actor == "user" {
+                        "user_message"
+                    } else {
+                        "agent_message"
+                    },
+                    actor,
+                    &text,
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            "reasoning" => {
+                let text = to_str(part.get("text"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "reasoning",
+                    "thinking",
+                    "assistant",
+                    &text,
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                row.insert("has_reasoning".to_string(), json!(1u8));
+                events.push(Value::Object(row));
+            }
+            "tool" => {
+                let state = part.get("state").unwrap_or(&Value::Null);
+                let status = to_str(state.get("status"));
+                let call_id = to_str(part.get("callID"));
+                let tool_name = to_str(part.get("tool"));
+                let input = state.get("input").cloned().unwrap_or(Value::Null);
+                let input_json = compact_json(&input);
+                let input_text = extract_message_text(&input);
+                if status == "pending" || status == "running" {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_call",
+                        "tool_use",
+                        "assistant",
+                        if input_text.is_empty() {
+                            &input_json
+                        } else {
+                            &input_text
+                        },
+                        &compact_json(part),
+                    );
+                    stamp_model(&mut row);
+                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+                    row.insert("tool_name".to_string(), json!(tool_name.clone()));
+                    row.insert("op_status".to_string(), json!(status));
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "request",
+                        0,
+                        &input_json,
+                        "",
+                        "",
+                    ));
+                } else {
+                    let output_text = if status == "error" {
+                        to_str(state.get("error"))
+                    } else {
+                        to_str(state.get("output"))
+                    };
+                    let error = u8::from(status == "error");
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_result",
+                        "tool_result",
+                        "tool",
+                        &output_text,
+                        &compact_json(part),
+                    );
+                    stamp_model(&mut row);
+                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+                    row.insert("tool_name".to_string(), json!(tool_name.clone()));
+                    row.insert("tool_error".to_string(), json!(error));
+                    row.insert("op_status".to_string(), json!(status));
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "response",
+                        error,
+                        "",
+                        &compact_json(state),
+                        &output_text,
+                    ));
+                }
+            }
+            "step-finish" => {
+                let tokens = part.get("tokens").unwrap_or(&Value::Null);
+                let cache = tokens.get("cache").unwrap_or(&Value::Null);
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "progress",
+                    "progress",
+                    "system",
+                    &to_str(part.get("reason")),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                row.insert("op_status".to_string(), json!(to_str(part.get("reason"))));
+                row.insert(
+                    "input_tokens".to_string(),
+                    json!(to_u32(tokens.get("input"))),
+                );
+                row.insert(
+                    "output_tokens".to_string(),
+                    json!(to_u32(tokens.get("output"))),
+                );
+                row.insert(
+                    "cache_read_tokens".to_string(),
+                    json!(to_u32(cache.get("read"))),
+                );
+                row.insert(
+                    "cache_write_tokens".to_string(),
+                    json!(to_u32(cache.get("write"))),
+                );
+                row.insert("token_usage_json".to_string(), json!(compact_json(tokens)));
+                events.push(Value::Object(row));
+            }
+            "patch" | "file" | "snapshot" => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "file_history_snapshot",
+                    "file-history-snapshot",
+                    "system",
+                    &extract_message_text(part),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            "compaction" => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "summary",
+                    "compacted",
+                    "system",
+                    "",
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            _ => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "progress",
+                    "progress",
+                    "system",
+                    &extract_message_text(part),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+        },
+        _ => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                &extract_message_text(record),
+                &payload_json,
+            )));
+        }
+    }
+
+    (events, links, tools)
+}
+
 fn normalize_codex_event(
     record: &Value,
     ctx: &RecordContext<'_>,
@@ -2464,14 +3139,21 @@ pub fn normalize_record(
     // harness. Hermes is different: the vendor is encoded inside the record's
     // `model` field as `vendor/model`, so we parse it here and use the parsed
     // value throughout the context.
-    let (inference_provider, hermes_model) = if harness == Harness::Hermes {
+    let (inference_provider, hermes_model, opencode_model) = if harness == Harness::Hermes {
         let (vendor, model) = split_hermes_vendor_model(&to_str(record.get("model")));
-        (vendor, model)
+        (vendor, model, String::new())
+    } else if harness == Harness::OpenCode {
+        let (provider, model) = opencode_provider_model(record);
+        (provider, String::new(), model)
     } else {
-        (harness.inference_provider().to_string(), String::new())
+        (
+            harness.inference_provider().to_string(),
+            String::new(),
+            String::new(),
+        )
     };
 
-    let record_ts = to_str(record.get("timestamp"));
+    let record_ts = record_timestamp(record, harness, source_line_no);
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = if harness == Harness::Hermes {
         let explicit = to_str(record.get("type"));
@@ -2479,6 +3161,18 @@ pub fn normalize_record(
             "trajectory".to_string()
         } else {
             explicit
+        }
+    } else if harness == Harness::KimiCli {
+        let message_type = to_str(record.get("message").and_then(|v| v.get("type")));
+        if !message_type.is_empty() {
+            message_type
+        } else {
+            let explicit = to_str(record.get("type"));
+            if !explicit.is_empty() {
+                explicit
+            } else {
+                to_str(record.get("role"))
+            }
         }
     } else {
         to_str(record.get("type"))
@@ -2489,6 +3183,15 @@ pub fn normalize_record(
     } else {
         String::new()
     };
+    if harness == Harness::KimiCli {
+        session_id = infer_parent_dir_session_id(source_file, "kimi-cli");
+    } else if harness == Harness::OpenCode {
+        let explicit = to_str(record.get("session_id"));
+        if !explicit.is_empty() {
+            session_id = format!("opencode:{explicit}");
+        }
+    }
+
     if session_id.is_empty() && harness != Harness::Hermes {
         session_id = if session_hint.is_empty() {
             infer_session_id_from_file(source_file)
@@ -2508,12 +3211,27 @@ pub fn normalize_record(
     let session_date = infer_session_date_from_file(source_file, &record_ts);
 
     let raw_json = compact_json(record);
+    let effective_source_offset = if harness == Harness::OpenCode {
+        0
+    } else {
+        source_offset
+    };
+    let record_fingerprint = if harness == Harness::OpenCode {
+        let row_id = to_str(record.get("row_id"));
+        if row_id.is_empty() {
+            raw_json.clone()
+        } else {
+            format!("{top_type}:{row_id}")
+        }
+    } else {
+        raw_json.clone()
+    };
     let base_uid = event_uid(
         source_file,
         source_generation,
         source_line_no,
-        source_offset,
-        &raw_json,
+        effective_source_offset,
+        &record_fingerprint,
         "raw",
     );
     if harness == Harness::Hermes {
@@ -2533,7 +3251,7 @@ pub fn normalize_record(
         "source_inode": source_inode,
         "source_generation": source_generation,
         "source_line_no": source_line_no,
-        "source_offset": source_offset,
+        "source_offset": effective_source_offset,
         "record_ts": record_ts,
         "top_type": top_type,
         "session_id": session_id,
@@ -2552,7 +3270,7 @@ pub fn normalize_record(
             "source_inode": source_inode,
             "source_generation": source_generation,
             "source_line_no": source_line_no,
-            "source_offset": source_offset,
+            "source_offset": effective_source_offset,
             "error_kind": "timestamp_parse_error",
             "error_text": format!(
                 "timestamp is missing or not supported ISO8601/RFC3339; used {} UTC fallback",
@@ -2572,7 +3290,7 @@ pub fn normalize_record(
         source_inode,
         source_generation,
         source_line_no,
-        source_offset,
+        source_offset: effective_source_offset,
         record_ts: &record_ts,
         event_ts: &event_ts,
     };
@@ -2587,6 +3305,10 @@ pub fn normalize_record(
             _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
+        Harness::KimiCli => normalize_kimi_cli_event(record, &ctx, &top_type, &base_uid),
+        Harness::OpenCode => {
+            normalize_opencode_event(record, &ctx, &top_type, &base_uid, &opencode_model)
+        }
     };
 
     // For Hermes, resolve_model_hint's fallback should be the already-split
@@ -2594,6 +3316,8 @@ pub fn normalize_record(
     // the verbatim model rather than the combined `vendor/model` string.
     let hint_fallback = if harness == Harness::Hermes {
         hermes_model.as_str()
+    } else if harness == Harness::OpenCode {
+        opencode_model.as_str()
     } else {
         model_hint
     };
