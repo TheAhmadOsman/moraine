@@ -64,6 +64,8 @@ nav:
   - Architecture:
       - Design Tradeoffs: architecture/design-tradeoffs.md
       - Workspace Ownership: architecture/workspace-ownership.md
+  - Roadmap:
+      - Feature Roadmap 2026-04-20: roadmap/feature-roadmap-2026-04-20.md
   - Development:
       - Dev Sandbox: development/sandbox.md
   - Operations:
