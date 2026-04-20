@@ -72,7 +72,7 @@ If Kimi `context.jsonl` is explicitly configured, Moraine supports role-based re
 
 ### OpenCode
 
-OpenCode uses `format = "opencode_sqlite"` against `~/.local/share/opencode/opencode.db`. The dispatcher opens SQLite with defensive read-only flags, validates expected `session`, `message`, and `part` tables, includes `PRAGMA user_version` in schema drift errors, and pages rows in strict watermark order with limits. [src: crates/moraine-ingest-core/src/dispatch.rs]
+OpenCode uses `format = "opencode_sqlite"` against `~/.local/share/opencode/opencode.db`. The dispatcher opens SQLite with defensive read-only flags, validates expected `session`, `message`, and `part` tables, includes `PRAGMA user_version` and observed table/column lists in schema drift errors, and pages rows in strict watermark order with limits. [src: crates/moraine-ingest-core/src/dispatch.rs]
 
 OpenCode `part` rows are the primary searchable content. Text parts become user/assistant messages, reasoning parts become reasoning rows, tool parts become tool I/O rows, and step-finish rows preserve token usage.
 

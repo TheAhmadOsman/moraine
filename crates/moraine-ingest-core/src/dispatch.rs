@@ -577,8 +577,21 @@ fn sqlite_table_columns(conn: &Connection, table: &str) -> Result<HashSet<String
     Ok(columns)
 }
 
+fn sqlite_table_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .context("failed to list sqlite tables")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row?);
+    }
+    Ok(names)
+}
+
 fn validate_opencode_sqlite_schema(conn: &Connection) -> Result<i64> {
     let user_version = opencode_sqlite_user_version(conn)?;
+    let observed_tables = sqlite_table_names(conn).unwrap_or_default();
     let required: &[(&str, &[&str])] = &[
         (
             "session",
@@ -617,22 +630,28 @@ fn validate_opencode_sqlite_schema(conn: &Connection) -> Result<i64> {
     ];
 
     let mut missing = Vec::<String>::new();
+    let mut observed_columns = Vec::<String>::new();
     for (table, columns) in required {
         let present = sqlite_table_columns(conn, table)?;
         if present.is_empty() {
             missing.push(format!("{table}.*"));
-            continue;
-        }
-        for column in *columns {
-            if !present.contains(*column) {
-                missing.push(format!("{table}.{column}"));
+        } else {
+            let present_sorted: Vec<String> = present.iter().cloned().collect();
+            observed_columns.push(format!("{table}({})", present_sorted.join(",")));
+            for column in *columns {
+                if !present.contains(*column) {
+                    missing.push(format!("{table}.{column}"));
+                }
             }
         }
     }
 
     if !missing.is_empty() {
         return Err(anyhow!(
-            "unsupported OpenCode sqlite schema user_version={user_version}: missing {}",
+            "unsupported OpenCode sqlite schema user_version={user_version} \
+             observed_tables=[{}] observed_columns=[{}] missing: {}",
+            observed_tables.join(","),
+            observed_columns.join("; "),
             missing.join(", ")
         ));
     }
@@ -1698,8 +1717,160 @@ mod tests {
         assert!(text.contains("user_version=123"));
         assert!(text.contains("message.*"));
         assert!(text.contains("part.*"));
+        // R08: error should include observed tables and columns.
+        assert!(text.contains("observed_tables="));
+        assert!(text.contains("observed_columns="));
 
         let _ = fs::remove_file(&path);
+    }
+
+    // C16 fixture generator: extra columns should be tolerated.
+    fn create_opencode_schema_with_extra_columns(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                parent_id TEXT,
+                slug TEXT,
+                directory TEXT,
+                title TEXT,
+                version TEXT,
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs INTEGER,
+                time_created INTEGER,
+                time_updated INTEGER,
+                extra_column TEXT
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT,
+                extra_message_col INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT,
+                session_id TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT,
+                extra_part_col REAL
+            );",
+        )
+        .expect("create opencode schema with extra columns");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_opencode_sqlite_tolerates_extra_columns() {
+        let path = unique_test_file("opencode-extra-cols").with_extension("db");
+        let conn = Connection::open(&path).expect("create fixture sqlite db");
+        create_opencode_schema_with_extra_columns(&conn);
+        insert_opencode_fixture_rows(&conn);
+        drop(conn);
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        process_opencode_sqlite_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("extra columns should not prevent ingestion");
+
+        let batch = timeout(Duration::from_millis(500), sink_rx.recv())
+            .await
+            .expect("recv")
+            .expect("batch");
+        let SinkMessage::Batch(batch) = batch;
+        assert_eq!(batch.raw_rows.len(), 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // C16: empty tables should produce no batches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_opencode_sqlite_empty_tables_is_noop() {
+        let path = unique_test_file("opencode-empty").with_extension("db");
+        let conn = Connection::open(&path).expect("create fixture sqlite db");
+        create_opencode_schema(&conn);
+        // No rows inserted.
+        drop(conn);
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        process_opencode_sqlite_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("empty tables should process cleanly");
+
+        if let Ok(Some(_)) = timeout(Duration::from_millis(200), sink_rx.recv()).await {
+            panic!("empty tables should not emit batches");
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // C16: WAL sidecar files should not prevent processing.
+    // R08: Verify the adapter can read a DB that was written in WAL mode.
+    // The watcher layer (watch.rs) already maps .db-wal/.db-shm events to the
+    // parent .db path; this test ensures the scanner itself tolerates WAL state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_opencode_sqlite_with_wal_mode_reads_successfully() {
+        let path = unique_test_file("opencode-wal").with_extension("db");
+        {
+            let conn = Connection::open(&path).expect("create fixture sqlite db");
+            create_opencode_schema(&conn);
+            conn.execute_batch("PRAGMA journal_mode=WAL;")
+                .expect("enable wal mode");
+            insert_opencode_fixture_rows(&conn);
+            // WAL files may be checkpointed and removed on connection close.
+            // What matters is that the DB is readable while in WAL mode.
+        }
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        process_opencode_sqlite_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("WAL mode should not prevent ingestion");
+
+        let batch = timeout(Duration::from_millis(500), sink_rx.recv())
+            .await
+            .expect("recv")
+            .expect("batch");
+        let SinkMessage::Batch(batch) = batch;
+        assert_eq!(batch.raw_rows.len(), 3);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]

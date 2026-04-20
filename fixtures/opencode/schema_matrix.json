@@ -1,0 +1,57 @@
+{
+  "description": "OpenCode SQLite schema compatibility matrix for Moraine ingest.",
+  "adapter_version": "0.4.3",
+  "required_tables": {
+    "session": [
+      "id",
+      "project_id",
+      "parent_id",
+      "slug",
+      "directory",
+      "title",
+      "version",
+      "share_url",
+      "summary_additions",
+      "summary_deletions",
+      "summary_files",
+      "summary_diffs",
+      "time_created",
+      "time_updated"
+    ],
+    "message": [
+      "id",
+      "session_id",
+      "time_created",
+      "time_updated",
+      "data"
+    ],
+    "part": [
+      "id",
+      "message_id",
+      "session_id",
+      "time_created",
+      "time_updated",
+      "data"
+    ]
+  },
+  "compatibility": [
+    {
+      "user_version": "unknown",
+      "status": "supported",
+      "notes": "All required tables and columns present."
+    },
+    {
+      "user_version": "123",
+      "status": "unsupported",
+      "notes": "Hypothetical future schema. Missing message and part tables."
+    }
+  ],
+  "corruption_modes": [
+    "missing_columns",
+    "extra_columns",
+    "empty_tables",
+    "missing_tables",
+    "wal_without_db",
+    "db_without_wal"
+  ]
+}
