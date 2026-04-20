@@ -264,7 +264,7 @@ Legacy wrappers remain only as fail-fast stubs:
 
 ## Remote Import Profiles
 
-Import profiles copy agent session files from remote machines into a local mirror directory that can be ingested as a source. Configure a profile under `[imports.<name>]` in `config.toml`:
+Import profiles describe how agent session files from remote machines should be mirrored into a local directory that can be ingested as a source. The current CLI slice previews and validates these profiles; live rsync execution is reserved for the next implementation slice. Configure a profile under `[imports.<name>]` in `config.toml`:
 
 ```toml
 [imports.vm503]
@@ -278,14 +278,14 @@ cadence = "manual"
 
 Commands:
 
-- `moraine import sync <name>` — run rsync for the profile and record a manifest.
+- `moraine import sync <name>` — preview the profile and planned local mirror.
 - `moraine import status` — show all profiles and their last sync manifest.
 
-Sync manifests are stored as JSON under `~/.moraine/imports/<name>.json`.
+Future live sync will store manifests as JSON under `~/.moraine/imports/<name>.json`.
 
 ## Portable Archives
 
-Export and import subsets of the corpus as portable JSONL archives.
+Preview and verify portable JSONL archive contracts. Live ClickHouse export/import is intentionally not wired in this slice.
 
 Export:
 
@@ -297,7 +297,6 @@ moraine archive export --out-dir ./archive --session-ids sess-1,sess-2 --raw
 Import:
 
 ```bash
-moraine archive import --input ./archive --dry-run
 moraine archive import --input ./archive
 ```
 
@@ -307,7 +306,7 @@ Verify an archive without importing:
 moraine archive verify ./archive
 ```
 
-Each archive contains a `manifest.json` with schema version and row counts, plus `.jsonl` files per table (`events`, `event_links`, `tool_io`, and optionally `raw_events`).
+Each archive is expected to contain a `manifest.json` with schema version and row counts, plus `.jsonl` files per table (`events`, `event_links`, `tool_io`, and optionally `raw_events`). Passing `--execute` currently returns a clear not-implemented error instead of touching ClickHouse.
 
 ## Config Wizard and Validation
 

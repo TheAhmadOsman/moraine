@@ -739,9 +739,6 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
 
     for profile in cfg.imports.values_mut() {
         profile.local_mirror = expand_path(&profile.local_mirror);
-        for p in &mut profile.remote_paths {
-            *p = expand_path(p);
-        }
     }
 
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);
@@ -886,16 +883,16 @@ pub fn validate_sources(sources: &[IngestSource]) -> Vec<SourceValidationIssue> 
             if !a.enabled || !b.enabled {
                 continue;
             }
-            let root_a = expand_path(&a.watch_root);
-            let root_b = expand_path(&b.watch_root);
+            let root_a = PathBuf::from(expand_path(&a.watch_root));
+            let root_b = PathBuf::from(expand_path(&b.watch_root));
             if root_a.starts_with(&root_b) || root_b.starts_with(&root_a) {
                 issues.push(SourceValidationIssue::OverlappingWatchRoot {
                     source_a: a.name.clone(),
                     source_b: b.name.clone(),
                     root: if root_a.starts_with(&root_b) {
-                        root_b.clone()
+                        root_b.display().to_string()
                     } else {
-                        root_a.clone()
+                        root_a.display().to_string()
                     },
                 });
             }
@@ -1111,6 +1108,51 @@ mod tests {
             err.to_string().contains("failed to read config"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn validate_sources_uses_component_aware_overlap_checks() {
+        let sources = vec![
+            IngestSource {
+                name: "a".to_string(),
+                harness: "codex".to_string(),
+                enabled: true,
+                glob: "/tmp/moraine-a/**/*.jsonl".to_string(),
+                watch_root: "/tmp/moraine-a".to_string(),
+                format: SOURCE_FORMAT_JSONL.to_string(),
+            },
+            IngestSource {
+                name: "a2".to_string(),
+                harness: "codex".to_string(),
+                enabled: true,
+                glob: "/tmp/moraine-a2/**/*.jsonl".to_string(),
+                watch_root: "/tmp/moraine-a2".to_string(),
+                format: SOURCE_FORMAT_JSONL.to_string(),
+            },
+        ];
+
+        assert!(!validate_sources(&sources)
+            .iter()
+            .any(|issue| matches!(issue, SourceValidationIssue::OverlappingWatchRoot { .. })));
+    }
+
+    #[test]
+    fn import_profile_normalization_keeps_remote_paths_verbatim() {
+        let path = write_temp_config(
+            r#"
+[imports.pc]
+host = "pc"
+remote_paths = ["~/.codex/sessions"]
+local_mirror = "~/.moraine/imports/pc"
+"#,
+            "import-profile-remote-paths",
+        );
+
+        let cfg = load_config(&path).expect("load config");
+        std::fs::remove_file(&path).ok();
+        let profile = cfg.imports.get("pc").expect("import profile");
+        assert_eq!(profile.remote_paths, vec!["~/.codex/sessions"]);
+        assert_ne!(profile.local_mirror, "~/.moraine/imports/pc");
     }
 
     #[test]

@@ -696,6 +696,9 @@ impl AppState {
                 }
             }
             "resources/list" => id.map(|msg_id| rpc_ok(msg_id, self.resources_list_result())),
+            "resources/templates/list" => {
+                id.map(|msg_id| rpc_ok(msg_id, self.resource_templates_list_result()))
+            }
             "resources/read" => {
                 let msg_id = id?;
                 let parsed: Result<ReadResourceParams> =
@@ -930,20 +933,12 @@ impl AppState {
 
     fn resources_list_result(&self) -> Value {
         json!({
-            "resources": [
-                {
-                    "uri": "moraine://sessions/{session_id}",
-                    "name": "Session resource",
-                    "description": "Read session metadata and summary by session_id.",
-                    "mimeType": "application/json"
-                },
-                {
-                    "uri": "moraine://events/{event_uid}",
-                    "name": "Event resource",
-                    "description": "Read event context by event_uid.",
-                    "mimeType": "application/json"
-                }
-            ],
+            "resources": []
+        })
+    }
+
+    fn resource_templates_list_result(&self) -> Value {
+        json!({
             "resourceTemplates": [
                 {
                     "uriTemplate": "moraine://sessions/{session_id}",
@@ -4050,16 +4045,20 @@ mod tests {
         };
         let result = state.resources_list_result();
         let resources = result["resources"].as_array().expect("resources array");
-        assert!(resources
-            .iter()
-            .any(|r| r["uri"] == "moraine://sessions/{session_id}"));
-        assert!(resources
-            .iter()
-            .any(|r| r["uri"] == "moraine://events/{event_uid}"));
-        let templates = result["resourceTemplates"]
+        assert!(resources.is_empty());
+        assert!(result.get("resourceTemplates").is_none());
+
+        let templates_result = state.resource_templates_list_result();
+        let templates = templates_result["resourceTemplates"]
             .as_array()
             .expect("templates array");
         assert_eq!(templates.len(), 2);
+        assert!(templates
+            .iter()
+            .any(|r| r["uriTemplate"] == "moraine://sessions/{session_id}"));
+        assert!(templates
+            .iter()
+            .any(|r| r["uriTemplate"] == "moraine://events/{event_uid}"));
     }
 
     #[test]

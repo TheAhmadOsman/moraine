@@ -636,7 +636,8 @@ fn validate_opencode_sqlite_schema(conn: &Connection) -> Result<i64> {
         if present.is_empty() {
             missing.push(format!("{table}.*"));
         } else {
-            let present_sorted: Vec<String> = present.iter().cloned().collect();
+            let mut present_sorted: Vec<String> = present.iter().cloned().collect();
+            present_sorted.sort();
             observed_columns.push(format!("{table}({})", present_sorted.join(",")));
             for column in *columns {
                 if !present.contains(*column) {

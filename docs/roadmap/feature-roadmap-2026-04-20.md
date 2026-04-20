@@ -13,7 +13,7 @@ agent harnesses appear.
 
 ## Strategic Specifications
 
-P2 and P3 features in this roadmap are too large to implement in a single PR. Detailed design specifications — including schema sketches, API contracts, acceptance criteria, and PR sequencing — are maintained in [`docs/roadmap/specs/`](specs/). Implementation should reference those specs before cutting branches.
+P2 and P3 features in this roadmap are too large to implement in a single PR. Detailed design specifications — including schema sketches, API contracts, acceptance criteria, and PR sequencing — are maintained in [`docs/roadmap/specs/`](specs/README.md). Implementation should reference those specs before cutting branches.
 
 ## Sources Used
 
@@ -1523,4 +1523,3 @@ Every feature above should include:
   validation.
 - Do not broaden storage retention or exports without privacy policy metadata.
 - Do not make adapter authors bypass shared source-health and privacy behavior.
-

@@ -14,16 +14,16 @@ Scope: C02 remote import profiles, C03 config wizard/source discovery, C11 porta
 
 ### `apps/moraine` CLI
 - New commands:
-  - `moraine import sync <name> --dry-run` — previews profile config (live sync stubbed; no rsync execution).
+  - `moraine import sync <name>` — previews profile config (live sync disabled unless a future slice wires `--execute`).
   - `moraine import status` — shows all configured profiles and last sync manifest.
-  - `moraine archive export --out-dir <dir> --dry-run` — previews export manifest (live export stubbed; no ClickHouse queries or file writes).
-  - `moraine archive import --input <dir> --dry-run` — previews archive tables (live import stubbed; no ClickHouse inserts).
+  - `moraine archive export --out-dir <dir>` — previews export manifest (live export disabled unless a future slice wires `--execute`).
+  - `moraine archive import --input <dir>` — previews archive tables (live import disabled unless a future slice wires `--execute`).
   - `moraine archive verify <dir>` — validates local `manifest.json` against JSONL files and row counts.
   - `moraine config detect --json` — outputs discovered sources.
   - `moraine config validate` — reports config issues.
   - `moraine config wizard` — interactive stdin wizard that appends discovered sources with `.toml.bak` backup.
-- All new commands support `--output json`.
-- Added 33 unit tests covering clap parsing, archive verify, config validate, sync manifest roundtrip, and existing regressions.
+- Non-interactive new commands support `--output json`; the interactive wizard remains terminal-oriented.
+- Added focused unit tests covering clap parsing, archive verify, config validate, source-overlap validation, import profile normalization, sync manifest roundtrip, and existing regressions.
 
 ### Config
 - `config/moraine.toml` now includes a commented `[imports.vm503]` example.
@@ -34,9 +34,9 @@ Scope: C02 remote import profiles, C03 config wizard/source discovery, C11 porta
 ## What Is Intentionally Stubbed
 
 Live execution paths are disabled in this foundation slice:
-- `import sync` without `--dry-run` returns an error directing the user to use dry-run.
-- `archive export` without `--dry-run` returns an error directing the user to use dry-run.
-- `archive import` without `--dry-run` returns an error directing the user to use dry-run.
+- `import sync --execute` returns a clear not-implemented error.
+- `archive export --execute` returns a clear not-implemented error.
+- `archive import --execute` returns a clear not-implemented error.
 
 These stubs preserve the CLI contract, rendering layer, and JSON output schemas while leaving actual subprocess/ClickHouse I/O for a follow-up slice.
 

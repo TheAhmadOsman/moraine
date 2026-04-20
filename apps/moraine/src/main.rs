@@ -215,8 +215,10 @@ enum ImportCommand {
 struct ImportSyncArgs {
     #[arg(value_name = "NAME")]
     name: String,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
 }
 
 #[derive(Debug, Args)]
@@ -244,8 +246,10 @@ struct ArchiveExportArgs {
     raw: bool,
     #[arg(long, default_value_t = false)]
     manifest_only: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
 }
 
 #[derive(Debug, Args)]
@@ -254,6 +258,8 @@ struct ArchiveImportArgs {
     input: PathBuf,
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2756,7 +2762,7 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
         .ok_or_else(|| anyhow!("import profile '{}' not found in config", name))?;
 
     if !dry_run {
-        bail!("live sync is not yet implemented; use --dry-run (default) to preview");
+        bail!("live sync is not yet implemented; omit --execute to preview");
     }
 
     let manifest = SyncManifest {
@@ -2783,6 +2789,10 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
         success: true,
         manifest,
     })
+}
+
+fn preview_mode(dry_run: bool, execute: bool) -> bool {
+    dry_run || !execute
 }
 
 async fn cmd_import_status(cfg: &AppConfig) -> Result<ImportStatusSnapshot> {
@@ -2815,8 +2825,8 @@ async fn cmd_archive_export(
     _cfg: &AppConfig,
     args: &ArchiveExportArgs,
 ) -> Result<ArchiveExportSnapshot> {
-    if !args.dry_run {
-        bail!("live archive export is not yet implemented; use --dry-run (default) to preview");
+    if !preview_mode(args.dry_run, args.execute) {
+        bail!("live archive export is not yet implemented; omit --execute to preview");
     }
 
     let mut tables = Vec::new();
@@ -2872,8 +2882,9 @@ async fn cmd_archive_import(
         );
     }
 
-    if !args.dry_run {
-        bail!("live archive import is not yet implemented; use --dry-run (default) to preview");
+    let dry_run = preview_mode(args.dry_run, args.execute);
+    if !dry_run {
+        bail!("live archive import is not yet implemented; omit --execute to preview");
     }
 
     let mut imported_tables = Vec::new();
@@ -2894,7 +2905,7 @@ async fn cmd_archive_import(
 
     Ok(ArchiveImportSnapshot {
         input_dir: args.input.display().to_string(),
-        dry_run: true,
+        dry_run,
         imported_tables,
     })
 }
@@ -3321,9 +3332,13 @@ async fn main() -> Result<ExitCode> {
                     }
                     Ok(ExitCode::SUCCESS)
                 }
-                ConfigCommand::Detect(_) => {
+                ConfigCommand::Detect(detect) => {
                     let snapshot = cmd_config_detect();
-                    render_config_detect(&output, &snapshot)?;
+                    if detect.json {
+                        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    } else {
+                        render_config_detect(&output, &snapshot)?;
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 ConfigCommand::Validate => {
@@ -3365,7 +3380,8 @@ async fn main() -> Result<ExitCode> {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
                 ImportCommand::Sync(sync) => {
-                    let result = cmd_import_sync(&cfg, &sync.name, sync.dry_run).await?;
+                    let dry_run = preview_mode(sync.dry_run, sync.execute);
+                    let result = cmd_import_sync(&cfg, &sync.name, dry_run).await?;
                     render_import_sync(&output, &result)?;
                     Ok(ExitCode::SUCCESS)
                 }
@@ -3997,7 +4013,10 @@ mod tests {
         match cli.command {
             CliCommand::Import(ImportArgs {
                 command: ImportCommand::Sync(sync),
-            }) => assert_eq!(sync.name, "vm503"),
+            }) => {
+                assert_eq!(sync.name, "vm503");
+                assert!(preview_mode(sync.dry_run, sync.execute));
+            }
             _ => panic!("expected import sync command"),
         }
     }
@@ -4027,6 +4046,7 @@ mod tests {
                 );
                 assert_eq!(export.since, Some("7d".to_string()));
                 assert!(export.raw);
+                assert!(preview_mode(export.dry_run, export.execute));
             }
             _ => panic!("expected archive export command"),
         }
@@ -4048,8 +4068,30 @@ mod tests {
             }) => {
                 assert_eq!(import.input, PathBuf::from("/tmp/import"));
                 assert!(import.dry_run);
+                assert!(!import.execute);
             }
             _ => panic!("expected archive import command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_export_execute() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "archive",
+            "export",
+            "--out-dir",
+            "/tmp/export",
+            "--execute",
+        ]);
+        match cli.command {
+            CliCommand::Archive(ArchiveArgs {
+                command: ArchiveCommand::Export(export),
+            }) => {
+                assert!(export.execute);
+                assert!(!preview_mode(export.dry_run, export.execute));
+            }
+            _ => panic!("expected archive export command"),
         }
     }
 
