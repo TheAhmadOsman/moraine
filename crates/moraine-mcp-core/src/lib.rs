@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
 const TOOL_LIMIT_MIN: u16 = 1;
+const DEFAULT_OUTPUT_BUDGET_CHARS: usize = 16_384;
 
 const CONVERSATION_MODE_CLASSIFICATION_SEMANTICS: &str =
     "Sessions are classified into exactly one mode by first match on any event in the session: web_search > mcp_internal > tool_calling > chat.";
@@ -283,6 +284,12 @@ struct GetSessionEventsArgs {
     safety_mode: Option<SafetyMode>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadResourceParams {
+    uri: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -654,6 +661,10 @@ impl AppState {
                     "capabilities": {
                         "tools": {
                             "listChanged": false
+                        },
+                        "resources": {
+                            "subscribe": false,
+                            "listChanged": false
                         }
                     },
                     "serverInfo": {
@@ -680,6 +691,22 @@ impl AppState {
                             Err(err) => tool_error_result(err.to_string()),
                         };
                         Some(rpc_ok(msg_id, tool_result))
+                    }
+                    Err(err) => Some(rpc_err(msg_id, -32602, &format!("invalid params: {err}"))),
+                }
+            }
+            "resources/list" => id.map(|msg_id| rpc_ok(msg_id, self.resources_list_result())),
+            "resources/read" => {
+                let msg_id = id?;
+                let parsed: Result<ReadResourceParams> =
+                    serde_json::from_value(req.params).context("invalid resources/read params");
+                match parsed {
+                    Ok(params) => {
+                        let resource_result = match self.read_resource(params).await {
+                            Ok(value) => value,
+                            Err(err) => tool_error_result(err.to_string()),
+                        };
+                        Some(rpc_ok(msg_id, resource_result))
                     }
                     Err(err) => Some(rpc_err(msg_id, -32602, &format!("invalid params: {err}"))),
                 }
@@ -717,6 +744,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_search_prose(&payload)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("search", counters),
@@ -744,6 +776,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_open_prose(&payload)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("open", counters),
@@ -779,6 +816,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_conversation_search_prose(&payload, mode)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("search_conversations", counters),
@@ -797,7 +839,7 @@ impl AppState {
                     validate_tool_limit("list_sessions", args.limit, self.cfg.mcp.max_results)?;
                 let safety_mode = args.safety_mode.unwrap_or_default();
                 let safety = SafetyObservation::start(safety_mode);
-                let counters = SafetyCounters::default();
+                let mut counters = SafetyCounters::default();
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.list_sessions(args).await?;
                 match verbosity {
@@ -807,6 +849,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_session_list_prose(&payload)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("list_sessions", counters),
@@ -819,7 +866,7 @@ impl AppState {
                     .context("get_session expects {\"session_id\": ...}")?;
                 let safety_mode = args.safety_mode.unwrap_or_default();
                 let safety = SafetyObservation::start(safety_mode);
-                let counters = SafetyCounters::default();
+                let mut counters = SafetyCounters::default();
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.get_session(args).await?;
                 match verbosity {
@@ -829,6 +876,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_get_session_prose(&payload)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("get_session", counters),
@@ -860,6 +912,11 @@ impl AppState {
                     )),
                     Verbosity::Prose => {
                         let text = format_session_events_prose(&payload)?;
+                        let text = truncate_prose_to_budget(
+                            text,
+                            DEFAULT_OUTPUT_BUDGET_CHARS,
+                            &mut counters,
+                        );
                         Ok(tool_ok_prose_with_preamble(
                             text,
                             safety.finish("get_session_events", counters),
@@ -869,6 +926,97 @@ impl AppState {
             }
             other => Err(anyhow!("unknown tool: {other}")),
         }
+    }
+
+    fn resources_list_result(&self) -> Value {
+        json!({
+            "resources": [
+                {
+                    "uri": "moraine://sessions/{session_id}",
+                    "name": "Session resource",
+                    "description": "Read session metadata and summary by session_id.",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uri": "moraine://events/{event_uid}",
+                    "name": "Event resource",
+                    "description": "Read event context by event_uid.",
+                    "mimeType": "application/json"
+                }
+            ],
+            "resourceTemplates": [
+                {
+                    "uriTemplate": "moraine://sessions/{session_id}",
+                    "name": "Session resource",
+                    "description": "Read session metadata and summary by session_id.",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uriTemplate": "moraine://events/{event_uid}",
+                    "name": "Event resource",
+                    "description": "Read event context by event_uid.",
+                    "mimeType": "application/json"
+                }
+            ]
+        })
+    }
+
+    async fn read_resource(&self, params: ReadResourceParams) -> Result<Value> {
+        if let Some(session_id) = params.uri.strip_prefix("moraine://sessions/") {
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                return Err(anyhow!("session_id is required in uri"));
+            }
+            let payload = self
+                .get_session(GetSessionArgs {
+                    session_id: session_id.to_string(),
+                    safety_mode: Some(SafetyMode::Normal),
+                    verbosity: Some(Verbosity::Full),
+                })
+                .await?;
+            return Ok(json!({
+                "contents": [
+                    {
+                        "uri": params.uri,
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                    }
+                ]
+            }));
+        }
+
+        if let Some(event_uid) = params.uri.strip_prefix("moraine://events/") {
+            let event_uid = event_uid.trim();
+            if event_uid.is_empty() {
+                return Err(anyhow!("event_uid is required in uri"));
+            }
+            let payload = self
+                .open(OpenArgs {
+                    event_uid: Some(event_uid.to_string()),
+                    session_id: None,
+                    scope: Some(OpenScope::All),
+                    include_payload: Some(OpenPayloadArg::Many(vec![OpenPayloadField::Text])),
+                    limit: None,
+                    cursor: None,
+                    before: Some(self.cfg.mcp.default_context_before),
+                    after: Some(self.cfg.mcp.default_context_after),
+                    include_system_events: Some(false),
+                    safety_mode: Some(SafetyMode::Normal),
+                    verbosity: Some(Verbosity::Full),
+                })
+                .await?;
+            return Ok(json!({
+                "contents": [
+                    {
+                        "uri": params.uri,
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                    }
+                ]
+            }));
+        }
+
+        Err(anyhow!("unsupported resource uri: {}", params.uri))
     }
 
     async fn search(&self, args: SearchArgs, counters: &mut SafetyCounters) -> Result<Value> {
@@ -1564,6 +1712,8 @@ fn safety_metadata_output_schema() -> Value {
                     "low_information_events_filtered": { "type": "integer" },
                     "payload_json_requests_suppressed": { "type": "integer" },
                     "system_event_requests_suppressed": { "type": "integer" },
+                    "truncation_applied": { "type": "integer" },
+                    "output_chars": { "type": "integer" },
                     "total_redactions": { "type": "integer" },
                     "total_filters": { "type": "integer" }
                 },
@@ -1573,6 +1723,8 @@ fn safety_metadata_output_schema() -> Value {
                     "low_information_events_filtered",
                     "payload_json_requests_suppressed",
                     "system_event_requests_suppressed",
+                    "truncation_applied",
+                    "output_chars",
                     "total_redactions",
                     "total_filters"
                 ]
@@ -2014,6 +2166,8 @@ struct SafetyCounters {
     low_information_events_filtered: u64,
     payload_json_requests_suppressed: u64,
     system_event_requests_suppressed: u64,
+    truncation_applied: u64,
+    output_chars: u64,
 }
 
 impl SafetyCounters {
@@ -2064,6 +2218,8 @@ impl SafetyObservation {
                 "low_information_events_filtered": counters.low_information_events_filtered,
                 "payload_json_requests_suppressed": counters.payload_json_requests_suppressed,
                 "system_event_requests_suppressed": counters.system_event_requests_suppressed,
+                "truncation_applied": counters.truncation_applied,
+                "output_chars": counters.output_chars,
                 "total_redactions": counters.total_redactions(),
                 "total_filters": counters.total_filters()
             },
@@ -2820,6 +2976,18 @@ fn compact_text_line(text: &str, max_chars: usize) -> String {
     }
 
     let mut trimmed: String = compact.chars().take(max_chars.saturating_sub(3)).collect();
+    trimmed.push_str("...");
+    trimmed
+}
+
+fn truncate_prose_to_budget(text: String, budget: usize, counters: &mut SafetyCounters) -> String {
+    let char_count = text.chars().count();
+    counters.output_chars = char_count as u64;
+    if char_count <= budget {
+        return text;
+    }
+    counters.truncation_applied = 1;
+    let mut trimmed: String = text.chars().take(budget.saturating_sub(3)).collect();
     trimmed.push_str("...");
     trimmed
 }
@@ -3841,5 +4009,86 @@ mod tests {
         assert!(text.contains("Scope: messages"));
         assert!(text.contains("Next cursor: cursor-next"));
         assert!(text.contains("hello world"));
+    }
+
+    #[test]
+    fn initialize_response_has_stable_shape() {
+        let payload = json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {
+                    "listChanged": false
+                },
+                "resources": {
+                    "subscribe": false,
+                    "listChanged": false
+                }
+            },
+            "serverInfo": {
+                "name": "codex-mcp",
+                "version": "0.4.3"
+            }
+        });
+        assert!(payload["protocolVersion"].is_string());
+        assert!(payload["capabilities"]["tools"].is_object());
+        assert!(payload["capabilities"]["resources"].is_object());
+        assert!(payload["serverInfo"]["name"].is_string());
+    }
+
+    #[test]
+    fn resources_list_declares_session_and_event_templates() {
+        let state = AppState {
+            cfg: moraine_config::AppConfig::default(),
+            repo: ClickHouseConversationRepository::new(
+                moraine_clickhouse::ClickHouseClient::new(
+                    moraine_config::ClickHouseConfig::default(),
+                )
+                .unwrap(),
+                RepoConfig::default(),
+            ),
+            prewarm_started: Arc::new(AtomicBool::new(false)),
+        };
+        let result = state.resources_list_result();
+        let resources = result["resources"].as_array().expect("resources array");
+        assert!(resources
+            .iter()
+            .any(|r| r["uri"] == "moraine://sessions/{session_id}"));
+        assert!(resources
+            .iter()
+            .any(|r| r["uri"] == "moraine://events/{event_uid}"));
+        let templates = result["resourceTemplates"]
+            .as_array()
+            .expect("templates array");
+        assert_eq!(templates.len(), 2);
+    }
+
+    #[test]
+    fn truncate_prose_respects_budget_and_sets_counters() {
+        let mut counters = SafetyCounters::default();
+        let text = "a b c d e".to_string();
+        let result = truncate_prose_to_budget(text.clone(), 100, &mut counters);
+        assert_eq!(result, text);
+        assert_eq!(counters.truncation_applied, 0);
+        assert_eq!(counters.output_chars, 9);
+
+        let long = "x ".repeat(50);
+        let mut counters2 = SafetyCounters::default();
+        let result2 = truncate_prose_to_budget(long.clone(), 10, &mut counters2);
+        assert!(result2.ends_with("..."));
+        assert_eq!(counters2.truncation_applied, 1);
+        assert_eq!(counters2.output_chars, 100);
+    }
+
+    #[test]
+    fn safety_counters_include_truncation_fields() {
+        let counters = SafetyCounters {
+            truncation_applied: 1,
+            output_chars: 42,
+            ..SafetyCounters::default()
+        };
+        let obs = SafetyObservation::start(SafetyMode::Normal);
+        let meta = obs.finish("search", counters);
+        assert_eq!(meta["counters"]["truncation_applied"], json!(1));
+        assert_eq!(meta["counters"]["output_chars"], json!(42));
     }
 }
