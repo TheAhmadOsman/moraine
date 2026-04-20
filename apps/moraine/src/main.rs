@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use moraine_clickhouse::{ClickHouseClient, DoctorReport};
+use moraine_clickhouse::{bundled_migrations, ClickHouseClient, DoctorReport};
 use moraine_config::AppConfig;
 use moraine_source_status::{
     build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
@@ -15,6 +15,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 
 const CLICKHOUSE_TEMPLATE: &str = include_str!("../../../config/clickhouse.xml");
 const USERS_TEMPLATE: &str = include_str!("../../../config/users.xml");
+const BACKUP_MANIFEST_FILE: &str = "manifest.json";
+const BACKUP_TABLES_DIR: &str = "tables";
+const BACKUP_MANIFEST_VERSION: u32 = 1;
 
 const DEFAULT_CLICKHOUSE_TAG: &str = "v25.12.5.44-stable";
 const CH_URL_MACOS_X86_64: &str = "https://github.com/ClickHouse/ClickHouse/releases/download/v25.12.5.44-stable/clickhouse-macos";
@@ -86,6 +90,8 @@ enum CliCommand {
     Sources(SourcesArgs),
     Import(ImportArgs),
     Archive(ArchiveArgs),
+    Backup(BackupArgs),
+    Restore(RestoreArgs),
     Run(RunArgs),
 }
 
@@ -266,6 +272,51 @@ struct ArchiveImportArgs {
 struct ArchiveVerifyArgs {
     #[arg(value_name = "DIR")]
     path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct BackupArgs {
+    #[command(subcommand)]
+    command: BackupCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    Create(BackupCreateArgs),
+    List(BackupListArgs),
+    Verify(BackupVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct BackupCreateArgs {
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    include_derived: bool,
+}
+
+#[derive(Debug, Args)]
+struct BackupListArgs {
+    #[arg(long, value_name = "DIR")]
+    root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BackupVerifyArgs {
+    #[arg(value_name = "DIR")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    #[arg(long, value_name = "DIR")]
+    input: PathBuf,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
+    #[arg(long, value_name = "DB")]
+    target_database: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -541,6 +592,90 @@ struct ArchiveTableImport {
     name: String,
     rows: u64,
     file: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupManifest {
+    manifest_version: u32,
+    backup_id: String,
+    created_unix_seconds: u64,
+    moraine_version: String,
+    clickhouse_database: String,
+    clickhouse_version: Option<String>,
+    include_derived: bool,
+    bundled_migrations: Vec<String>,
+    applied_migrations: Vec<String>,
+    privacy_key_material: String,
+    sources: Vec<BackupSourceInventory>,
+    tables: Vec<BackupTableManifest>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupSourceInventory {
+    name: String,
+    harness: String,
+    enabled: bool,
+    glob: String,
+    watch_root: String,
+    format: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupTableManifest {
+    name: String,
+    kind: String,
+    file: String,
+    row_count: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupCreateSnapshot {
+    backup_dir: String,
+    manifest: BackupManifest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupListSnapshot {
+    root: String,
+    backups: Vec<BackupListEntry>,
+    skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupListEntry {
+    backup_id: String,
+    path: String,
+    created_unix_seconds: u64,
+    table_count: usize,
+    total_rows: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackupVerifySnapshot {
+    path: String,
+    ok: bool,
+    errors: Vec<String>,
+    manifest: Option<BackupManifest>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RestorePlanSnapshot {
+    input_dir: String,
+    target_database: String,
+    dry_run: bool,
+    can_restore: bool,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+    table_count: usize,
+    total_rows: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackupTableSpec {
+    name: &'static str,
+    kind: &'static str,
+    derived: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2937,6 +3072,485 @@ fn cmd_archive_verify(path: &Path) -> Result<ArchiveManifest> {
     Ok(manifest)
 }
 
+#[derive(Debug, Deserialize)]
+struct ClickHouseTableNameRow {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppliedMigrationRow {
+    version: String,
+}
+
+fn backup_table_specs(include_derived: bool) -> Vec<BackupTableSpec> {
+    let mut specs = vec![
+        BackupTableSpec {
+            name: "raw_events",
+            kind: "base",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "events",
+            kind: "base",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "event_links",
+            kind: "base",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "tool_io",
+            kind: "base",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "ingest_errors",
+            kind: "operational",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "ingest_checkpoints",
+            kind: "operational",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "ingest_heartbeats",
+            kind: "operational",
+            derived: false,
+        },
+        BackupTableSpec {
+            name: "schema_migrations",
+            kind: "schema",
+            derived: false,
+        },
+    ];
+
+    if include_derived {
+        specs.extend([
+            BackupTableSpec {
+                name: "search_documents",
+                kind: "derived",
+                derived: true,
+            },
+            BackupTableSpec {
+                name: "search_postings",
+                kind: "derived",
+                derived: true,
+            },
+            BackupTableSpec {
+                name: "search_conversation_terms",
+                kind: "derived",
+                derived: true,
+            },
+            BackupTableSpec {
+                name: "search_query_log",
+                kind: "derived",
+                derived: true,
+            },
+            BackupTableSpec {
+                name: "search_hit_log",
+                kind: "derived",
+                derived: true,
+            },
+            BackupTableSpec {
+                name: "search_interaction_log",
+                kind: "derived",
+                derived: true,
+            },
+        ]);
+    }
+
+    specs
+}
+
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn backup_default_root(cfg: &AppConfig) -> PathBuf {
+    PathBuf::from(&cfg.runtime.root_dir).join("backups")
+}
+
+fn make_backup_id() -> String {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("moraine-backup-{stamp}")
+}
+
+fn backup_target_dir(cfg: &AppConfig, out_dir: Option<&PathBuf>, backup_id: &str) -> PathBuf {
+    out_dir
+        .cloned()
+        .unwrap_or_else(|| backup_default_root(cfg).join(backup_id))
+}
+
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+fn count_jsonl_rows_text(text: &str) -> u64 {
+    text.lines().filter(|line| !line.trim().is_empty()).count() as u64
+}
+
+fn count_jsonl_rows_bytes(bytes: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(bytes).context("backup table file is not valid utf-8")?;
+    Ok(count_jsonl_rows_text(text))
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid backup file path {}", path.display()))?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, path).with_context(|| format!("failed to install {}", path.display()))?;
+    Ok(())
+}
+
+fn backup_source_inventory(cfg: &AppConfig) -> Vec<BackupSourceInventory> {
+    cfg.ingest
+        .sources
+        .iter()
+        .map(|source| BackupSourceInventory {
+            name: source.name.clone(),
+            harness: source.harness.clone(),
+            enabled: source.enabled,
+            glob: source.glob.clone(),
+            watch_root: source.watch_root.clone(),
+            format: source.format.clone(),
+        })
+        .collect()
+}
+
+async fn existing_clickhouse_tables(
+    ch: &ClickHouseClient,
+    database: &str,
+) -> Result<HashSet<String>> {
+    let query = format!(
+        "SELECT name FROM system.tables WHERE database = {} FORMAT JSONEachRow",
+        quote_sql_string(database)
+    );
+    let rows: Vec<ClickHouseTableNameRow> = ch
+        .query_json_each_row(&query, Some("system"))
+        .await
+        .context("failed to list ClickHouse tables")?;
+    Ok(rows.into_iter().map(|row| row.name).collect())
+}
+
+async fn applied_migrations(ch: &ClickHouseClient, database: &str) -> Result<Vec<String>> {
+    let query = format!(
+        "SELECT toString(version) AS version FROM {}.schema_migrations GROUP BY version ORDER BY version FORMAT JSONEachRow",
+        quote_identifier(database)
+    );
+    let rows: Vec<AppliedMigrationRow> = ch
+        .query_json_each_row(&query, None)
+        .await
+        .context("failed to read applied schema migrations")?;
+    Ok(rows.into_iter().map(|row| row.version).collect())
+}
+
+fn backup_relative_path(path: &str) -> Result<PathBuf> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("backup manifest contains unsafe relative path: {path}");
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn read_backup_manifest(path: &Path) -> Result<BackupManifest> {
+    let manifest_path = path.join(BACKUP_MANIFEST_FILE);
+    let text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("missing {BACKUP_MANIFEST_FILE} in {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("invalid backup manifest {}", manifest_path.display()))
+}
+
+async fn cmd_backup_create(
+    cfg: &AppConfig,
+    args: &BackupCreateArgs,
+) -> Result<BackupCreateSnapshot> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    ch.ping().await.context("ClickHouse ping failed")?;
+
+    let existing_tables = existing_clickhouse_tables(&ch, &cfg.clickhouse.database).await?;
+    let backup_id = make_backup_id();
+    let backup_dir = backup_target_dir(cfg, args.out_dir.as_ref(), &backup_id);
+    if backup_dir.exists() && backup_dir.read_dir()?.next().transpose()?.is_some() {
+        bail!(
+            "backup output directory is not empty: {}",
+            backup_dir.display()
+        );
+    }
+    fs::create_dir_all(backup_dir.join(BACKUP_TABLES_DIR))
+        .with_context(|| format!("failed to create {}", backup_dir.display()))?;
+
+    let mut tables = Vec::new();
+    for spec in backup_table_specs(args.include_derived) {
+        if !existing_tables.contains(spec.name) {
+            if spec.derived {
+                continue;
+            }
+            bail!(
+                "required backup table `{}` is missing from ClickHouse database `{}`",
+                spec.name,
+                cfg.clickhouse.database
+            );
+        }
+
+        let query = format!(
+            "SELECT * FROM {}.{} FORMAT JSONEachRow",
+            quote_identifier(&cfg.clickhouse.database),
+            quote_identifier(spec.name)
+        );
+        let text = ch
+            .request_text(&query, None, Some(&cfg.clickhouse.database), false, None)
+            .await
+            .with_context(|| format!("failed to export table {}", spec.name))?;
+        let file = format!("{BACKUP_TABLES_DIR}/{}.jsonl", spec.name);
+        write_atomic_bytes(&backup_dir.join(&file), text.as_bytes())?;
+        tables.push(BackupTableManifest {
+            name: spec.name.to_string(),
+            kind: spec.kind.to_string(),
+            file,
+            row_count: count_jsonl_rows_text(&text),
+            sha256: sha256_bytes_hex(text.as_bytes()),
+        });
+    }
+
+    let manifest = BackupManifest {
+        manifest_version: BACKUP_MANIFEST_VERSION,
+        backup_id,
+        created_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        moraine_version: env!("CARGO_PKG_VERSION").to_string(),
+        clickhouse_database: cfg.clickhouse.database.clone(),
+        clickhouse_version: ch.version().await.ok(),
+        include_derived: args.include_derived,
+        bundled_migrations: bundled_migrations()
+            .iter()
+            .map(|migration| migration.version.to_string())
+            .collect(),
+        applied_migrations: applied_migrations(&ch, &cfg.clickhouse.database).await?,
+        privacy_key_material: "external_not_included".to_string(),
+        sources: backup_source_inventory(cfg),
+        tables,
+    };
+
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encode backup manifest")?;
+    write_atomic_bytes(
+        &backup_dir.join(BACKUP_MANIFEST_FILE),
+        manifest_bytes.as_slice(),
+    )?;
+
+    Ok(BackupCreateSnapshot {
+        backup_dir: backup_dir.display().to_string(),
+        manifest,
+    })
+}
+
+fn cmd_backup_list(cfg: &AppConfig, args: &BackupListArgs) -> Result<BackupListSnapshot> {
+    let root = args
+        .root
+        .clone()
+        .unwrap_or_else(|| backup_default_root(cfg));
+    let mut backups = Vec::new();
+    let mut skipped = Vec::new();
+
+    if !root.exists() {
+        return Ok(BackupListSnapshot {
+            root: root.display().to_string(),
+            backups,
+            skipped,
+        });
+    }
+    if !root.is_dir() {
+        bail!("backup root is not a directory: {}", root.display());
+    }
+
+    let candidates = if root.join(BACKUP_MANIFEST_FILE).exists() {
+        vec![root.clone()]
+    } else {
+        fs::read_dir(&root)
+            .with_context(|| format!("failed to read {}", root.display()))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.is_dir().then_some(path)
+            })
+            .collect()
+    };
+
+    for path in candidates {
+        if !path.join(BACKUP_MANIFEST_FILE).exists() {
+            continue;
+        }
+        match read_backup_manifest(&path) {
+            Ok(manifest) => backups.push(BackupListEntry {
+                backup_id: manifest.backup_id,
+                path: path.display().to_string(),
+                created_unix_seconds: manifest.created_unix_seconds,
+                table_count: manifest.tables.len(),
+                total_rows: manifest.tables.iter().map(|table| table.row_count).sum(),
+            }),
+            Err(err) => skipped.push(format!("{}: {err:#}", path.display())),
+        }
+    }
+
+    backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_unix_seconds));
+
+    Ok(BackupListSnapshot {
+        root: root.display().to_string(),
+        backups,
+        skipped,
+    })
+}
+
+fn cmd_backup_verify(path: &Path) -> BackupVerifySnapshot {
+    let mut errors = Vec::new();
+    let manifest = match read_backup_manifest(path) {
+        Ok(manifest) => Some(manifest),
+        Err(err) => {
+            errors.push(format!("{err:#}"));
+            None
+        }
+    };
+
+    if let Some(manifest) = &manifest {
+        if manifest.manifest_version != BACKUP_MANIFEST_VERSION {
+            errors.push(format!(
+                "unsupported manifest version {} (expected {BACKUP_MANIFEST_VERSION})",
+                manifest.manifest_version
+            ));
+        }
+
+        let mut seen_files = HashSet::new();
+        let mut seen_tables = HashSet::new();
+        for table in &manifest.tables {
+            if !seen_tables.insert(table.name.clone()) {
+                errors.push(format!("duplicate table entry: {}", table.name));
+            }
+            if !seen_files.insert(table.file.clone()) {
+                errors.push(format!("duplicate table file entry: {}", table.file));
+            }
+
+            let relative_path = match backup_relative_path(&table.file) {
+                Ok(relative_path) => relative_path,
+                Err(err) => {
+                    errors.push(format!("{err:#}"));
+                    continue;
+                }
+            };
+            let table_path = path.join(relative_path);
+            let bytes = match fs::read(&table_path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    errors.push(format!("failed to read {}: {err}", table_path.display()));
+                    continue;
+                }
+            };
+
+            match count_jsonl_rows_bytes(&bytes) {
+                Ok(actual_rows) if actual_rows == table.row_count => {}
+                Ok(actual_rows) => errors.push(format!(
+                    "row count mismatch for {}: manifest says {}, file has {}",
+                    table.name, table.row_count, actual_rows
+                )),
+                Err(err) => errors.push(format!("{}: {err:#}", table_path.display())),
+            }
+
+            let actual_sha = sha256_bytes_hex(&bytes);
+            if actual_sha != table.sha256 {
+                errors.push(format!(
+                    "sha256 mismatch for {}: manifest says {}, file has {}",
+                    table.name, table.sha256, actual_sha
+                ));
+            }
+        }
+    }
+
+    BackupVerifySnapshot {
+        path: path.display().to_string(),
+        ok: errors.is_empty(),
+        errors,
+        manifest,
+    }
+}
+
+fn cmd_restore_plan(cfg: &AppConfig, args: &RestoreArgs) -> RestorePlanSnapshot {
+    let verify = cmd_backup_verify(&args.input);
+    let target_database = args
+        .target_database
+        .clone()
+        .unwrap_or_else(|| cfg.clickhouse.database.clone());
+    let dry_run = preview_mode(args.dry_run, args.execute);
+    let mut blockers = verify.errors.clone();
+    let mut warnings = Vec::new();
+
+    if !dry_run {
+        blockers.push(
+            "live restore --execute is not implemented yet; run without --execute to inspect the restore plan"
+                .to_string(),
+        );
+    }
+
+    let (table_count, total_rows) = verify
+        .manifest
+        .as_ref()
+        .map(|manifest| {
+            if manifest.moraine_version != env!("CARGO_PKG_VERSION") {
+                warnings.push(format!(
+                    "backup was created by moraine {} (current {})",
+                    manifest.moraine_version,
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+            (
+                manifest.tables.len(),
+                manifest.tables.iter().map(|table| table.row_count).sum(),
+            )
+        })
+        .unwrap_or((0, 0));
+
+    RestorePlanSnapshot {
+        input_dir: args.input.display().to_string(),
+        target_database,
+        dry_run,
+        can_restore: blockers.is_empty(),
+        blockers,
+        warnings,
+        table_count,
+        total_rows,
+    }
+}
+
 fn cmd_config_detect() -> ConfigDetectSnapshot {
     ConfigDetectSnapshot {
         sources: moraine_config::discover_sources(),
@@ -3127,6 +3741,106 @@ fn render_archive_verify(output: &CliOutput, manifest: &ArchiveManifest) -> Resu
         ));
     }
     output.section("Archive Verify", &lines);
+    Ok(())
+}
+
+fn render_backup_create(output: &CliOutput, snapshot: &BackupCreateSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    let total_rows: u64 = snapshot
+        .manifest
+        .tables
+        .iter()
+        .map(|table| table.row_count)
+        .sum();
+    let mut lines = vec![
+        format!("backup id: {}", snapshot.manifest.backup_id),
+        format!("backup dir: {}", snapshot.backup_dir),
+        format!("database: {}", snapshot.manifest.clickhouse_database),
+        format!("tables: {}", snapshot.manifest.tables.len()),
+        format!("rows: {total_rows}"),
+        "privacy keys: external/not included".to_string(),
+    ];
+    for table in &snapshot.manifest.tables {
+        lines.push(format!(
+            "  {}: {} rows, sha256 {}",
+            table.name, table.row_count, table.sha256
+        ));
+    }
+    output.section("Backup Create", &lines);
+    Ok(())
+}
+
+fn render_backup_list(output: &CliOutput, snapshot: &BackupListSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    let mut lines = vec![format!("root: {}", snapshot.root)];
+    if snapshot.backups.is_empty() {
+        lines.push("no backups found".to_string());
+    }
+    for backup in &snapshot.backups {
+        lines.push(format!(
+            "  {}: {} tables, {} rows ({})",
+            backup.backup_id, backup.table_count, backup.total_rows, backup.path
+        ));
+    }
+    for skipped in &snapshot.skipped {
+        lines.push(format!("  skipped: {skipped}"));
+    }
+    output.section("Backup List", &lines);
+    Ok(())
+}
+
+fn render_backup_verify(output: &CliOutput, snapshot: &BackupVerifySnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    let mut lines = vec![
+        format!("path: {}", snapshot.path),
+        format!("ok: {}", state_label(snapshot.ok)),
+    ];
+    if let Some(manifest) = &snapshot.manifest {
+        let total_rows: u64 = manifest.tables.iter().map(|table| table.row_count).sum();
+        lines.push(format!("backup id: {}", manifest.backup_id));
+        lines.push(format!("tables: {}", manifest.tables.len()));
+        lines.push(format!("rows: {total_rows}"));
+    }
+    for error in &snapshot.errors {
+        lines.push(format!("  error: {error}"));
+    }
+    output.section("Backup Verify", &lines);
+    Ok(())
+}
+
+fn render_restore_plan(output: &CliOutput, snapshot: &RestorePlanSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    let mut lines = vec![
+        format!("input dir: {}", snapshot.input_dir),
+        format!("target database: {}", snapshot.target_database),
+        format!("dry run: {}", snapshot.dry_run),
+        format!("can restore: {}", state_label(snapshot.can_restore)),
+        format!("tables: {}", snapshot.table_count),
+        format!("rows: {}", snapshot.total_rows),
+    ];
+    for blocker in &snapshot.blockers {
+        lines.push(format!("  blocker: {blocker}"));
+    }
+    for warning in &snapshot.warnings {
+        lines.push(format!("  warning: {warning}"));
+    }
+    output.section("Restore Plan", &lines);
     Ok(())
 }
 
@@ -3411,6 +4125,40 @@ async fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
             }
+        }
+        CliCommand::Backup(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                BackupCommand::Create(create) => {
+                    let snapshot = cmd_backup_create(&cfg, &create).await?;
+                    render_backup_create(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                BackupCommand::List(list) => {
+                    let snapshot = cmd_backup_list(&cfg, &list)?;
+                    render_backup_list(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                BackupCommand::Verify(verify) => {
+                    let snapshot = cmd_backup_verify(&verify.path);
+                    render_backup_verify(&output, &snapshot)?;
+                    Ok(if snapshot.ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    })
+                }
+            }
+        }
+        CliCommand::Restore(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let snapshot = cmd_restore_plan(&cfg, &args);
+            render_restore_plan(&output, &snapshot)?;
+            Ok(if snapshot.can_restore {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
         }
         CliCommand::Run(run) => {
             let (inline_config, passthrough) = parse_config_flag(&run.args)?;
@@ -4007,6 +4755,174 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn test_backup_manifest(table_file: &str, table_bytes: &[u8]) -> BackupManifest {
+        BackupManifest {
+            manifest_version: BACKUP_MANIFEST_VERSION,
+            backup_id: "backup-test".to_string(),
+            created_unix_seconds: 42,
+            moraine_version: env!("CARGO_PKG_VERSION").to_string(),
+            clickhouse_database: "moraine".to_string(),
+            clickhouse_version: Some("25.12.5.44".to_string()),
+            include_derived: false,
+            bundled_migrations: vec!["001".to_string()],
+            applied_migrations: vec!["001".to_string()],
+            privacy_key_material: "external_not_included".to_string(),
+            sources: vec![BackupSourceInventory {
+                name: "codex".to_string(),
+                harness: "codex".to_string(),
+                enabled: true,
+                glob: "/tmp/codex/**/*.jsonl".to_string(),
+                watch_root: "/tmp/codex".to_string(),
+                format: "jsonl".to_string(),
+            }],
+            tables: vec![BackupTableManifest {
+                name: "events".to_string(),
+                kind: "base".to_string(),
+                file: table_file.to_string(),
+                row_count: count_jsonl_rows_bytes(table_bytes).unwrap(),
+                sha256: sha256_bytes_hex(table_bytes),
+            }],
+        }
+    }
+
+    fn write_test_backup(root: &Path, manifest: &BackupManifest, table_bytes: &[u8]) {
+        fs::write(
+            root.join(BACKUP_MANIFEST_FILE),
+            serde_json::to_string_pretty(manifest).unwrap(),
+        )
+        .expect("write manifest");
+        let table_path = root.join(&manifest.tables[0].file);
+        fs::create_dir_all(table_path.parent().expect("table parent")).expect("create table dir");
+        fs::write(table_path, table_bytes).expect("write table file");
+    }
+
+    #[test]
+    fn backup_verify_passes_for_valid_backup() {
+        let root = temp_dir("backup-verify-ok");
+        let table_bytes = br#"{"event_uid":"a"}
+{"event_uid":"b"}
+"#;
+        let manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        write_test_backup(&root, &manifest, table_bytes);
+
+        let snapshot = cmd_backup_verify(&root);
+        assert!(snapshot.ok, "{:?}", snapshot.errors);
+        assert_eq!(
+            snapshot.manifest.as_ref().unwrap().tables[0].sha256,
+            sha256_bytes_hex(table_bytes)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_verify_reports_checksum_mismatch() {
+        let root = temp_dir("backup-verify-checksum");
+        let original = br#"{"event_uid":"a"}
+"#;
+        let manifest = test_backup_manifest("tables/events.jsonl", original);
+        write_test_backup(
+            &root,
+            &manifest,
+            br#"{"event_uid":"changed"}
+"#,
+        );
+
+        let snapshot = cmd_backup_verify(&root);
+        assert!(!snapshot.ok);
+        assert!(snapshot
+            .errors
+            .iter()
+            .any(|error| error.contains("sha256 mismatch")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_verify_rejects_unsafe_manifest_paths() {
+        let root = temp_dir("backup-verify-unsafe");
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let manifest = test_backup_manifest("../events.jsonl", table_bytes);
+        fs::write(
+            root.join(BACKUP_MANIFEST_FILE),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .expect("write manifest");
+
+        let snapshot = cmd_backup_verify(&root);
+        assert!(!snapshot.ok);
+        assert!(snapshot
+            .errors
+            .iter()
+            .any(|error| error.contains("unsafe relative path")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_list_reads_valid_manifests_and_skips_bad_ones() {
+        let root = temp_dir("backup-list");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        fs::create_dir_all(&good).expect("create good");
+        fs::create_dir_all(&bad).expect("create bad");
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        write_test_backup(&good, &manifest, table_bytes);
+        fs::write(bad.join(BACKUP_MANIFEST_FILE), "{bad json").expect("write bad manifest");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.display().to_string();
+        let snapshot = cmd_backup_list(
+            &cfg,
+            &BackupListArgs {
+                root: Some(root.clone()),
+            },
+        )
+        .expect("list backups");
+        assert_eq!(snapshot.backups.len(), 1);
+        assert_eq!(snapshot.backups[0].backup_id, "backup-test");
+        assert_eq!(snapshot.skipped.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_plan_blocks_invalid_or_execute_requests() {
+        let root = temp_dir("restore-plan");
+        let cfg = AppConfig::default();
+        let invalid = cmd_restore_plan(
+            &cfg,
+            &RestoreArgs {
+                input: root.clone(),
+                dry_run: true,
+                execute: false,
+                target_database: None,
+            },
+        );
+        assert!(!invalid.can_restore);
+        assert!(!invalid.blockers.is_empty());
+
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        write_test_backup(&root, &manifest, table_bytes);
+        let execute = cmd_restore_plan(
+            &cfg,
+            &RestoreArgs {
+                input: root.clone(),
+                dry_run: false,
+                execute: true,
+                target_database: Some("restore_db".to_string()),
+            },
+        );
+        assert!(!execute.can_restore);
+        assert_eq!(execute.target_database, "restore_db");
+        assert!(execute
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not implemented")));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn clap_parses_import_sync_name() {
         let cli = Cli::parse_from(["moraine", "import", "sync", "vm503"]);
@@ -4092,6 +5008,60 @@ mod tests {
                 assert!(!preview_mode(export.dry_run, export.execute));
             }
             _ => panic!("expected archive export command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_backup_and_restore_commands() {
+        let create = Cli::parse_from([
+            "moraine",
+            "backup",
+            "create",
+            "--out-dir",
+            "/tmp/backup",
+            "--include-derived",
+        ]);
+        match create.command {
+            CliCommand::Backup(BackupArgs {
+                command: BackupCommand::Create(args),
+            }) => {
+                assert_eq!(args.out_dir, Some(PathBuf::from("/tmp/backup")));
+                assert!(args.include_derived);
+            }
+            _ => panic!("expected backup create command"),
+        }
+
+        let list = Cli::parse_from(["moraine", "backup", "list", "--root", "/tmp/backups"]);
+        match list.command {
+            CliCommand::Backup(BackupArgs {
+                command: BackupCommand::List(args),
+            }) => assert_eq!(args.root, Some(PathBuf::from("/tmp/backups"))),
+            _ => panic!("expected backup list command"),
+        }
+
+        let verify = Cli::parse_from(["moraine", "backup", "verify", "/tmp/backups/one"]);
+        match verify.command {
+            CliCommand::Backup(BackupArgs {
+                command: BackupCommand::Verify(args),
+            }) => assert_eq!(args.path, PathBuf::from("/tmp/backups/one")),
+            _ => panic!("expected backup verify command"),
+        }
+
+        let restore = Cli::parse_from([
+            "moraine",
+            "restore",
+            "--input",
+            "/tmp/backups/one",
+            "--target-database",
+            "restore_db",
+        ]);
+        match restore.command {
+            CliCommand::Restore(args) => {
+                assert_eq!(args.input, PathBuf::from("/tmp/backups/one"));
+                assert_eq!(args.target_database, Some("restore_db".to_string()));
+                assert!(preview_mode(args.dry_run, args.execute));
+            }
+            _ => panic!("expected restore command"),
         }
     }
 

@@ -12,7 +12,7 @@ The corpus is split by subsystem boundary: `Moraine Core` (data plane), `Moraine
 
 ## Reading Path
 
-Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/unified-trace-schema.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/operations/source-health-and-monitor.md`, `docs/operations/privacy-and-redaction.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, field-level normalization mapping, runtime behavior, search structures, interface contract, source/monitor operations, privacy policy, then architectural and operational consequences.
+Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/unified-trace-schema.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/operations/source-health-and-monitor.md`, `docs/operations/backup-and-restore.md`, `docs/operations/privacy-and-redaction.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, field-level normalization mapping, runtime behavior, search structures, interface contract, source/monitor operations, backup safety, privacy policy, then architectural and operational consequences.
 
 ## External References
 

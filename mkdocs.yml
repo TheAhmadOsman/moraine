@@ -93,6 +93,7 @@ nav:
   - Operations:
       - Build and Operations: operations/build-and-operations.md
       - Monitor and Source Health: operations/source-health-and-monitor.md
+      - Backup and Restore: operations/backup-and-restore.md
       - Privacy and Redaction: operations/privacy-and-redaction.md
       - Environment Variables: operations/environment-variables.md
       - Replay Search Latency Benchmark: operations/replay-search-latency-benchmark.md

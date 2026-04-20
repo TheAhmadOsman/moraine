@@ -283,6 +283,34 @@ Commands:
 
 Future live sync will store manifests as JSON under `~/.moraine/imports/<name>.json`.
 
+## Backup and Restore
+
+Back up the local ClickHouse corpus before migrations, clean reindexing, privacy policy changes, or destructive maintenance:
+
+```bash
+moraine backup create
+moraine backup create --out-dir ~/.moraine/backups/pre-migration-2026-04-20
+moraine backup create --include-derived
+```
+
+Inspect and verify backups:
+
+```bash
+moraine backup list
+moraine backup verify ~/.moraine/backups/pre-migration-2026-04-20
+```
+
+Plan a restore without mutating ClickHouse:
+
+```bash
+moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20
+moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20 --target-database moraine_restore
+```
+
+Backups include a manifest, source inventory, migration metadata, table row counts, and SHA-256 checksums for exported `JSONEachRow` table files. Privacy encryption key material is not included and must be managed separately. Live restore execution is intentionally not enabled yet; `restore --execute` reports a blocker instead of changing ClickHouse.
+
+Detailed operational guidance is in `backup-and-restore.md`.
+
 ## Portable Archives
 
 Preview and verify portable JSONL archive contracts. Live ClickHouse export/import is intentionally not wired in this slice.
