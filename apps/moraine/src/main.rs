@@ -84,6 +84,8 @@ enum CliCommand {
     Clickhouse(ClickhouseArgs),
     Config(ConfigArgs),
     Sources(SourcesArgs),
+    Import(ImportArgs),
+    Archive(ArchiveArgs),
     Run(RunArgs),
 }
 
@@ -147,6 +149,9 @@ struct ConfigArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Get(ConfigGetArgs),
+    Wizard,
+    Detect(ConfigDetectArgs),
+    Validate,
 }
 
 #[derive(Debug, Args)]
@@ -186,6 +191,75 @@ struct SourcesErrorsArgs {
 struct ConfigGetArgs {
     #[arg(value_name = "KEY")]
     key: String,
+}
+
+#[derive(Debug, Args)]
+struct ConfigDetectArgs {
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    #[command(subcommand)]
+    command: ImportCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCommand {
+    Sync(ImportSyncArgs),
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct ImportSyncArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveArgs {
+    #[command(subcommand)]
+    command: ArchiveCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ArchiveCommand {
+    Export(ArchiveExportArgs),
+    Import(ArchiveImportArgs),
+    Verify(ArchiveVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct ArchiveExportArgs {
+    #[arg(short, long, value_name = "DIR")]
+    out_dir: PathBuf,
+    #[arg(long, value_name = "IDS", value_delimiter = ',')]
+    session_ids: Option<Vec<String>>,
+    #[arg(long, value_name = "DURATION")]
+    since: Option<String>,
+    #[arg(long, default_value_t = false)]
+    raw: bool,
+    #[arg(long, default_value_t = false)]
+    manifest_only: bool,
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveImportArgs {
+    #[arg(short, long, value_name = "DIR")]
+    input: PathBuf,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveVerifyArgs {
+    #[arg(value_name = "DIR")]
+    path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -390,6 +464,88 @@ struct UpSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DownSnapshot {
     stopped: Vec<Service>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SyncManifest {
+    profile_name: String,
+    synced_at: String,
+    source_host: String,
+    source_paths: Vec<String>,
+    local_mirror: String,
+    files_copied: u64,
+    bytes_copied: u64,
+    files_skipped: u64,
+    duration_ms: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SyncResult {
+    profile_name: String,
+    success: bool,
+    manifest: SyncManifest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ImportStatusSnapshot {
+    profiles: Vec<ImportProfileStatus>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ImportProfileStatus {
+    name: String,
+    configured: bool,
+    host: String,
+    local_mirror: String,
+    cadence: String,
+    last_sync: Option<SyncManifest>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ArchiveManifest {
+    schema_version: String,
+    moraine_version: String,
+    exported_at: String,
+    tables: Vec<ArchiveTableManifest>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ArchiveTableManifest {
+    name: String,
+    rows: u64,
+    file: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ArchiveExportSnapshot {
+    output_dir: String,
+    manifest: ArchiveManifest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ArchiveImportSnapshot {
+    input_dir: String,
+    dry_run: bool,
+    imported_tables: Vec<ArchiveTableImport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ArchiveTableImport {
+    name: String,
+    rows: u64,
+    file: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ConfigDetectSnapshot {
+    sources: Vec<moraine_config::DiscoveredSource>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ConfigValidateSnapshot {
+    ok: bool,
+    issues: Vec<moraine_config::SourceValidationIssue>,
 }
 
 struct CliOutput {
@@ -2573,6 +2729,439 @@ fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn imports_dir(cfg: &AppConfig) -> PathBuf {
+    PathBuf::from(&cfg.runtime.root_dir).join("imports")
+}
+
+fn sync_manifest_path(cfg: &AppConfig, name: &str) -> PathBuf {
+    imports_dir(cfg).join(format!("{name}.json"))
+}
+
+fn read_sync_manifest(cfg: &AppConfig, name: &str) -> Result<Option<SyncManifest>> {
+    let path = sync_manifest_path(cfg, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read sync manifest {}", path.display()))?;
+    let manifest: SyncManifest = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse sync manifest {}", path.display()))?;
+    Ok(Some(manifest))
+}
+
+async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<SyncResult> {
+    let profile = cfg
+        .imports
+        .get(name)
+        .ok_or_else(|| anyhow!("import profile '{}' not found in config", name))?;
+
+    if !dry_run {
+        bail!("live sync is not yet implemented; use --dry-run (default) to preview");
+    }
+
+    let manifest = SyncManifest {
+        profile_name: name.to_string(),
+        synced_at: format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+        source_host: profile.host.clone(),
+        source_paths: profile.remote_paths.clone(),
+        local_mirror: profile.local_mirror.clone(),
+        files_copied: 0,
+        bytes_copied: 0,
+        files_skipped: 0,
+        duration_ms: 0,
+        last_error: None,
+    };
+
+    Ok(SyncResult {
+        profile_name: name.to_string(),
+        success: true,
+        manifest,
+    })
+}
+
+async fn cmd_import_status(cfg: &AppConfig) -> Result<ImportStatusSnapshot> {
+    let mut profiles = Vec::new();
+    for (name, profile) in &cfg.imports {
+        let last_sync = read_sync_manifest(cfg, name).ok().flatten();
+        profiles.push(ImportProfileStatus {
+            name: name.clone(),
+            configured: true,
+            host: profile.host.clone(),
+            local_mirror: profile.local_mirror.clone(),
+            cadence: profile.cadence.clone(),
+            last_sync,
+        });
+    }
+    if profiles.is_empty() {
+        profiles.push(ImportProfileStatus {
+            name: "(none)".to_string(),
+            configured: false,
+            host: "".to_string(),
+            local_mirror: "".to_string(),
+            cadence: "".to_string(),
+            last_sync: None,
+        });
+    }
+    Ok(ImportStatusSnapshot { profiles })
+}
+
+async fn cmd_archive_export(
+    _cfg: &AppConfig,
+    args: &ArchiveExportArgs,
+) -> Result<ArchiveExportSnapshot> {
+    if !args.dry_run {
+        bail!("live archive export is not yet implemented; use --dry-run (default) to preview");
+    }
+
+    let mut tables = Vec::new();
+    for table in ["events", "event_links", "tool_io"] {
+        tables.push(ArchiveTableManifest {
+            name: table.to_string(),
+            rows: 0,
+            file: format!("{table}.jsonl"),
+        });
+    }
+    if args.raw {
+        tables.push(ArchiveTableManifest {
+            name: "raw_events".to_string(),
+            rows: 0,
+            file: "raw_events.jsonl".to_string(),
+        });
+    }
+
+    let manifest = ArchiveManifest {
+        schema_version: env!("CARGO_PKG_VERSION").to_string(),
+        moraine_version: env!("CARGO_PKG_VERSION").to_string(),
+        exported_at: format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+        tables,
+    };
+
+    Ok(ArchiveExportSnapshot {
+        output_dir: args.out_dir.display().to_string(),
+        manifest,
+    })
+}
+
+async fn cmd_archive_import(
+    _cfg: &AppConfig,
+    args: &ArchiveImportArgs,
+) -> Result<ArchiveImportSnapshot> {
+    let manifest_path = args.input.join("manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("missing manifest.json in {}", args.input.display()))?;
+    let manifest: ArchiveManifest =
+        serde_json::from_str(&manifest_text).context("failed to parse archive manifest")?;
+
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    if manifest.moraine_version != current_version {
+        eprintln!(
+            "warning: archive was built with moraine {} (current {})",
+            manifest.moraine_version, current_version
+        );
+    }
+
+    if !args.dry_run {
+        bail!("live archive import is not yet implemented; use --dry-run (default) to preview");
+    }
+
+    let mut imported_tables = Vec::new();
+    for table_manifest in &manifest.tables {
+        let file_path = args.input.join(&table_manifest.file);
+        if !file_path.exists() {
+            bail!("archive file missing: {}", file_path.display());
+        }
+        let data = fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
+        let rows = data.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+        imported_tables.push(ArchiveTableImport {
+            name: table_manifest.name.clone(),
+            rows,
+            file: table_manifest.file.clone(),
+        });
+    }
+
+    Ok(ArchiveImportSnapshot {
+        input_dir: args.input.display().to_string(),
+        dry_run: true,
+        imported_tables,
+    })
+}
+
+fn cmd_archive_verify(path: &Path) -> Result<ArchiveManifest> {
+    let manifest_path = path.join("manifest.json");
+    let text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("missing manifest.json in {}", path.display()))?;
+    let manifest: ArchiveManifest = serde_json::from_str(&text).context("invalid manifest")?;
+
+    for table in &manifest.tables {
+        let file_path = path.join(&table.file);
+        if !file_path.exists() {
+            bail!("manifest references missing file: {}", file_path.display());
+        }
+        let data = fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
+        let actual_rows = data.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+        if actual_rows != table.rows {
+            bail!(
+                "row count mismatch for {}: manifest says {}, file has {}",
+                table.name,
+                table.rows,
+                actual_rows
+            );
+        }
+    }
+
+    Ok(manifest)
+}
+
+fn cmd_config_detect() -> ConfigDetectSnapshot {
+    ConfigDetectSnapshot {
+        sources: moraine_config::discover_sources(),
+    }
+}
+
+fn cmd_config_validate(cfg: &AppConfig) -> ConfigValidateSnapshot {
+    let issues = moraine_config::validate_sources(&cfg.ingest.sources);
+    ConfigValidateSnapshot {
+        ok: issues.is_empty(),
+        issues,
+    }
+}
+
+fn cmd_config_wizard(cfg_path: &Path, cfg: &AppConfig) -> Result<()> {
+    let discovered = moraine_config::discover_sources();
+    println!("Moraine Config Wizard");
+    println!("=====================\n");
+
+    let existing_names: std::collections::HashSet<String> =
+        cfg.ingest.sources.iter().map(|s| s.name.clone()).collect();
+
+    let mut to_add = Vec::new();
+    for src in discovered {
+        if !src.exists {
+            continue;
+        }
+        if existing_names.contains(&src.name) {
+            println!("[skip] source '{}' already configured", src.name);
+            continue;
+        }
+        print!("Add source '{}' ({})? [Y/n] ", src.name, src.glob);
+        std::io::stdout().flush()?;
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        let answer = buf.trim().to_ascii_lowercase();
+        if answer.is_empty() || answer.starts_with('y') {
+            to_add.push(src);
+        }
+    }
+
+    if to_add.is_empty() {
+        println!("\nNo new sources selected.");
+        return Ok(());
+    }
+
+    println!("\nPreview of sources to add:");
+    for src in &to_add {
+        println!("  [[ingest.sources]]");
+        println!("  name = {:?}", src.name);
+        println!("  harness = {:?}", src.harness);
+        println!("  enabled = true");
+        println!("  glob = {:?}", src.glob);
+        println!("  watch_root = {:?}", src.watch_root);
+        println!("  format = {:?}", src.format);
+        println!();
+    }
+
+    print!("Write to {}? [Y/n] ", cfg_path.display());
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    let answer = buf.trim().to_ascii_lowercase();
+    if !answer.is_empty() && !answer.starts_with('y') {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    if cfg_path.exists() {
+        let backup = cfg_path.with_extension("toml.bak");
+        fs::copy(cfg_path, &backup)
+            .with_context(|| format!("failed to write backup {}", backup.display()))?;
+        println!("Backed up existing config to {}", backup.display());
+    }
+
+    let mut toml_text = fs::read_to_string(cfg_path).unwrap_or_default();
+    for src in &to_add {
+        toml_text.push_str("\n[[ingest.sources]]\n");
+        toml_text.push_str(&format!("name = {:?}\n", src.name));
+        toml_text.push_str(&format!("harness = {:?}\n", src.harness));
+        toml_text.push_str("enabled = true\n");
+        toml_text.push_str(&format!("glob = {:?}\n", src.glob));
+        toml_text.push_str(&format!("watch_root = {:?}\n", src.watch_root));
+        toml_text.push_str(&format!("format = {:?}\n", src.format));
+    }
+    fs::write(cfg_path, toml_text)
+        .with_context(|| format!("failed to write config {}", cfg_path.display()))?;
+    println!("Config updated.");
+
+    Ok(())
+}
+
+fn render_import_sync(output: &CliOutput, result: &SyncResult) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(result)?);
+        return Ok(());
+    }
+    let lines = vec![
+        format!("profile: {}", result.profile_name),
+        format!("success: {}", result.success),
+        format!("files copied: {}", result.manifest.files_copied),
+        format!("bytes copied: {}", result.manifest.bytes_copied),
+        format!("duration: {}ms", result.manifest.duration_ms),
+    ];
+    output.section("Import Sync", &lines);
+    Ok(())
+}
+
+fn render_import_status(output: &CliOutput, snapshot: &ImportStatusSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = snapshot
+        .profiles
+        .iter()
+        .map(|p| {
+            let last_sync = p
+                .last_sync
+                .as_ref()
+                .map(|m| format!("{} ({} files)", m.synced_at, m.files_copied))
+                .unwrap_or_else(|| "never".to_string());
+            vec![
+                p.name.clone(),
+                p.host.clone(),
+                p.local_mirror.clone(),
+                p.cadence.clone(),
+                last_sync,
+            ]
+        })
+        .collect();
+    output.table(
+        "Import Profiles",
+        &["name", "host", "mirror", "cadence", "last_sync"],
+        &rows,
+    );
+    Ok(())
+}
+
+fn render_archive_export(output: &CliOutput, snapshot: &ArchiveExportSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![format!("output dir: {}", snapshot.output_dir)];
+    for table in &snapshot.manifest.tables {
+        lines.push(format!(
+            "  {}: {} rows ({})",
+            table.name, table.rows, table.file
+        ));
+    }
+    output.section("Archive Export", &lines);
+    Ok(())
+}
+
+fn render_archive_import(output: &CliOutput, snapshot: &ArchiveImportSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![
+        format!("input dir: {}", snapshot.input_dir),
+        format!("dry run: {}", snapshot.dry_run),
+    ];
+    for table in &snapshot.imported_tables {
+        lines.push(format!(
+            "  {}: {} rows ({})",
+            table.name, table.rows, table.file
+        ));
+    }
+    output.section("Archive Import", &lines);
+    Ok(())
+}
+
+fn render_archive_verify(output: &CliOutput, manifest: &ArchiveManifest) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(manifest)?);
+        return Ok(());
+    }
+    let mut lines = vec![
+        format!("schema version: {}", manifest.schema_version),
+        format!("exported at: {}", manifest.exported_at),
+    ];
+    for table in &manifest.tables {
+        lines.push(format!(
+            "  {}: {} rows ({})",
+            table.name, table.rows, table.file
+        ));
+    }
+    output.section("Archive Verify", &lines);
+    Ok(())
+}
+
+fn render_config_detect(output: &CliOutput, snapshot: &ConfigDetectSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = snapshot
+        .sources
+        .iter()
+        .map(|s| {
+            vec![
+                s.name.clone(),
+                s.harness.clone(),
+                s.glob.clone(),
+                if s.exists {
+                    "found".to_string()
+                } else {
+                    "missing".to_string()
+                },
+            ]
+        })
+        .collect();
+    output.table(
+        "Discovered Sources",
+        &["name", "harness", "glob", "status"],
+        &rows,
+    );
+    Ok(())
+}
+
+fn render_config_validate(output: &CliOutput, snapshot: &ConfigValidateSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    if snapshot.ok {
+        output.section("Config Validate", &["ok".to_string()]);
+    } else {
+        let lines: Vec<String> = snapshot.issues.iter().map(|i| format!("{:?}", i)).collect();
+        output.section("Config Validate", &lines);
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
@@ -2715,7 +3304,7 @@ async fn main() -> Result<ExitCode> {
             }
         }
         CliCommand::Config(args) => {
-            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let (config_path, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
                 ConfigCommand::Get(get) => {
                     let value = cmd_config_get(&cfg, &get.key)?;
@@ -2730,6 +3319,24 @@ async fn main() -> Result<ExitCode> {
                     } else {
                         println!("{value}");
                     }
+                    Ok(ExitCode::SUCCESS)
+                }
+                ConfigCommand::Detect(_) => {
+                    let snapshot = cmd_config_detect();
+                    render_config_detect(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ConfigCommand::Validate => {
+                    let snapshot = cmd_config_validate(&cfg);
+                    render_config_validate(&output, &snapshot)?;
+                    if snapshot.ok {
+                        Ok(ExitCode::SUCCESS)
+                    } else {
+                        Ok(ExitCode::from(1))
+                    }
+                }
+                ConfigCommand::Wizard => {
+                    cmd_config_wizard(&config_path, &cfg)?;
                     Ok(ExitCode::SUCCESS)
                 }
             }
@@ -2750,6 +3357,41 @@ async fn main() -> Result<ExitCode> {
                 SourcesCommand::Errors(errors) => {
                     let snapshot = cmd_sources_errors(&cfg, &errors.source, errors.limit).await?;
                     render_sources_errors(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        CliCommand::Import(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                ImportCommand::Sync(sync) => {
+                    let result = cmd_import_sync(&cfg, &sync.name, sync.dry_run).await?;
+                    render_import_sync(&output, &result)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ImportCommand::Status => {
+                    let snapshot = cmd_import_status(&cfg).await?;
+                    render_import_status(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        CliCommand::Archive(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                ArchiveCommand::Export(export) => {
+                    let snapshot = cmd_archive_export(&cfg, &export).await?;
+                    render_archive_export(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ArchiveCommand::Import(import) => {
+                    let snapshot = cmd_archive_import(&cfg, &import).await?;
+                    render_archive_import(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ArchiveCommand::Verify(verify) => {
+                    let manifest = cmd_archive_verify(&verify.path)?;
+                    render_archive_verify(&output, &manifest)?;
                     Ok(ExitCode::SUCCESS)
                 }
             }
@@ -3293,5 +3935,162 @@ mod tests {
 
         assert_eq!(managed_clickhouse_checksum_state(&cfg, &paths), "verified");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_verify_passes_for_valid_archive() {
+        let root = temp_dir("archive-verify");
+        let manifest = ArchiveManifest {
+            schema_version: "0.4.3".to_string(),
+            moraine_version: "0.4.3".to_string(),
+            exported_at: "12345".to_string(),
+            tables: vec![ArchiveTableManifest {
+                name: "events".to_string(),
+                rows: 2,
+                file: "events.jsonl".to_string(),
+            }],
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .expect("write manifest");
+        fs::write(
+            root.join("events.jsonl"),
+            "{\"event_uid\":\"a\"}\n{\"event_uid\":\"b\"}\n",
+        )
+        .expect("write events");
+
+        let verified = cmd_archive_verify(&root).expect("verify");
+        assert_eq!(verified.tables[0].rows, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_verify_fails_when_row_count_mismatch() {
+        let root = temp_dir("archive-verify-mismatch");
+        let manifest = ArchiveManifest {
+            schema_version: "0.4.3".to_string(),
+            moraine_version: "0.4.3".to_string(),
+            exported_at: "12345".to_string(),
+            tables: vec![ArchiveTableManifest {
+                name: "events".to_string(),
+                rows: 5,
+                file: "events.jsonl".to_string(),
+            }],
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .expect("write manifest");
+        fs::write(root.join("events.jsonl"), "{\"event_uid\":\"a\"}\n").expect("write events");
+
+        let err = cmd_archive_verify(&root).expect_err("verify should fail");
+        assert!(err.to_string().contains("row count mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clap_parses_import_sync_name() {
+        let cli = Cli::parse_from(["moraine", "import", "sync", "vm503"]);
+        match cli.command {
+            CliCommand::Import(ImportArgs {
+                command: ImportCommand::Sync(sync),
+            }) => assert_eq!(sync.name, "vm503"),
+            _ => panic!("expected import sync command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_export_flags() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "archive",
+            "export",
+            "--out-dir",
+            "/tmp/export",
+            "--session-ids",
+            "a,b",
+            "--since",
+            "7d",
+            "--raw",
+        ]);
+        match cli.command {
+            CliCommand::Archive(ArchiveArgs {
+                command: ArchiveCommand::Export(export),
+            }) => {
+                assert_eq!(export.out_dir, PathBuf::from("/tmp/export"));
+                assert_eq!(
+                    export.session_ids,
+                    Some(vec!["a".to_string(), "b".to_string()])
+                );
+                assert_eq!(export.since, Some("7d".to_string()));
+                assert!(export.raw);
+            }
+            _ => panic!("expected archive export command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_import_dry_run() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "archive",
+            "import",
+            "--input",
+            "/tmp/import",
+            "--dry-run",
+        ]);
+        match cli.command {
+            CliCommand::Archive(ArchiveArgs {
+                command: ArchiveCommand::Import(import),
+            }) => {
+                assert_eq!(import.input, PathBuf::from("/tmp/import"));
+                assert!(import.dry_run);
+            }
+            _ => panic!("expected archive import command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_config_detect_json() {
+        let cli = Cli::parse_from(["moraine", "config", "detect", "--json"]);
+        match cli.command {
+            CliCommand::Config(ConfigArgs {
+                command: ConfigCommand::Detect(detect),
+            }) => assert!(detect.json),
+            _ => panic!("expected config detect command"),
+        }
+    }
+
+    #[test]
+    fn cmd_config_validate_reports_overlap() {
+        use moraine_config::IngestSource;
+        let mut cfg = AppConfig::default();
+        cfg.ingest.sources = vec![
+            IngestSource {
+                name: "a".to_string(),
+                harness: "codex".to_string(),
+                enabled: true,
+                glob: "/tmp/a/**/*.jsonl".to_string(),
+                watch_root: "/tmp/a".to_string(),
+                format: "jsonl".to_string(),
+            },
+            IngestSource {
+                name: "b".to_string(),
+                harness: "codex".to_string(),
+                enabled: true,
+                glob: "/tmp/a/b/**/*.jsonl".to_string(),
+                watch_root: "/tmp/a/b".to_string(),
+                format: "jsonl".to_string(),
+            },
+        ];
+        let snapshot = cmd_config_validate(&cfg);
+        assert!(!snapshot.ok);
+        assert!(snapshot.issues.iter().any(|i| matches!(
+            i,
+            moraine_config::SourceValidationIssue::OverlappingWatchRoot { .. }
+        )));
     }
 }

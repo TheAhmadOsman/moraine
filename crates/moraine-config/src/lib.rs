@@ -142,20 +142,15 @@ pub struct RuntimeConfig {
     pub start_mcp_on_up: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionMode {
+    #[default]
     StoreRaw,
     HashRaw,
     RedactRaw,
     DropRaw,
     EncryptRaw,
-}
-
-impl Default for RedactionMode {
-    fn default() -> Self {
-        RedactionMode::StoreRaw
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,6 +185,23 @@ impl Default for PrivacyConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+pub struct ImportProfile {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub remote_paths: Vec<String>,
+    #[serde(default)]
+    pub local_mirror: String,
+    #[serde(default)]
+    pub include_patterns: Vec<String>,
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
+    #[serde(default = "default_import_cadence")]
+    pub cadence: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
@@ -205,6 +217,8 @@ pub struct AppConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    #[serde(default)]
+    pub imports: std::collections::HashMap<String, ImportProfile>,
 }
 
 impl Default for ClickHouseConfig {
@@ -723,6 +737,13 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         )?;
     }
 
+    for profile in cfg.imports.values_mut() {
+        profile.local_mirror = expand_path(&profile.local_mirror);
+        for p in &mut profile.remote_paths {
+            *p = expand_path(p);
+        }
+    }
+
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);
     cfg.runtime.root_dir = expand_path(&cfg.runtime.root_dir);
     cfg.runtime.logs_dir = resolve_runtime_subdir(&cfg.runtime.root_dir, &cfg.runtime.logs_dir);
@@ -731,6 +752,157 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.runtime.managed_clickhouse_dir = expand_path(&cfg.runtime.managed_clickhouse_dir);
 
     Ok(cfg)
+}
+
+fn default_import_cadence() -> String {
+    "manual".to_string()
+}
+
+/// A candidate source discovered by scanning well-known directories.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredSource {
+    pub name: String,
+    pub harness: String,
+    pub glob: String,
+    pub watch_root: String,
+    pub format: String,
+    pub exists: bool,
+}
+
+/// Scan common agent session directories and return candidate sources.
+pub fn discover_sources() -> Vec<DiscoveredSource> {
+    let mut candidates = Vec::new();
+
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().to_string());
+
+    if let Some(ref home) = home {
+        let codex_root = format!("{home}/.codex/sessions");
+        candidates.push(DiscoveredSource {
+            name: "codex".to_string(),
+            harness: "codex".to_string(),
+            glob: format!("{codex_root}/**/*.jsonl"),
+            watch_root: codex_root.clone(),
+            format: SOURCE_FORMAT_JSONL.to_string(),
+            exists: std::path::Path::new(&codex_root).is_dir(),
+        });
+
+        let claude_root = format!("{home}/.claude/projects");
+        candidates.push(DiscoveredSource {
+            name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            glob: format!("{claude_root}/**/*.jsonl"),
+            watch_root: claude_root.clone(),
+            format: SOURCE_FORMAT_JSONL.to_string(),
+            exists: std::path::Path::new(&claude_root).is_dir(),
+        });
+
+        let kimi_root = format!("{home}/.kimi/sessions");
+        candidates.push(DiscoveredSource {
+            name: "kimi-cli".to_string(),
+            harness: "kimi-cli".to_string(),
+            glob: format!("{kimi_root}/**/wire.jsonl"),
+            watch_root: kimi_root.clone(),
+            format: SOURCE_FORMAT_JSONL.to_string(),
+            exists: std::path::Path::new(&kimi_root).is_dir(),
+        });
+
+        let hermes_root = format!("{home}/.hermes/sessions");
+        candidates.push(DiscoveredSource {
+            name: "hermes".to_string(),
+            harness: "hermes".to_string(),
+            glob: format!("{hermes_root}/session_*.json"),
+            watch_root: hermes_root.clone(),
+            format: SOURCE_FORMAT_SESSION_JSON.to_string(),
+            exists: std::path::Path::new(&hermes_root).is_dir(),
+        });
+
+        let opencode_path = format!("{home}/.local/share/opencode/opencode.db");
+        let opencode_root = format!("{home}/.local/share/opencode");
+        candidates.push(DiscoveredSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            glob: opencode_path.clone(),
+            watch_root: opencode_root.clone(),
+            format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
+            exists: std::path::Path::new(&opencode_path).is_file(),
+        });
+    }
+
+    candidates
+}
+
+/// An issue found while validating a source configuration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceValidationIssue {
+    MissingDirectory {
+        source: String,
+        path: String,
+    },
+    UnknownFormat {
+        source: String,
+        format: String,
+    },
+    OverlappingWatchRoot {
+        source_a: String,
+        source_b: String,
+        root: String,
+    },
+}
+
+/// Validate a list of sources for common configuration mistakes.
+pub fn validate_sources(sources: &[IngestSource]) -> Vec<SourceValidationIssue> {
+    let mut issues = Vec::new();
+
+    for source in sources {
+        if !source.enabled {
+            continue;
+        }
+        let resolved = expand_path(&source.watch_root);
+        let path = std::path::Path::new(&resolved);
+        if !path.exists() {
+            issues.push(SourceValidationIssue::MissingDirectory {
+                source: source.name.clone(),
+                path: resolved,
+            });
+        }
+
+        let fmt = source.format.trim().to_ascii_lowercase();
+        if !fmt.is_empty()
+            && fmt != SOURCE_FORMAT_JSONL
+            && fmt != SOURCE_FORMAT_SESSION_JSON
+            && fmt != SOURCE_FORMAT_OPENCODE_SQLITE
+        {
+            issues.push(SourceValidationIssue::UnknownFormat {
+                source: source.name.clone(),
+                format: source.format.clone(),
+            });
+        }
+    }
+
+    for i in 0..sources.len() {
+        for j in (i + 1)..sources.len() {
+            let a = &sources[i];
+            let b = &sources[j];
+            if !a.enabled || !b.enabled {
+                continue;
+            }
+            let root_a = expand_path(&a.watch_root);
+            let root_b = expand_path(&b.watch_root);
+            if root_a.starts_with(&root_b) || root_b.starts_with(&root_a) {
+                issues.push(SourceValidationIssue::OverlappingWatchRoot {
+                    source_a: a.name.clone(),
+                    source_b: b.name.clone(),
+                    root: if root_a.starts_with(&root_b) {
+                        root_b.clone()
+                    } else {
+                        root_a.clone()
+                    },
+                });
+            }
+        }
+    }
+
+    issues
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {

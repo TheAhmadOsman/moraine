@@ -261,3 +261,70 @@ Legacy wrappers remain only as fail-fast stubs:
 4. If monitor APIs degrade, run `bin/moraine run monitor` in foreground for direct error output.
 5. If MCP retrieval degrades, verify `search_*` tables in doctor output and rerun `db migrate`.
 6. If MCP hosts reject tool calls, inspect `tools/list`; unknown input fields are intentionally rejected by strict schemas.
+
+## Remote Import Profiles
+
+Import profiles copy agent session files from remote machines into a local mirror directory that can be ingested as a source. Configure a profile under `[imports.<name>]` in `config.toml`:
+
+```toml
+[imports.vm503]
+host = "vm503.local"
+remote_paths = ["~/.codex/sessions", "~/.claude/projects"]
+local_mirror = "~/.moraine/imports/vm503"
+include_patterns = ["**/*.jsonl", "**/*.json"]
+exclude_patterns = ["**/.git"]
+cadence = "manual"
+```
+
+Commands:
+
+- `moraine import sync <name>` — run rsync for the profile and record a manifest.
+- `moraine import status` — show all profiles and their last sync manifest.
+
+Sync manifests are stored as JSON under `~/.moraine/imports/<name>.json`.
+
+## Portable Archives
+
+Export and import subsets of the corpus as portable JSONL archives.
+
+Export:
+
+```bash
+moraine archive export --out-dir ./archive --since 7d
+moraine archive export --out-dir ./archive --session-ids sess-1,sess-2 --raw
+```
+
+Import:
+
+```bash
+moraine archive import --input ./archive --dry-run
+moraine archive import --input ./archive
+```
+
+Verify an archive without importing:
+
+```bash
+moraine archive verify ./archive
+```
+
+Each archive contains a `manifest.json` with schema version and row counts, plus `.jsonl` files per table (`events`, `event_links`, `tool_io`, and optionally `raw_events`).
+
+## Config Wizard and Validation
+
+Auto-discover common agent session directories:
+
+```bash
+moraine config detect --json
+```
+
+Validate the current config for missing directories, unknown formats, and overlapping watch roots:
+
+```bash
+moraine config validate
+```
+
+Run an interactive wizard to add discovered sources to your config (with automatic backup):
+
+```bash
+moraine config wizard
+```
