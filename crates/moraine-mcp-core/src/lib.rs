@@ -50,6 +50,7 @@ struct ToolCallParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     query: String,
     #[serde(default)]
@@ -89,6 +90,7 @@ impl SearchEventKindsArg {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchConversationsArgs {
     query: String,
     #[serde(default)]
@@ -114,6 +116,7 @@ struct SearchConversationsArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListSessionsArgs {
     #[serde(default)]
     limit: Option<u16>,
@@ -132,6 +135,7 @@ struct ListSessionsArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetSessionArgs {
     session_id: String,
     #[serde(default)]
@@ -139,6 +143,7 @@ struct GetSessionArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpenArgs {
     #[serde(default)]
     event_uid: Option<String>,
@@ -228,6 +233,7 @@ impl OpenPayloadArg {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetSessionEventsArgs {
     session_id: String,
     #[serde(default)]
@@ -648,212 +654,7 @@ impl AppState {
     }
 
     fn tools_list_result(&self) -> Value {
-        let (limit_min, limit_max) = tool_limit_bounds(self.cfg.mcp.max_results);
-        json!({
-            "tools": [
-                {
-                    "name": "search",
-                    "description": "BM25 lexical search over Moraine indexed conversation events. Bag-of-words ranking: no phrase matching, no stemming. Word order does not matter.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
-                            "session_id": { "type": "string" },
-                            "min_score": { "type": "number" },
-                            "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
-                            "include_tool_events": { "type": "boolean" },
-                            "event_kind": {
-                                "oneOf": [
-                                    {
-                                        "type": "string",
-                                        "enum": ["message", "reasoning", "tool_call", "tool_result"]
-                                    },
-                                    {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "enum": ["message", "reasoning", "tool_call", "tool_result"]
-                                        }
-                                    }
-                                ]
-                            },
-                            "exclude_codex_mcp": { "type": "boolean" },
-                            "include_payload_json": {
-                                "type": "boolean",
-                                "default": false,
-                                "description": "Include truncated payload_json for user-facing message events."
-                            },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "open",
-                    "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`. Callers must supply exactly one of `event_uid` or `session_id`.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "event_uid": { "type": "string" },
-                            "session_id": { "type": "string" },
-                            "scope": {
-                                "type": "string",
-                                "enum": ["all", "messages", "events", "turns"],
-                                "default": "all"
-                            },
-                            "include_payload": {
-                                "oneOf": [
-                                    {
-                                        "type": "string",
-                                        "enum": ["text", "payload_json"]
-                                    },
-                                    {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "enum": ["text", "payload_json"]
-                                        }
-                                    }
-                                ]
-                            },
-                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
-                            "cursor": { "type": "string" },
-                            "before": { "type": "integer", "minimum": 0 },
-                            "after": { "type": "integer", "minimum": 0 },
-                            "include_system_events": { "type": "boolean", "default": false },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "search_conversations",
-                    "description": format!(
-                        "BM25 lexical search across whole conversations. {CONVERSATION_MODE_CLASSIFICATION_SEMANTICS} {SEARCH_CONVERSATIONS_MODE_DOC}"
-                    ),
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
-                            "min_score": { "type": "number" },
-                            "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
-                            "from_unix_ms": { "type": "integer" },
-                            "to_unix_ms": { "type": "integer" },
-                            "mode": {
-                                "type": "string",
-                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
-                                "description": SEARCH_CONVERSATIONS_MODE_DOC
-                            },
-                            "include_tool_events": { "type": "boolean" },
-                            "exclude_codex_mcp": { "type": "boolean" },
-                            "include_payload_json": {
-                                "type": "boolean",
-                                "default": false,
-                                "description": "Include truncated payload_json for the best event per hit when user-facing."
-                            },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "list_sessions",
-                    "description": "List session metadata in a time window without requiring a search query.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
-                            "cursor": { "type": "string" },
-                            "from_unix_ms": { "type": "integer" },
-                            "to_unix_ms": { "type": "integer" },
-                            "mode": {
-                                "type": "string",
-                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
-                                "description": SEARCH_CONVERSATIONS_MODE_DOC
-                            },
-                            "sort": {
-                                "type": "string",
-                                "enum": ["asc", "desc"],
-                                "default": "desc",
-                                "description": "Sort by session end time then session_id. Use `desc` for newest-first or `asc` for oldest-first. Cursor tokens are deterministic for a fixed filter + sort."
-                            },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "get_session",
-                    "description": "Fetch stable metadata for one summarized session by session_id without loading full event history. Returns found=false when the session is absent from session summary metadata.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": { "type": "string" },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        },
-                        "required": ["session_id"]
-                    }
-                },
-                {
-                    "name": "get_session_events",
-                    "description": "Fetch an ordered timeline of events for one session with deterministic pagination. Results follow `direction` (`forward` = chronological, `reverse` = newest-first).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
-                            "cursor": { "type": "string" },
-                            "direction": {
-                                "type": "string",
-                                "enum": ["forward", "reverse"],
-                                "default": "forward"
-                            },
-                            "event_kind": {
-                                "oneOf": [
-                                    {
-                                        "type": "string",
-                                        "enum": ["message", "reasoning", "tool_call", "tool_result"]
-                                    },
-                                    {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "enum": ["message", "reasoning", "tool_call", "tool_result"]
-                                        }
-                                    }
-                                ]
-                            },
-                            "verbosity": {
-                                "type": "string",
-                                "enum": ["prose", "full"],
-                                "default": "prose"
-                            }
-                        },
-                        "required": ["session_id"]
-                    }
-                }
-            ]
-        })
+        tools_list_result_for_max_results(self.cfg.mcp.max_results)
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
@@ -1381,6 +1182,571 @@ impl AppState {
         let result = self.repo.get_session_metadata(&session_id).await;
         Self::build_get_session_payload(session_id, result)
     }
+}
+
+fn tools_list_result_for_max_results(max_results: u16) -> Value {
+    let (limit_min, limit_max) = tool_limit_bounds(max_results);
+    json!({
+        "tools": [
+            {
+                "name": "search",
+                "description": "BM25 lexical search over Moraine indexed conversation events. Bag-of-words ranking: no phrase matching, no stemming. Word order does not matter.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query string. Bag-of-words ranking: no phrase matching, no stemming. Word order does not matter." },
+                        "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max, "description": "Maximum number of results to return." },
+                        "session_id": { "type": "string", "description": "Filter results to a specific session_id." },
+                        "min_score": { "type": "number", "minimum": 0.0, "description": "Minimum BM25 score threshold." },
+                        "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
+                        "include_tool_events": { "type": "boolean", "description": "Whether to include tool events in results." },
+                        "event_kind": event_kind_input_schema(),
+                        "exclude_codex_mcp": { "type": "boolean", "description": "Whether to exclude Codex MCP internal search/open events." },
+                        "include_payload_json": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include truncated payload_json for user-facing message events."
+                        },
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                },
+                "outputSchema": search_output_schema()
+            },
+            {
+                "name": "open",
+                "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`. Callers must supply exactly one of `event_uid` or `session_id`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "event_uid": { "type": "string", "description": "Open one event by uid and include surrounding context." },
+                        "session_id": { "type": "string", "description": "Open one session transcript page." },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["all", "messages", "events", "turns"],
+                            "default": "all"
+                        },
+                        "include_payload": open_payload_input_schema(),
+                        "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                        "cursor": { "type": "string" },
+                        "before": { "type": "integer", "minimum": 0 },
+                        "after": { "type": "integer", "minimum": 0 },
+                        "include_system_events": { "type": "boolean", "default": false },
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "oneOf": [
+                        {
+                            "required": ["event_uid"],
+                            "not": { "required": ["session_id"] }
+                        },
+                        {
+                            "required": ["session_id"],
+                            "not": { "required": ["event_uid"] }
+                        }
+                    ],
+                    "additionalProperties": false
+                },
+                "outputSchema": open_output_schema()
+            },
+            {
+                "name": "search_conversations",
+                "description": format!(
+                    "BM25 lexical search across whole conversations. {CONVERSATION_MODE_CLASSIFICATION_SEMANTICS} {SEARCH_CONVERSATIONS_MODE_DOC}"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                        "min_score": { "type": "number", "minimum": 0.0 },
+                        "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
+                        "from_unix_ms": { "type": "integer" },
+                        "to_unix_ms": { "type": "integer" },
+                        "mode": mode_input_schema(),
+                        "include_tool_events": { "type": "boolean" },
+                        "exclude_codex_mcp": { "type": "boolean" },
+                        "include_payload_json": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include truncated payload_json for the best event per hit when user-facing."
+                        },
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                },
+                "outputSchema": search_conversations_output_schema()
+            },
+            {
+                "name": "list_sessions",
+                "description": "List session metadata in a time window without requiring a search query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                        "cursor": { "type": "string" },
+                        "from_unix_ms": { "type": "integer" },
+                        "to_unix_ms": { "type": "integer" },
+                        "mode": mode_input_schema(),
+                        "sort": {
+                            "type": "string",
+                            "enum": ["asc", "desc"],
+                            "default": "desc",
+                            "description": "Sort by session end time then session_id. Use `desc` for newest-first or `asc` for oldest-first. Cursor tokens are deterministic for a fixed filter + sort."
+                        },
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "additionalProperties": false
+                },
+                "outputSchema": list_sessions_output_schema()
+            },
+            {
+                "name": "get_session",
+                "description": "Fetch stable metadata for one summarized session by session_id without loading full event history. Returns found=false when the session is absent from session summary metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                },
+                "outputSchema": get_session_output_schema()
+            },
+            {
+                "name": "get_session_events",
+                "description": "Fetch an ordered timeline of events for one session with deterministic pagination. Results follow `direction` (`forward` = chronological, `reverse` = newest-first).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
+                        "cursor": { "type": "string" },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "reverse"],
+                            "default": "forward"
+                        },
+                        "event_kind": event_kind_input_schema(),
+                        "verbosity": verbosity_input_schema()
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                },
+                "outputSchema": get_session_events_output_schema()
+            }
+        ]
+    })
+}
+
+fn verbosity_input_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["prose", "full"],
+        "default": "prose",
+        "description": "Response format: prose (human-readable text) or full (raw JSON structuredContent)."
+    })
+}
+
+fn mode_input_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
+        "description": SEARCH_CONVERSATIONS_MODE_DOC
+    })
+}
+
+fn event_kind_input_schema() -> Value {
+    json!({
+        "description": "Filter to specific event kind(s).",
+        "oneOf": [
+            {
+                "type": "string",
+                "enum": ["message", "reasoning", "tool_call", "tool_result"]
+            },
+            {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                }
+            }
+        ]
+    })
+}
+
+fn open_payload_input_schema() -> Value {
+    json!({
+        "description": "Optional event payload fields to include in session transcript pages.",
+        "oneOf": [
+            {
+                "type": "string",
+                "enum": ["text", "payload_json"]
+            },
+            {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["text", "payload_json"]
+                }
+            }
+        ]
+    })
+}
+
+fn nullable_string_schema(description: &str) -> Value {
+    json!({
+        "type": ["string", "null"],
+        "description": description
+    })
+}
+
+fn nullable_integer_schema(description: &str) -> Value {
+    json!({
+        "type": ["integer", "null"],
+        "description": description
+    })
+}
+
+fn string_array_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": description
+    })
+}
+
+fn stats_output_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": true,
+        "properties": {
+            "docs": { "type": "integer" },
+            "avgdl": { "type": "number" },
+            "took_ms": { "type": "integer" },
+            "result_count": { "type": "integer" },
+            "requested_limit": { "type": "integer" },
+            "effective_limit": { "type": "integer" },
+            "limit_capped": { "type": "boolean" }
+        }
+    })
+}
+
+fn search_hit_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "rank": { "type": "integer" },
+            "event_uid": { "type": "string" },
+            "session_id": { "type": "string" },
+            "first_event_time": { "type": "string" },
+            "last_event_time": { "type": "string" },
+            "source_name": { "type": "string" },
+            "harness": { "type": "string" },
+            "inference_provider": { "type": "string" },
+            "score": { "type": "number" },
+            "matched_terms": { "type": "integer" },
+            "event_class": { "type": "string" },
+            "payload_type": { "type": "string" },
+            "actor_role": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "text_preview": { "type": "string" },
+            "text_content": nullable_string_schema("Full text content when permitted by content policy."),
+            "payload_json": nullable_string_schema("Raw payload JSON when explicitly requested and permitted by content policy.")
+        }
+    })
+}
+
+fn search_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured search result payload returned when verbosity is full.",
+        "additionalProperties": true,
+        "properties": {
+            "query_id": { "type": "string" },
+            "query": { "type": "string" },
+            "terms": string_array_schema("Tokenized query terms."),
+            "stats": stats_output_schema("Search execution and limit metadata."),
+            "hits": {
+                "type": "array",
+                "items": search_hit_output_schema()
+            }
+        },
+        "required": ["query_id", "query", "terms", "stats", "hits"]
+    })
+}
+
+fn conversation_hit_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "rank": { "type": "integer" },
+            "session_id": { "type": "string" },
+            "first_event_time": nullable_string_schema("First event timestamp for the session."),
+            "first_event_unix_ms": nullable_integer_schema("First event unix timestamp in milliseconds."),
+            "last_event_time": nullable_string_schema("Last event timestamp for the session."),
+            "last_event_unix_ms": nullable_integer_schema("Last event unix timestamp in milliseconds."),
+            "harness": nullable_string_schema("Harness associated with the matching session."),
+            "inference_provider": nullable_string_schema("Inference provider associated with the matching session."),
+            "session_slug": nullable_string_schema("Human-oriented session slug when available."),
+            "session_summary": nullable_string_schema("Session summary when available."),
+            "score": { "type": "number" },
+            "matched_terms": { "type": "integer" },
+            "event_count_considered": { "type": "integer" },
+            "best_event_uid": nullable_string_schema("Best matching event uid when available."),
+            "snippet": nullable_string_schema("Best match snippet."),
+            "text_preview": nullable_string_schema("Best event text preview."),
+            "text_content": nullable_string_schema("Full best-event text when present."),
+            "payload_json": nullable_string_schema("Best-event payload JSON when explicitly requested.")
+        }
+    })
+}
+
+fn search_conversations_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured conversation search result payload returned when verbosity is full.",
+        "additionalProperties": true,
+        "properties": {
+            "query_id": { "type": "string" },
+            "query": { "type": "string" },
+            "terms": string_array_schema("Tokenized query terms."),
+            "stats": stats_output_schema("Conversation search execution and limit metadata."),
+            "hits": {
+                "type": "array",
+                "items": conversation_hit_output_schema()
+            }
+        },
+        "required": ["query_id", "query", "terms", "stats", "hits"]
+    })
+}
+
+fn open_event_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "is_target": { "type": "boolean" },
+            "session_id": { "type": "string" },
+            "event_uid": { "type": "string" },
+            "event_order": { "type": "integer" },
+            "turn_seq": { "type": "integer" },
+            "event_time": { "type": "string" },
+            "actor_role": { "type": "string" },
+            "event_class": { "type": "string" },
+            "payload_type": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "text_content": { "type": "string" },
+            "payload_json": { "type": "string" }
+        }
+    })
+}
+
+fn turn_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "turn_seq": { "type": "integer" },
+            "started_at": { "type": "string" },
+            "started_at_unix_ms": { "type": "integer" },
+            "ended_at": { "type": "string" },
+            "ended_at_unix_ms": { "type": "integer" },
+            "event_count": { "type": "integer" },
+            "user_messages": { "type": "integer" },
+            "assistant_messages": { "type": "integer" },
+            "tool_calls": { "type": "integer" },
+            "tool_results": { "type": "integer" }
+        }
+    })
+}
+
+fn open_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured open payload. Event opens return event context; session opens return a paginated transcript page.",
+        "additionalProperties": true,
+        "properties": {
+            "open_mode": { "type": "string", "enum": ["session"] },
+            "found": { "type": "boolean" },
+            "event_uid": { "type": "string" },
+            "session_id": { "type": "string" },
+            "scope": { "type": "string", "enum": ["all", "messages", "events", "turns"] },
+            "target_event_order": { "type": "integer" },
+            "turn_seq": { "type": "integer" },
+            "before": { "type": "integer" },
+            "after": { "type": "integer" },
+            "include_system_events": { "type": "boolean" },
+            "include_payload": string_array_schema("Payload fields included in session events."),
+            "limit": { "type": "integer" },
+            "cursor": nullable_string_schema("Input pagination cursor."),
+            "next_cursor": nullable_string_schema("Cursor for the next transcript page."),
+            "summary": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "start_time": { "type": "string" },
+                    "start_unix_ms": { "type": "integer" },
+                    "end_time": { "type": "string" },
+                    "end_unix_ms": { "type": "integer" },
+                    "event_count": { "type": "integer" },
+                    "turn_count": { "type": "integer" }
+                }
+            },
+            "turns": {
+                "type": "array",
+                "items": turn_output_schema()
+            },
+            "events": {
+                "type": "array",
+                "items": open_event_output_schema()
+            }
+        },
+        "required": ["found", "events"]
+    })
+}
+
+fn session_summary_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "session_id": { "type": "string" },
+            "start_time": { "type": "string" },
+            "start_unix_ms": { "type": "integer" },
+            "end_time": { "type": "string" },
+            "end_unix_ms": { "type": "integer" },
+            "event_count": { "type": "integer" },
+            "turn_count": { "type": "integer" },
+            "user_messages": { "type": "integer" },
+            "assistant_messages": { "type": "integer" },
+            "tool_calls": { "type": "integer" },
+            "tool_results": { "type": "integer" },
+            "mode": { "type": "string", "enum": ["web_search", "mcp_internal", "tool_calling", "chat"] }
+        },
+        "required": ["session_id"]
+    })
+}
+
+fn list_sessions_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured session list payload returned when verbosity is full.",
+        "additionalProperties": true,
+        "properties": {
+            "from_unix_ms": nullable_integer_schema("Applied lower time bound."),
+            "to_unix_ms": nullable_integer_schema("Applied upper time bound."),
+            "mode": {
+                "type": ["string", "null"],
+                "enum": ["web_search", "mcp_internal", "tool_calling", "chat", null],
+                "description": SEARCH_CONVERSATIONS_MODE_DOC
+            },
+            "sort": { "type": "string", "enum": ["asc", "desc"] },
+            "sessions": {
+                "type": "array",
+                "items": session_summary_output_schema()
+            },
+            "next_cursor": nullable_string_schema("Cursor for the next session page.")
+        },
+        "required": ["sessions", "next_cursor"]
+    })
+}
+
+fn get_session_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured session metadata lookup payload returned when verbosity is full.",
+        "additionalProperties": true,
+        "properties": {
+            "found": { "type": "boolean" },
+            "session_id": { "type": "string" },
+            "session": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "first_event_time": { "type": "string" },
+                    "first_event_unix_ms": { "type": "integer" },
+                    "last_event_time": { "type": "string" },
+                    "last_event_unix_ms": { "type": "integer" },
+                    "total_events": { "type": "integer" },
+                    "total_turns": { "type": "integer" },
+                    "user_messages": { "type": "integer" },
+                    "assistant_messages": { "type": "integer" },
+                    "tool_calls": { "type": "integer" },
+                    "tool_results": { "type": "integer" },
+                    "mode": { "type": "string", "enum": ["web_search", "mcp_internal", "tool_calling", "chat"] },
+                    "first_event_uid": { "type": "string" },
+                    "last_event_uid": { "type": "string" },
+                    "last_actor_role": { "type": "string" }
+                }
+            },
+            "error": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "code": { "type": "string" },
+                    "message": { "type": "string" }
+                }
+            }
+        },
+        "required": ["found", "session_id"]
+    })
+}
+
+fn trace_event_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "event_uid": { "type": "string" },
+            "event_order": { "type": "integer" },
+            "turn_seq": { "type": "integer" },
+            "event_time": { "type": "string" },
+            "actor_role": { "type": "string" },
+            "event_class": { "type": "string" },
+            "payload_type": { "type": "string" },
+            "call_id": { "type": "string" },
+            "name": { "type": "string" },
+            "phase": { "type": "string" },
+            "item_id": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "text_content": { "type": "string" },
+            "payload_json": { "type": "string" },
+            "token_usage_json": { "type": "string" }
+        },
+        "required": ["event_uid", "event_order"]
+    })
+}
+
+fn get_session_events_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Structured session event timeline payload returned when verbosity is full.",
+        "additionalProperties": true,
+        "properties": {
+            "session_id": { "type": "string" },
+            "direction": { "type": "string", "enum": ["forward", "reverse"] },
+            "event_kinds": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "string",
+                    "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                }
+            },
+            "events": {
+                "type": "array",
+                "items": trace_event_output_schema()
+            },
+            "next_cursor": nullable_string_schema("Cursor for the next event page.")
+        },
+        "required": ["session_id", "direction", "events", "next_cursor"]
+    })
 }
 
 fn tool_limit_bounds(max_results: u16) -> (u16, u16) {
@@ -2080,6 +2446,15 @@ pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn tool_by_name<'a>(payload: &'a Value, name: &str) -> &'a Value {
+        payload["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing tool schema for {name}"))
+    }
+
     #[test]
     fn display_kind_compacts_payload_type_when_redundant() {
         assert_eq!(display_kind("message", "message"), "message");
@@ -2091,6 +2466,179 @@ mod tests {
         let text = "one two three four five";
         let compact = compact_text_line(text, 10);
         assert!(compact.ends_with("..."));
+    }
+
+    #[test]
+    fn tools_list_declares_strict_inputs_and_outputs() {
+        let payload = tools_list_result_for_max_results(25);
+        let expected_tools = [
+            "search",
+            "open",
+            "search_conversations",
+            "list_sessions",
+            "get_session",
+            "get_session_events",
+        ];
+
+        for name in expected_tools {
+            let tool = tool_by_name(&payload, name);
+            assert_eq!(
+                tool.pointer("/inputSchema/additionalProperties")
+                    .and_then(Value::as_bool),
+                Some(false),
+                "{name} should reject undeclared input properties"
+            );
+            assert_eq!(
+                tool.pointer("/outputSchema/type").and_then(Value::as_str),
+                Some("object"),
+                "{name} should declare a structured output schema"
+            );
+        }
+    }
+
+    #[test]
+    fn tools_list_preserves_required_input_fields() {
+        let payload = tools_list_result_for_max_results(25);
+        let cases = [
+            ("search", vec!["query"]),
+            ("open", Vec::<&str>::new()),
+            ("search_conversations", vec!["query"]),
+            ("list_sessions", Vec::<&str>::new()),
+            ("get_session", vec!["session_id"]),
+            ("get_session_events", vec!["session_id"]),
+        ];
+
+        for (name, expected) in cases {
+            let tool = tool_by_name(&payload, name);
+            let actual = tool
+                .pointer("/inputSchema/required")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().expect("required string"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(actual, expected, "{name} required inputs changed");
+        }
+    }
+
+    #[test]
+    fn tools_list_output_schemas_describe_top_level_fields() {
+        let payload = tools_list_result_for_max_results(25);
+        let cases = [
+            (
+                "search",
+                vec!["query_id", "query", "terms", "stats", "hits"],
+            ),
+            ("open", vec!["found", "events"]),
+            (
+                "search_conversations",
+                vec!["query_id", "query", "terms", "stats", "hits"],
+            ),
+            ("list_sessions", vec!["sessions", "next_cursor"]),
+            ("get_session", vec!["found", "session_id"]),
+            (
+                "get_session_events",
+                vec!["session_id", "direction", "events", "next_cursor"],
+            ),
+        ];
+
+        for (name, expected) in cases {
+            let tool = tool_by_name(&payload, name);
+            let required = tool
+                .pointer("/outputSchema/required")
+                .and_then(Value::as_array)
+                .expect("output required array");
+            for field in expected {
+                assert!(
+                    required.iter().any(|value| value.as_str() == Some(field)),
+                    "{name} output schema should require {field}"
+                );
+                assert!(
+                    tool.pointer(&format!("/outputSchema/properties/{field}"))
+                        .is_some(),
+                    "{name} output schema should describe {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn existing_tool_args_still_deserialize_with_strict_structs() {
+        let _: SearchArgs = serde_json::from_value(json!({
+            "query": "error",
+            "limit": 5,
+            "session_id": "sess-1",
+            "min_score": 0.1,
+            "min_should_match": 1,
+            "include_tool_events": true,
+            "event_kinds": ["message", "tool_result"],
+            "exclude_codex_mcp": true,
+            "include_payload_json": true,
+            "verbosity": "full"
+        }))
+        .expect("search args");
+
+        let _: OpenArgs = serde_json::from_value(json!({
+            "event_uid": "evt-1",
+            "before": 1,
+            "after": 2,
+            "include_system_events": false,
+            "verbosity": "prose"
+        }))
+        .expect("open args");
+
+        let _: SearchConversationsArgs = serde_json::from_value(json!({
+            "query": "deploy",
+            "limit": 10,
+            "from_unix_ms": 1_i64,
+            "to_unix_ms": 2_i64,
+            "mode": "tool_calling",
+            "include_tool_events": true,
+            "exclude_codex_mcp": true,
+            "include_payload_json": false,
+            "verbosity": "full"
+        }))
+        .expect("search_conversations args");
+
+        let _: ListSessionsArgs = serde_json::from_value(json!({
+            "limit": 10,
+            "cursor": "c1",
+            "from_unix_ms": 1_i64,
+            "to_unix_ms": 2_i64,
+            "mode": "chat",
+            "sort": "asc",
+            "verbosity": "prose"
+        }))
+        .expect("list_sessions args");
+
+        let _: GetSessionArgs = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "verbosity": "full"
+        }))
+        .expect("get_session args");
+
+        let _: GetSessionEventsArgs = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "limit": 10,
+            "cursor": "c1",
+            "direction": "reverse",
+            "kind": "tool_call",
+            "verbosity": "prose"
+        }))
+        .expect("get_session_events args");
+    }
+
+    #[test]
+    fn strict_tool_args_reject_unknown_fields() {
+        let err = serde_json::from_value::<SearchArgs>(json!({
+            "query": "error",
+            "surprise": true
+        }))
+        .expect_err("unknown search field should fail");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
