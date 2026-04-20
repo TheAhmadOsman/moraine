@@ -168,6 +168,12 @@ pub struct PrivacyConfig {
     pub payload_json_mode: RedactionMode,
     #[serde(default)]
     pub tool_io_mode: RedactionMode,
+    #[serde(default)]
+    pub encryption_key_id: String,
+    #[serde(default)]
+    pub encryption_key_env: String,
+    #[serde(default)]
+    pub encryption_key_file: String,
 }
 
 impl Default for PrivacyConfig {
@@ -179,6 +185,9 @@ impl Default for PrivacyConfig {
             text_content_mode: RedactionMode::StoreRaw,
             payload_json_mode: RedactionMode::StoreRaw,
             tool_io_mode: RedactionMode::StoreRaw,
+            encryption_key_id: String::new(),
+            encryption_key_env: String::new(),
+            encryption_key_file: String::new(),
         }
     }
 }
@@ -741,6 +750,8 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         profile.local_mirror = expand_path(&profile.local_mirror);
     }
 
+    cfg.privacy.encryption_key_file = expand_path(&cfg.privacy.encryption_key_file);
+
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);
     cfg.runtime.root_dir = expand_path(&cfg.runtime.root_dir);
     cfg.runtime.logs_dir = resolve_runtime_subdir(&cfg.runtime.root_dir, &cfg.runtime.logs_dir);
@@ -1153,6 +1164,32 @@ local_mirror = "~/.moraine/imports/pc"
         let profile = cfg.imports.get("pc").expect("import profile");
         assert_eq!(profile.remote_paths, vec!["~/.codex/sessions"]);
         assert_ne!(profile.local_mirror, "~/.moraine/imports/pc");
+    }
+
+    #[test]
+    fn privacy_encryption_key_file_is_expanded() {
+        let path = write_temp_config(
+            r#"
+[privacy]
+enabled = true
+redaction_policy_version = "2"
+text_content_mode = "encrypt_raw"
+encryption_key_id = "local"
+encryption_key_env = "MORAINE_TEST_KEY"
+encryption_key_file = "~/.moraine/keys/local.key"
+"#,
+            "privacy-encryption-key-file",
+        );
+
+        let cfg = load_config(&path).expect("load config");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.privacy.encryption_key_id, "local");
+        assert_eq!(cfg.privacy.encryption_key_env, "MORAINE_TEST_KEY");
+        assert_ne!(cfg.privacy.encryption_key_file, "~/.moraine/keys/local.key");
+        assert!(cfg
+            .privacy
+            .encryption_key_file
+            .ends_with(".moraine/keys/local.key"));
     }
 
     #[test]

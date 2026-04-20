@@ -114,7 +114,7 @@ The alternative was response-time filtering only. That is easier to add at MCP b
 
 The cost is operational responsibility. Policy changes are not retroactive, and redacting `text_content` changes future search documents. Operators must back up, reindex, and rebuild search state when they want historical rows to reflect a new policy.
 
-Revisit trigger: when real encryption key management exists, replace the current `encrypt_raw` marker behavior with reversible encryption and document key rotation, backup, and recovery semantics.
+Revisit trigger: when live restore execution and key rotation exist, extend the current reversible `encrypt_raw` envelope design with tested re-encryption workflows and recovery automation.
 
 ## Decision Summary
 

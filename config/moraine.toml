@@ -89,6 +89,21 @@ default_min_score = 0.0
 default_min_should_match = 1
 max_query_terms = 32
 
+# Ingest-time privacy policy is disabled by default. `encrypt_raw` encrypts
+# the entire configured field with AES-256-GCM and requires a 32-byte key from
+# either `encryption_key_env` or `encryption_key_file`. Backups do not include
+# key material.
+# [privacy]
+# enabled = true
+# redaction_policy_version = "1"
+# raw_events_mode = "redact_raw"
+# text_content_mode = "redact_raw"
+# payload_json_mode = "redact_raw"
+# tool_io_mode = "redact_raw"
+# encryption_key_id = "local-main"
+# encryption_key_env = "MORAINE_ENCRYPTION_KEY"
+# encryption_key_file = "~/.moraine/keys/local-main.key"
+
 # Remote import profiles mirror sessions from another machine into a local
 # directory that can then be ingested as a source. `cadence` can be
 # "manual", "on_start", "5min", "30min", or "1h". The sync command uses rsync

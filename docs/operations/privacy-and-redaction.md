@@ -18,6 +18,10 @@ raw_events_mode = "store_raw"
 text_content_mode = "redact_raw"
 payload_json_mode = "redact_raw"
 tool_io_mode = "redact_raw"
+# Required only when one or more modes are set to "encrypt_raw".
+encryption_key_id = "local-main"
+encryption_key_env = "MORAINE_ENCRYPTION_KEY"
+encryption_key_file = "~/.moraine/keys/local-main.key"
 ```
 
 Supported modes are:
@@ -28,9 +32,11 @@ Supported modes are:
 | `redact_raw` | Replace each detected secret with `[REDACTED:<detector>]` while preserving surrounding text. |
 | `hash_raw` | Replace each detected secret with `[HASH:<short_sha256>]`. This supports stable equality checks without storing the literal secret. |
 | `drop_raw` | Drop the whole string value only when a detector matches. Values with no detector hit are preserved. |
-| `encrypt_raw` | Emits `[ENCRYPTED:<short_sha256>]` markers today. It is a forward-compatible placeholder, not reversible encryption. |
+| `encrypt_raw` | Encrypt the entire configured field with an authenticated AES-256-GCM envelope. Requires `encryption_key_id` and either `encryption_key_env` or `encryption_key_file`. |
 
-`redaction_policy_version` is currently config metadata for operators. It does not create a schema migration or historical row marker by itself, so treat policy changes like any other ingest semantics change and record them in release notes or local operations logs.
+`redaction_policy_version` is stored on rows processed while privacy is enabled. It is still not retroactive: old rows keep the policy metadata and stored representation they had at ingest time.
+
+Encryption key material must be exactly 32 bytes as raw bytes, base64, or 64-character hex. Environment variables are checked before files. Key IDs are stored with encrypted rows; key material is not stored in ClickHouse and is not included in backups.
 
 ## Field Groups
 
@@ -64,11 +70,11 @@ Detectors are regex-based. They are fast and transparent, but they are not a ful
 
 ## Operational Semantics
 
-Redaction runs after a source record has normalized successfully and before sink batching writes rows to ClickHouse. If normalization fails before that point, the error row may still contain a raw fragment captured by `ingest_errors`; that table is not currently passed through the same configurable privacy transform.
+Redaction runs after a source record has normalized successfully and before sink batching writes rows to ClickHouse. Normalized `raw_events`, `events`, `tool_io`, and `ingest_errors` rows receive privacy metadata. Error rows created before source-specific normalization can still contain limited diagnostic context; validate `ingest_errors` when changing policy for a sensitive corpus.
 
 The privacy layer mutates selected string fields in the normalized record. JSON payload columns are serialized strings in the canonical ClickHouse tables, so the stored string representation is scanned according to the configured mode.
 
-Redaction is not retroactive. Existing rows keep whatever representation they had when they were ingested. To apply a new policy to historical data, back up ClickHouse first, clear or rebuild affected tables according to the migration plan, and reindex from source files. If you redact `text_content`, rebuild search index tables after reingest so search documents and postings match the stored event text.
+Redaction and encryption are not retroactive. Existing rows keep whatever representation they had when they were ingested. To apply a new policy to historical data, back up ClickHouse first, clear or rebuild affected tables according to the migration plan, and reindex from source files. If you redact or encrypt `text_content`, rebuild search index tables after reingest so search documents and postings match the stored event text.
 
 ## Policy Guidance
 
@@ -80,7 +86,9 @@ Use `hash_raw` when stable comparison is useful, for example verifying that the 
 
 Use `drop_raw` sparingly. It can make rows much less useful for debugging because a single detector hit empties the whole string field.
 
-Avoid relying on `encrypt_raw` for compliance or recovery semantics until real encryption key management exists. The current behavior is a labeled hash marker.
+Use `encrypt_raw` only when you can manage the external key lifecycle. Losing the key means the field cannot be decrypted. Rotating keys or changing policies requires backup, reingest, and search rebuild planning; Moraine does not re-encrypt historical rows automatically.
+
+Encrypted `text_content` is not meaningfully searchable because the search corpus receives the stored ciphertext envelope. Prefer `redact_raw` for fields that should remain searchable.
 
 ## Interaction With MCP Safety
 
@@ -98,9 +106,10 @@ After changing privacy config:
 
 1. Run a controlled ingest against a fixture or sandbox source.
 2. Query `raw_events`, `events`, and `tool_io` for a known test token.
-3. Confirm `events.text_content` still contains enough context for search if `text_content_mode` changed.
-4. Run `bin/backfill-search-index` or a clean reindex when historical search rows need to match the new policy.
-5. Test MCP retrieval with `include_payload_json=true` and `safety_mode="strict"` to verify response-time behavior is still acceptable.
+3. Check `privacy_policy_version`, `privacy_redaction_applied`, `privacy_redaction_count`, `privacy_redaction_kinds`, and `privacy_key_id` on affected rows.
+4. Confirm `events.text_content` still contains enough context for search if `text_content_mode` changed.
+5. Run `bin/backfill-search-index` or a clean reindex when historical search rows need to match the new policy.
+6. Test MCP retrieval with `include_payload_json=true` and `safety_mode="strict"` to verify response-time behavior is still acceptable.
 
 ## Related Files
 
@@ -108,4 +117,6 @@ After changing privacy config:
 - Config structs and modes: `crates/moraine-config/src/lib.rs`
 - Ingest application point: `crates/moraine-ingest-core/src/normalize.rs`
 - Dispatcher calls: `crates/moraine-ingest-core/src/dispatch.rs`
+- Privacy metadata migration: `sql/013_privacy_metadata.sql`
+- Backup and key recovery: `docs/operations/backup-and-restore.md`
 - MCP response safety: `crates/moraine-mcp-core/src/lib.rs`

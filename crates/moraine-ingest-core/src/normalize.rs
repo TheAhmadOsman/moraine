@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2802,7 +2802,7 @@ fn normalize_kimi_cli_wire_event(
         }
     };
     let payload = message.get("payload").unwrap_or(record);
-    let payload_json = compact_json(&payload);
+    let payload_json = compact_json(payload);
 
     let mut push_progress = |suffix: &str, kind: &str, text: String, payload_type: &str| {
         let uid = kimi_cli_event_uid(ctx, &payload_json, suffix);
@@ -3575,87 +3575,204 @@ fn map_redaction_mode(mode: moraine_config::RedactionMode) -> moraine_privacy::R
     }
 }
 
+fn mode_requires_encryption(mode: moraine_config::RedactionMode) -> bool {
+    mode == moraine_config::RedactionMode::EncryptRaw
+}
+
+fn resolve_privacy_encryption_key(
+    privacy: &moraine_config::PrivacyConfig,
+) -> Result<Option<moraine_privacy::EncryptionKey>> {
+    if !mode_requires_encryption(privacy.raw_events_mode)
+        && !mode_requires_encryption(privacy.text_content_mode)
+        && !mode_requires_encryption(privacy.payload_json_mode)
+        && !mode_requires_encryption(privacy.tool_io_mode)
+    {
+        return Ok(None);
+    }
+
+    let key_id = privacy.encryption_key_id.trim();
+    if key_id.is_empty() {
+        return Err(anyhow!(
+            "privacy encrypt_raw requires privacy.encryption_key_id"
+        ));
+    }
+
+    let env_name = privacy.encryption_key_env.trim();
+    if !env_name.is_empty() {
+        if let Ok(value) = std::env::var(env_name) {
+            return moraine_privacy::EncryptionKey::from_material(key_id, value.as_bytes())
+                .map(Some)
+                .map_err(|err| anyhow!("invalid privacy encryption key from ${env_name}: {err}"));
+        }
+    }
+
+    let key_file = privacy.encryption_key_file.trim();
+    if !key_file.is_empty() {
+        return moraine_privacy::EncryptionKey::from_file(key_id, std::path::Path::new(key_file))
+            .map(Some)
+            .map_err(|err| anyhow!("invalid privacy encryption key file {key_file}: {err}"));
+    }
+
+    Err(anyhow!(
+        "privacy encrypt_raw requires privacy.encryption_key_env or privacy.encryption_key_file"
+    ))
+}
+
+#[derive(Default)]
+struct PrivacyRowStats {
+    count: u64,
+    kinds: BTreeSet<String>,
+    key_id: String,
+}
+
+impl PrivacyRowStats {
+    fn add(
+        &mut self,
+        result: &moraine_privacy::RedactionResult,
+        mode: moraine_config::RedactionMode,
+        encryption_key: Option<&moraine_privacy::EncryptionKey>,
+    ) {
+        if !result.was_redacted {
+            return;
+        }
+        self.count = self.count.saturating_add(result.count as u64);
+        for kind in &result.kinds {
+            self.kinds.insert(kind.clone());
+        }
+        if mode_requires_encryption(mode) {
+            if let Some(key) = encryption_key {
+                self.key_id = key.key_id.clone();
+            }
+        }
+    }
+}
+
+fn init_privacy_metadata(row: &mut Value, policy_version: &str) {
+    let Value::Object(map) = row else {
+        return;
+    };
+    map.insert(
+        "privacy_policy_version".to_string(),
+        Value::String(policy_version.to_string()),
+    );
+    map.insert("privacy_redaction_applied".to_string(), json!(0_u8));
+    map.insert("privacy_redaction_count".to_string(), json!(0_u64));
+    map.insert(
+        "privacy_redaction_kinds".to_string(),
+        Value::Array(Vec::new()),
+    );
+    map.insert("privacy_key_id".to_string(), Value::String(String::new()));
+}
+
+fn finish_privacy_metadata(row: &mut Value, stats: PrivacyRowStats) {
+    let Value::Object(map) = row else {
+        return;
+    };
+    map.insert(
+        "privacy_redaction_applied".to_string(),
+        json!(u8::from(stats.count > 0)),
+    );
+    map.insert("privacy_redaction_count".to_string(), json!(stats.count));
+    map.insert(
+        "privacy_redaction_kinds".to_string(),
+        Value::Array(stats.kinds.into_iter().map(Value::String).collect()),
+    );
+    map.insert("privacy_key_id".to_string(), Value::String(stats.key_id));
+}
+
+fn apply_privacy_to_string_field(
+    row: &mut Value,
+    field: &str,
+    mode: moraine_config::RedactionMode,
+    detectors: &[moraine_privacy::RegexDetector],
+    encryption_key: Option<&moraine_privacy::EncryptionKey>,
+    stats: &mut PrivacyRowStats,
+) -> Result<()> {
+    if mode == moraine_config::RedactionMode::StoreRaw {
+        return Ok(());
+    }
+
+    if let Some(Value::String(text)) = row.get_mut(field) {
+        let result =
+            moraine_privacy::redact_text(text, map_redaction_mode(mode), detectors, encryption_key)
+                .map_err(|err| anyhow!("privacy redaction failed for {field}: {err}"))?;
+        if result.was_redacted {
+            *text = result.text.clone();
+        }
+        stats.add(&result, mode, encryption_key);
+    }
+    Ok(())
+}
+
 /// Apply privacy redaction to a normalized record according to config.
 pub fn apply_privacy_redaction(
     record: &mut NormalizedRecord,
     privacy: &moraine_config::PrivacyConfig,
-) {
+) -> Result<()> {
     if !privacy.enabled {
-        return;
+        return Ok(());
     }
 
     let detectors = moraine_privacy::BuiltinDetectors::all();
+    let encryption_key = resolve_privacy_encryption_key(privacy)?;
+    let encryption_key_ref = encryption_key.as_ref();
 
-    // Redact raw_json in raw_row
-    if privacy.raw_events_mode != moraine_config::RedactionMode::StoreRaw {
-        if let Some(serde_json::Value::String(raw_json)) = record.raw_row.get_mut("raw_json") {
-            let result = moraine_privacy::redact_text(
-                raw_json,
-                map_redaction_mode(privacy.raw_events_mode),
+    init_privacy_metadata(&mut record.raw_row, &privacy.redaction_policy_version);
+    let mut raw_stats = PrivacyRowStats::default();
+    apply_privacy_to_string_field(
+        &mut record.raw_row,
+        "raw_json",
+        privacy.raw_events_mode,
+        &detectors,
+        encryption_key_ref,
+        &mut raw_stats,
+    )?;
+    finish_privacy_metadata(&mut record.raw_row, raw_stats);
+
+    for event in &mut record.event_rows {
+        init_privacy_metadata(event, &privacy.redaction_policy_version);
+        let mut stats = PrivacyRowStats::default();
+        apply_privacy_to_string_field(
+            event,
+            "text_content",
+            privacy.text_content_mode,
+            &detectors,
+            encryption_key_ref,
+            &mut stats,
+        )?;
+        apply_privacy_to_string_field(
+            event,
+            "payload_json",
+            privacy.payload_json_mode,
+            &detectors,
+            encryption_key_ref,
+            &mut stats,
+        )?;
+        finish_privacy_metadata(event, stats);
+    }
+
+    for tool in &mut record.tool_rows {
+        init_privacy_metadata(tool, &privacy.redaction_policy_version);
+        let mut stats = PrivacyRowStats::default();
+        for field in ["input_json", "output_json", "output_text"] {
+            apply_privacy_to_string_field(
+                tool,
+                field,
+                privacy.tool_io_mode,
                 &detectors,
-            );
-            if result.was_redacted {
-                *raw_json = result.text;
-            }
+                encryption_key_ref,
+                &mut stats,
+            )?;
         }
+        finish_privacy_metadata(tool, stats);
     }
 
-    // Redact text_content and payload_json in event_rows
-    if privacy.text_content_mode != moraine_config::RedactionMode::StoreRaw {
-        for event in &mut record.event_rows {
-            if let Some(serde_json::Value::String(text)) = event.get_mut("text_content") {
-                let result = moraine_privacy::redact_text(
-                    text,
-                    map_redaction_mode(privacy.text_content_mode),
-                    &detectors,
-                );
-                if result.was_redacted {
-                    *text = result.text;
-                }
-            }
-        }
+    for error in &mut record.error_rows {
+        init_privacy_metadata(error, &privacy.redaction_policy_version);
+        finish_privacy_metadata(error, PrivacyRowStats::default());
     }
 
-    if privacy.payload_json_mode != moraine_config::RedactionMode::StoreRaw {
-        for event in &mut record.event_rows {
-            if let Some(serde_json::Value::String(payload)) = event.get_mut("payload_json") {
-                let result = moraine_privacy::redact_text(
-                    payload,
-                    map_redaction_mode(privacy.payload_json_mode),
-                    &detectors,
-                );
-                if result.was_redacted {
-                    *payload = result.text;
-                }
-            }
-        }
-    }
-
-    // Redact input_json and output_json in tool_rows
-    if privacy.tool_io_mode != moraine_config::RedactionMode::StoreRaw {
-        for tool in &mut record.tool_rows {
-            if let Some(serde_json::Value::String(input)) = tool.get_mut("input_json") {
-                let result = moraine_privacy::redact_text(
-                    input,
-                    map_redaction_mode(privacy.tool_io_mode),
-                    &detectors,
-                );
-                if result.was_redacted {
-                    *input = result.text;
-                }
-            }
-            if let Some(serde_json::Value::String(output)) = tool.get_mut("output_json") {
-                let result = moraine_privacy::redact_text(
-                    output,
-                    map_redaction_mode(privacy.tool_io_mode),
-                    &detectors,
-                );
-                if result.was_redacted {
-                    *output = result.text;
-                }
-            }
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4708,9 +4825,10 @@ mod tests {
             text_content_mode: moraine_config::RedactionMode::RedactRaw,
             payload_json_mode: moraine_config::RedactionMode::StoreRaw,
             tool_io_mode: moraine_config::RedactionMode::StoreRaw,
+            ..moraine_config::PrivacyConfig::default()
         };
 
-        apply_privacy_redaction(&mut out, &privacy);
+        apply_privacy_redaction(&mut out, &privacy).expect("privacy redaction");
 
         let raw_json = out
             .raw_row
@@ -4739,6 +4857,20 @@ mod tests {
             text_content
         );
         assert!(!text_content.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(
+            event.get("privacy_policy_version").and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event
+                .get("privacy_redaction_applied")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            event.get("privacy_redaction_count").and_then(Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4773,9 +4905,10 @@ mod tests {
             text_content_mode: moraine_config::RedactionMode::RedactRaw,
             payload_json_mode: moraine_config::RedactionMode::StoreRaw,
             tool_io_mode: moraine_config::RedactionMode::StoreRaw,
+            ..moraine_config::PrivacyConfig::default()
         };
 
-        apply_privacy_redaction(&mut out, &privacy);
+        apply_privacy_redaction(&mut out, &privacy).expect("privacy disabled");
 
         let raw_json = out
             .raw_row
@@ -4783,5 +4916,122 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(raw_json.contains("sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQR"));
+    }
+
+    #[test]
+    fn privacy_encrypt_raw_encrypts_whole_field_and_sets_metadata() {
+        let record = json!({
+            "timestamp": "2026-02-14T02:28:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "content": [{ "type": "text", "text": "plain text without detector hits" }]
+            }
+        });
+
+        let mut out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/tmp/s1.jsonl",
+            1,
+            1,
+            1,
+            0,
+            "",
+            "",
+        )
+        .expect("should normalize");
+
+        let key_path = std::env::temp_dir().join(format!(
+            "moraine-privacy-key-{}-{}.hex",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let key_hex = "08".repeat(32);
+        std::fs::write(&key_path, &key_hex).expect("write key");
+
+        let privacy = moraine_config::PrivacyConfig {
+            enabled: true,
+            redaction_policy_version: "42".to_string(),
+            text_content_mode: moraine_config::RedactionMode::EncryptRaw,
+            encryption_key_id: "local-test".to_string(),
+            encryption_key_file: key_path.display().to_string(),
+            ..moraine_config::PrivacyConfig::default()
+        };
+
+        apply_privacy_redaction(&mut out, &privacy).expect("privacy encryption");
+        std::fs::remove_file(&key_path).ok();
+
+        let event = out
+            .event_rows
+            .iter()
+            .find(|r| r.get("event_kind") == Some(&json!("message")))
+            .expect("message event");
+        let encrypted = event
+            .get("text_content")
+            .and_then(Value::as_str)
+            .expect("encrypted text");
+        assert!(encrypted.starts_with("moraine:v1:aes-256-gcm:local-test:"));
+        assert!(!encrypted.contains("plain text"));
+        let key = moraine_privacy::EncryptionKey::from_material("local-test", key_hex.as_bytes())
+            .expect("key");
+        assert_eq!(
+            moraine_privacy::decrypt_text(encrypted, &key).expect("decrypt"),
+            "plain text without detector hits"
+        );
+        assert_eq!(
+            event.get("privacy_policy_version").and_then(Value::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            event
+                .get("privacy_redaction_applied")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            event.get("privacy_key_id").and_then(Value::as_str),
+            Some("local-test")
+        );
+    }
+
+    #[test]
+    fn privacy_encrypt_raw_without_key_fails_closed() {
+        let mut out = normalize_record(
+            &json!({
+                "timestamp": "2026-02-14T02:28:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "content": [{ "type": "text", "text": "hello" }]
+                }
+            }),
+            "codex",
+            "codex",
+            "/tmp/s1.jsonl",
+            1,
+            1,
+            1,
+            0,
+            "",
+            "",
+        )
+        .expect("should normalize");
+
+        let privacy = moraine_config::PrivacyConfig {
+            enabled: true,
+            redaction_policy_version: "1".to_string(),
+            text_content_mode: moraine_config::RedactionMode::EncryptRaw,
+            encryption_key_id: "local-test".to_string(),
+            ..moraine_config::PrivacyConfig::default()
+        };
+
+        let err =
+            apply_privacy_redaction(&mut out, &privacy).expect_err("missing key must fail closed");
+        assert!(err.to_string().contains("encrypt_raw requires"));
     }
 }

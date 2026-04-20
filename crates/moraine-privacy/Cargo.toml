@@ -6,10 +6,15 @@ description = "Privacy redaction and secret detection for Moraine"
 
 [dependencies]
 anyhow = "1.0"
+aes-gcm = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+thiserror = "1.0"
 
 [dev-dependencies]
 serde_json = "1.0"

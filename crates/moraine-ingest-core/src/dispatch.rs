@@ -484,7 +484,7 @@ pub(crate) async fn process_file(
             &mut session_cursors,
         );
 
-        apply_privacy_redaction(&mut normalized, &config.privacy);
+        apply_privacy_redaction(&mut normalized, &config.privacy)?;
 
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
@@ -840,7 +840,7 @@ async fn process_opencode_sqlite_file(
                 &model_hint,
             ) {
                 Ok(mut normalized) => {
-                    apply_privacy_redaction(&mut normalized, &config.privacy);
+                    apply_privacy_redaction(&mut normalized, &config.privacy)?;
                     session_hint = normalized.session_hint;
                     model_hint = normalized.model_hint;
                     batch.raw_rows.push(normalized.raw_row);
@@ -1047,7 +1047,7 @@ async fn process_session_json_file(
             &model_hint,
         ) {
             Ok(mut normalized) => {
-                apply_privacy_redaction(&mut normalized, &config.privacy);
+                apply_privacy_redaction(&mut normalized, &config.privacy)?;
                 session_hint = normalized.session_hint;
                 model_hint = normalized.model_hint;
                 batch.raw_rows.push(normalized.raw_row);
