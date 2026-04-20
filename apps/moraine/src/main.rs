@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -78,6 +79,7 @@ enum CliCommand {
     Db(DbArgs),
     Clickhouse(ClickhouseArgs),
     Config(ConfigArgs),
+    Sources(SourcesArgs),
     Run(RunArgs),
 }
 
@@ -141,6 +143,23 @@ struct ConfigArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Get(ConfigGetArgs),
+}
+
+#[derive(Debug, Args)]
+struct SourcesArgs {
+    #[command(subcommand)]
+    command: SourcesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SourcesCommand {
+    Status(SourcesStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct SourcesStatusArgs {
+    #[arg(long, default_value_t = false)]
+    include_disabled: bool,
 }
 
 #[derive(Debug, Args)]
@@ -351,6 +370,74 @@ struct UpSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DownSnapshot {
     stopped: Vec<Service>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceStatusSnapshot {
+    sources: Vec<SourceStatusRow>,
+    query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceStatusRow {
+    name: String,
+    harness: String,
+    format: String,
+    enabled: bool,
+    glob: String,
+    watch_root: String,
+    status: SourceHealthStatus,
+    checkpoint_count: u64,
+    latest_checkpoint_at: Option<String>,
+    raw_event_count: u64,
+    ingest_error_count: u64,
+    latest_error_at: Option<String>,
+    latest_error_kind: Option<String>,
+    latest_error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceHealthStatus {
+    Disabled,
+    Ok,
+    Warning,
+    Error,
+    Unknown,
+}
+
+impl SourceHealthStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCheckpointStatsRow {
+    source_name: String,
+    checkpoint_count: u64,
+    latest_checkpoint_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCountRow {
+    source_name: String,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceErrorStatsRow {
+    source_name: String,
+    ingest_error_count: u64,
+    latest_error_at: String,
+    latest_error_kind: String,
+    latest_error_text: String,
 }
 
 struct CliOutput {
@@ -1569,6 +1656,170 @@ async fn query_heartbeat(cfg: &AppConfig) -> Result<Option<HeartbeatRow>> {
     }
 }
 
+async fn query_source_checkpoint_stats(
+    ch: &ClickHouseClient,
+    db: &str,
+) -> Result<Vec<SourceCheckpointStatsRow>> {
+    let query = format!(
+        "SELECT \
+            source_name, \
+            toUInt64(count()) AS checkpoint_count, \
+            toString(max(updated_at)) AS latest_checkpoint_at \
+         FROM {db}.ingest_checkpoints FINAL \
+         GROUP BY source_name"
+    );
+    ch.query_rows(&query, None).await
+}
+
+async fn query_source_raw_counts(ch: &ClickHouseClient, db: &str) -> Result<Vec<SourceCountRow>> {
+    let query = format!(
+        "SELECT source_name, toUInt64(count()) AS count \
+         FROM {db}.raw_events \
+         GROUP BY source_name"
+    );
+    ch.query_rows(&query, None).await
+}
+
+async fn query_source_error_stats(
+    ch: &ClickHouseClient,
+    db: &str,
+) -> Result<Vec<SourceErrorStatsRow>> {
+    let query = format!(
+        "SELECT \
+            source_name, \
+            toUInt64(count()) AS ingest_error_count, \
+            toString(max(ingested_at)) AS latest_error_at, \
+            argMax(error_kind, ingested_at) AS latest_error_kind, \
+            argMax(error_text, ingested_at) AS latest_error_text \
+         FROM {db}.ingest_errors \
+         GROUP BY source_name"
+    );
+    ch.query_rows(&query, None).await
+}
+
+fn source_health_status(
+    enabled: bool,
+    checkpoint_count: u64,
+    raw_event_count: u64,
+    ingest_error_count: u64,
+    query_error: Option<&str>,
+) -> SourceHealthStatus {
+    if !enabled {
+        SourceHealthStatus::Disabled
+    } else if query_error.is_some() {
+        SourceHealthStatus::Unknown
+    } else if ingest_error_count > 0 && raw_event_count == 0 {
+        SourceHealthStatus::Error
+    } else if checkpoint_count == 0 && raw_event_count == 0 {
+        SourceHealthStatus::Unknown
+    } else if ingest_error_count > 0 {
+        SourceHealthStatus::Warning
+    } else {
+        SourceHealthStatus::Ok
+    }
+}
+
+async fn cmd_sources_status(
+    cfg: &AppConfig,
+    include_disabled: bool,
+) -> Result<SourceStatusSnapshot> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let db = quote_identifier(&cfg.clickhouse.database);
+
+    let mut query_error = None::<String>;
+    let checkpoint_rows = match query_source_checkpoint_stats(&ch, &db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            query_error = Some(format!("checkpoint query failed: {err}"));
+            Vec::new()
+        }
+    };
+    let raw_count_rows = match query_source_raw_counts(&ch, &db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            if query_error.is_none() {
+                query_error = Some(format!("raw event count query failed: {err}"));
+            }
+            Vec::new()
+        }
+    };
+    let error_rows = match query_source_error_stats(&ch, &db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            if query_error.is_none() {
+                query_error = Some(format!("ingest error query failed: {err}"));
+            }
+            Vec::new()
+        }
+    };
+
+    let checkpoints = checkpoint_rows
+        .into_iter()
+        .map(|row| (row.source_name.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let raw_counts = raw_count_rows
+        .into_iter()
+        .map(|row| (row.source_name, row.count))
+        .collect::<BTreeMap<_, _>>();
+    let errors = error_rows
+        .into_iter()
+        .map(|row| (row.source_name.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut sources = Vec::new();
+    for source in &cfg.ingest.sources {
+        if !source.enabled && !include_disabled {
+            continue;
+        }
+
+        let checkpoint = checkpoints.get(&source.name);
+        let raw_event_count = raw_counts.get(&source.name).copied().unwrap_or(0);
+        let error = errors.get(&source.name);
+        let ingest_error_count = error.map(|row| row.ingest_error_count).unwrap_or(0);
+        let status = source_health_status(
+            source.enabled,
+            checkpoint
+                .map(|row| row.checkpoint_count)
+                .unwrap_or_default(),
+            raw_event_count,
+            ingest_error_count,
+            query_error.as_deref(),
+        );
+
+        sources.push(SourceStatusRow {
+            name: source.name.clone(),
+            harness: source.harness.clone(),
+            format: source.format.clone(),
+            enabled: source.enabled,
+            glob: source.glob.clone(),
+            watch_root: source.watch_root.clone(),
+            status,
+            checkpoint_count: checkpoint
+                .map(|row| row.checkpoint_count)
+                .unwrap_or_default(),
+            latest_checkpoint_at: checkpoint
+                .map(|row| row.latest_checkpoint_at.clone())
+                .filter(|value| !value.is_empty()),
+            raw_event_count,
+            ingest_error_count,
+            latest_error_at: error
+                .map(|row| row.latest_error_at.clone())
+                .filter(|value| !value.is_empty()),
+            latest_error_kind: error
+                .map(|row| row.latest_error_kind.clone())
+                .filter(|value| !value.is_empty()),
+            latest_error_text: error
+                .map(|row| row.latest_error_text.clone())
+                .filter(|value| !value.is_empty()),
+        });
+    }
+
+    Ok(SourceStatusSnapshot {
+        sources,
+        query_error,
+    })
+}
+
 fn quote_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
@@ -2075,6 +2326,124 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn render_sources_status(output: &CliOutput, snapshot: &SourceStatusSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    if let Some(error) = &snapshot.query_error {
+        output.section(
+            "Source Status Query",
+            &[format!("status: partial ({error})")],
+        );
+    }
+
+    if snapshot.sources.is_empty() {
+        output.section(
+            "Sources",
+            &["no matching ingest sources configured".to_string()],
+        );
+        return Ok(());
+    }
+
+    let rows = snapshot
+        .sources
+        .iter()
+        .map(|source| {
+            let format = if source.format.trim().is_empty() {
+                "infer"
+            } else {
+                source.format.as_str()
+            };
+            let latest_error = source
+                .latest_error_kind
+                .as_ref()
+                .map(|kind| {
+                    if output.verbose {
+                        let text = source.latest_error_text.as_deref().unwrap_or_default();
+                        if text.is_empty() {
+                            kind.clone()
+                        } else {
+                            format!("{kind}: {text}")
+                        }
+                    } else {
+                        kind.clone()
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut row = vec![
+                source.name.clone(),
+                source.status.as_str().to_string(),
+                source.harness.clone(),
+                format.to_string(),
+                source.raw_event_count.to_string(),
+                source.checkpoint_count.to_string(),
+                source.ingest_error_count.to_string(),
+                latest_error,
+            ];
+
+            if output.verbose {
+                row.push(
+                    source
+                        .latest_checkpoint_at
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                row.push(
+                    source
+                        .latest_error_at
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                row.push(source.watch_root.clone());
+                row.push(source.glob.clone());
+            }
+
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if output.verbose {
+        output.table(
+            "Sources",
+            &[
+                "source",
+                "status",
+                "harness",
+                "format",
+                "raw",
+                "checkpoints",
+                "errors",
+                "latest error",
+                "latest checkpoint",
+                "latest error at",
+                "watch root",
+                "glob",
+            ],
+            &rows,
+        );
+    } else {
+        output.table(
+            "Sources",
+            &[
+                "source",
+                "status",
+                "harness",
+                "format",
+                "raw",
+                "checkpoints",
+                "errors",
+                "latest error",
+            ],
+            &rows,
+        );
+    }
+
+    Ok(())
+}
+
 fn render_db_migrate(output: &CliOutput, outcome: &MigrationOutcome) -> Result<()> {
     if output.is_json() {
         println!("{}", serde_json::to_string_pretty(outcome)?);
@@ -2409,6 +2778,16 @@ async fn main() -> Result<ExitCode> {
                 }
             }
         }
+        CliCommand::Sources(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                SourcesCommand::Status(status) => {
+                    let snapshot = cmd_sources_status(&cfg, status.include_disabled).await?;
+                    render_sources_status(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
         CliCommand::Run(run) => {
             let (inline_config, passthrough) = parse_config_flag(&run.args)?;
             let raw_config = inline_config.or(cli.config.clone());
@@ -2636,6 +3015,34 @@ mod tests {
     }
 
     #[test]
+    fn source_health_status_classifies_source_rows() {
+        assert_eq!(
+            source_health_status(false, 0, 0, 0, None),
+            SourceHealthStatus::Disabled
+        );
+        assert_eq!(
+            source_health_status(true, 0, 0, 0, Some("query failed")),
+            SourceHealthStatus::Unknown
+        );
+        assert_eq!(
+            source_health_status(true, 0, 0, 0, None),
+            SourceHealthStatus::Unknown
+        );
+        assert_eq!(
+            source_health_status(true, 1, 42, 0, None),
+            SourceHealthStatus::Ok
+        );
+        assert_eq!(
+            source_health_status(true, 1, 42, 2, None),
+            SourceHealthStatus::Warning
+        );
+        assert_eq!(
+            source_health_status(true, 0, 0, 2, None),
+            SourceHealthStatus::Error
+        );
+    }
+
+    #[test]
     fn clap_parses_clickhouse_install_flags() {
         let cli = Cli::parse_from([
             "moraine",
@@ -2653,6 +3060,17 @@ mod tests {
                 assert_eq!(install.version.as_deref(), Some("v25.12.5.44-stable"));
             }
             _ => panic!("expected clickhouse install command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_sources_status_flags() {
+        let cli = Cli::parse_from(["moraine", "sources", "status", "--include-disabled"]);
+        match cli.command {
+            CliCommand::Sources(SourcesArgs {
+                command: SourcesCommand::Status(status),
+            }) => assert!(status.include_disabled),
+            _ => panic!("expected sources status command"),
         }
     }
 
