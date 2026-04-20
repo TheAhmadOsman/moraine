@@ -1,0 +1,35 @@
+{
+  "description": "Pre-computed search results for offline harness self-check.",
+  "strategy": "optimized",
+  "results": {
+    "q-auth-error": [
+      {"rank": 1, "event_uid": "evt-auth-001", "score": 14.52, "session_id": "sess-a1"},
+      {"rank": 2, "event_uid": "evt-auth-004", "score": 8.31, "session_id": "sess-a1"},
+      {"rank": 3, "event_uid": "evt-auth-002", "score": 6.20, "session_id": "sess-a2"},
+      {"rank": 4, "event_uid": "evt-unrelated-01", "score": 3.10, "session_id": "sess-a3"},
+      {"rank": 5, "event_uid": "evt-auth-003", "score": 2.05, "session_id": "sess-a2"}
+    ],
+    "q-db-timeout": [
+      {"rank": 1, "event_uid": "evt-db-001", "score": 12.80, "session_id": "sess-d1"},
+      {"rank": 2, "event_uid": "evt-db-003", "score": 7.40, "session_id": "sess-d1"},
+      {"rank": 3, "event_uid": "evt-db-002", "score": 5.60, "session_id": "sess-d2"}
+    ],
+    "q-shell-cmd": [
+      {"rank": 1, "event_uid": "evt-shell-002", "score": 15.10, "session_id": "sess-s1"},
+      {"rank": 2, "event_uid": "evt-shell-004", "score": 9.20, "session_id": "sess-s1"},
+      {"rank": 3, "event_uid": "evt-shell-001", "score": 7.80, "session_id": "sess-s2"}
+    ],
+    "q-model-switch": [
+      {"rank": 1, "event_uid": "evt-model-002", "score": 10.50, "session_id": "sess-m1"},
+      {"rank": 2, "event_uid": "evt-model-001", "score": 8.90, "session_id": "sess-m1"},
+      {"rank": 3, "event_uid": "evt-model-003", "score": 4.20, "session_id": "sess-m2"}
+    ],
+    "q-memory-leak": [
+      {"rank": 1, "event_uid": "evt-mem-001", "score": 18.30, "session_id": "sess-mem1"},
+      {"rank": 2, "event_uid": "evt-mem-005", "score": 11.20, "session_id": "sess-mem1"},
+      {"rank": 3, "event_uid": "evt-mem-002", "score": 9.50, "session_id": "sess-mem2"},
+      {"rank": 4, "event_uid": "evt-mem-003", "score": 6.10, "session_id": "sess-mem2"},
+      {"rank": 5, "event_uid": "evt-mem-006", "score": 3.40, "session_id": "sess-mem3"}
+    ]
+  }
+}
