@@ -14,6 +14,7 @@ use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
     ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
     RepoError, SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    TurnListFilter,
 };
 use serde_json::json;
 
@@ -707,6 +708,39 @@ fn sql_self_aliases_aggregate(sql: &str, column: &str) -> bool {
         let tail_word = matches!(tail, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_');
         !head_word && !tail_word
     })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_turns_qualifies_timestamps_to_avoid_clickhouse_alias_shadowing() {
+    let (repo, state) = build_repo().await;
+
+    let page = repo
+        .list_turns(
+            "sess_c",
+            TurnListFilter::default(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("turn list query should be accepted by the mock");
+
+    assert!(page.items.is_empty());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let query = queries
+        .iter()
+        .find(|q| q.contains("FROM `moraine`.`v_turn_summary` AS t"))
+        .expect("turn list query should be captured");
+
+    assert!(query.contains("toString(t.started_at) AS started_at"));
+    assert!(query.contains("toInt64(toUnixTimestamp64Milli(t.started_at)) AS started_at_unix_ms"));
+    assert!(query.contains("toString(t.ended_at) AS ended_at"));
+    assert!(query.contains("toInt64(toUnixTimestamp64Milli(t.ended_at)) AS ended_at_unix_ms"));
+    assert!(query.contains("WHERE t.session_id = 'sess_c'"));
+    assert!(!query.contains("toUnixTimestamp64Milli(started_at)"));
+    assert!(!query.contains("toUnixTimestamp64Milli(ended_at)"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

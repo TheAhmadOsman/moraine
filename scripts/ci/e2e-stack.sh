@@ -346,14 +346,14 @@ EOF
   # the `anthropic/claude-sonnet-4.6` record field).
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE harness = 'hermes' AND inference_provider = 'anthropic' AND positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 60
 
-  echo "[e2e] checking monitor API routes"
-  for path in /api/health /api/status /api/analytics /api/web-searches; do
-    local body
-    body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
-    printf '%s' "$body" | json_ok_true "$python_bin"
-  done
+  echo "[e2e] checking monitor API routes and source health"
+  "$python_bin" "$repo_root/scripts/ci/monitor_smoke.py" \
+    --base-url "http://127.0.0.1:${monitor_port}" \
+    --expect-source "ci-codex:codex" \
+    --expect-source "ci-claude:claude-code" \
+    --expect-source "ci-hermes:hermes"
 
-  echo "[e2e] checking MCP initialize/tools/search/open (codex)"
+  echo "[e2e] checking MCP protocol/schema/retrieval smoke (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
@@ -362,7 +362,7 @@ EOF
     --expect-source-file "$codex_fixture_file" \
     --expect-open-text "$codex_trace_marker"
 
-  echo "[e2e] checking MCP initialize/tools/search/open (claude)"
+  echo "[e2e] checking MCP protocol/schema/retrieval smoke (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
@@ -374,7 +374,7 @@ EOF
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the
   # row round-tripped from fixture through ingest to MCP search/open.
-  echo "[e2e] checking MCP initialize/tools/search/open (hermes)"
+  echo "[e2e] checking MCP protocol/schema/retrieval smoke (hermes)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \

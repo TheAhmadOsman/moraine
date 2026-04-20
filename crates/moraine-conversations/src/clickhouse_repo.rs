@@ -856,22 +856,22 @@ GROUP BY session_id"
         let turn_summary = self.table_ref("v_turn_summary");
         let query = format!(
             "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
-WHERE session_id = {}
-ORDER BY turn_seq ASC
+  t.session_id,
+  toUInt32(t.turn_seq) AS turn_seq,
+  ifNull(t.turn_id, '') AS turn_id,
+  toString(t.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(t.started_at)) AS started_at_unix_ms,
+  toString(t.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(t.ended_at)) AS ended_at_unix_ms,
+  toUInt64(t.total_events) AS total_events,
+  toUInt64(t.user_messages) AS user_messages,
+  toUInt64(t.assistant_messages) AS assistant_messages,
+  toUInt64(t.tool_calls) AS tool_calls,
+  toUInt64(t.tool_results) AS tool_results,
+  toUInt64(t.reasoning_items) AS reasoning_items
+FROM {turn_summary} AS t
+WHERE t.session_id = {}
+ORDER BY t.turn_seq ASC
 FORMAT JSONEachRow",
             sql_quote(session_id),
         );
@@ -2985,13 +2985,13 @@ FORMAT JSONEachRow",
         };
 
         let turn_summary = self.table_ref("v_turn_summary");
-        let mut where_clauses = vec![format!("session_id = {}", sql_quote(session_id))];
+        let mut where_clauses = vec![format!("t.session_id = {}", sql_quote(session_id))];
 
         if let Some(from_turn_seq) = filter.from_turn_seq {
-            where_clauses.push(format!("turn_seq >= {from_turn_seq}"));
+            where_clauses.push(format!("t.turn_seq >= {from_turn_seq}"));
         }
         if let Some(to_turn_seq) = filter.to_turn_seq {
-            where_clauses.push(format!("turn_seq <= {to_turn_seq}"));
+            where_clauses.push(format!("t.turn_seq <= {to_turn_seq}"));
         }
 
         if let Some(cursor) = &cursor {
@@ -3000,28 +3000,28 @@ FORMAT JSONEachRow",
                     "cursor session_id does not match requested session_id",
                 ));
             }
-            where_clauses.push(format!("turn_seq > {}", cursor.last_turn_seq));
+            where_clauses.push(format!("t.turn_seq > {}", cursor.last_turn_seq));
         }
 
         let where_sql = where_clauses.join("\n  AND ");
         let query = format!(
             "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
+  t.session_id,
+  toUInt32(t.turn_seq) AS turn_seq,
+  ifNull(t.turn_id, '') AS turn_id,
+  toString(t.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(t.started_at)) AS started_at_unix_ms,
+  toString(t.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(t.ended_at)) AS ended_at_unix_ms,
+  toUInt64(t.total_events) AS total_events,
+  toUInt64(t.user_messages) AS user_messages,
+  toUInt64(t.assistant_messages) AS assistant_messages,
+  toUInt64(t.tool_calls) AS tool_calls,
+  toUInt64(t.tool_results) AS tool_results,
+  toUInt64(t.reasoning_items) AS reasoning_items
+FROM {turn_summary} AS t
 WHERE {where_sql}
-ORDER BY turn_seq ASC
+ORDER BY t.turn_seq ASC
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             turn_summary = turn_summary,
@@ -3060,21 +3060,21 @@ FORMAT JSONEachRow",
         let turn_summary = self.table_ref("v_turn_summary");
         let summary_query = format!(
             "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
-WHERE session_id = {} AND turn_seq = {}
+  t.session_id,
+  toUInt32(t.turn_seq) AS turn_seq,
+  ifNull(t.turn_id, '') AS turn_id,
+  toString(t.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(t.started_at)) AS started_at_unix_ms,
+  toString(t.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(t.ended_at)) AS ended_at_unix_ms,
+  toUInt64(t.total_events) AS total_events,
+  toUInt64(t.user_messages) AS user_messages,
+  toUInt64(t.assistant_messages) AS assistant_messages,
+  toUInt64(t.tool_calls) AS tool_calls,
+  toUInt64(t.tool_results) AS tool_results,
+  toUInt64(t.reasoning_items) AS reasoning_items
+FROM {turn_summary} AS t
+WHERE t.session_id = {} AND t.turn_seq = {}
 LIMIT 1
 FORMAT JSONEachRow",
             sql_quote(session_id),
