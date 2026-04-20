@@ -3565,9 +3565,102 @@ pub fn normalize_record(
     })
 }
 
+fn map_redaction_mode(mode: moraine_config::RedactionMode) -> moraine_privacy::RedactionMode {
+    match mode {
+        moraine_config::RedactionMode::StoreRaw => moraine_privacy::RedactionMode::StoreRaw,
+        moraine_config::RedactionMode::HashRaw => moraine_privacy::RedactionMode::HashRaw,
+        moraine_config::RedactionMode::RedactRaw => moraine_privacy::RedactionMode::RedactRaw,
+        moraine_config::RedactionMode::DropRaw => moraine_privacy::RedactionMode::DropRaw,
+        moraine_config::RedactionMode::EncryptRaw => moraine_privacy::RedactionMode::EncryptRaw,
+    }
+}
+
+/// Apply privacy redaction to a normalized record according to config.
+pub fn apply_privacy_redaction(
+    record: &mut NormalizedRecord,
+    privacy: &moraine_config::PrivacyConfig,
+) {
+    if !privacy.enabled {
+        return;
+    }
+
+    let detectors = moraine_privacy::BuiltinDetectors::all();
+
+    // Redact raw_json in raw_row
+    if privacy.raw_events_mode != moraine_config::RedactionMode::StoreRaw {
+        if let Some(serde_json::Value::String(raw_json)) = record.raw_row.get_mut("raw_json") {
+            let result = moraine_privacy::redact_text(
+                raw_json,
+                map_redaction_mode(privacy.raw_events_mode),
+                &detectors,
+            );
+            if result.was_redacted {
+                *raw_json = result.text;
+            }
+        }
+    }
+
+    // Redact text_content and payload_json in event_rows
+    if privacy.text_content_mode != moraine_config::RedactionMode::StoreRaw {
+        for event in &mut record.event_rows {
+            if let Some(serde_json::Value::String(text)) = event.get_mut("text_content") {
+                let result = moraine_privacy::redact_text(
+                    text,
+                    map_redaction_mode(privacy.text_content_mode),
+                    &detectors,
+                );
+                if result.was_redacted {
+                    *text = result.text;
+                }
+            }
+        }
+    }
+
+    if privacy.payload_json_mode != moraine_config::RedactionMode::StoreRaw {
+        for event in &mut record.event_rows {
+            if let Some(serde_json::Value::String(payload)) = event.get_mut("payload_json") {
+                let result = moraine_privacy::redact_text(
+                    payload,
+                    map_redaction_mode(privacy.payload_json_mode),
+                    &detectors,
+                );
+                if result.was_redacted {
+                    *payload = result.text;
+                }
+            }
+        }
+    }
+
+    // Redact input_json and output_json in tool_rows
+    if privacy.tool_io_mode != moraine_config::RedactionMode::StoreRaw {
+        for tool in &mut record.tool_rows {
+            if let Some(serde_json::Value::String(input)) = tool.get_mut("input_json") {
+                let result = moraine_privacy::redact_text(
+                    input,
+                    map_redaction_mode(privacy.tool_io_mode),
+                    &detectors,
+                );
+                if result.was_redacted {
+                    *input = result.text;
+                }
+            }
+            if let Some(serde_json::Value::String(output)) = tool.get_mut("output_json") {
+                let result = moraine_privacy::redact_text(
+                    output,
+                    map_redaction_mode(privacy.tool_io_mode),
+                    &detectors,
+                );
+                if result.was_redacted {
+                    *output = result.text;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_link_row, normalize_record, RecordContext};
+    use super::{apply_privacy_redaction, build_link_row, normalize_record, RecordContext};
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -4581,5 +4674,114 @@ mod tests {
             link_obj.get("link_type").unwrap().as_str().unwrap(),
             "unknown"
         );
+    }
+
+    #[test]
+    fn privacy_redaction_scrubs_secrets_from_raw_and_events() {
+        let record = json!({
+            "timestamp": "2026-02-14T02:28:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "content": [{ "type": "text", "text": "key=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQR" }]
+            }
+        });
+
+        let mut out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/tmp/s1.jsonl",
+            1,
+            1,
+            1,
+            0,
+            "",
+            "",
+        )
+        .expect("should normalize");
+
+        let privacy = moraine_config::PrivacyConfig {
+            enabled: true,
+            redaction_policy_version: "1".to_string(),
+            raw_events_mode: moraine_config::RedactionMode::RedactRaw,
+            text_content_mode: moraine_config::RedactionMode::RedactRaw,
+            payload_json_mode: moraine_config::RedactionMode::StoreRaw,
+            tool_io_mode: moraine_config::RedactionMode::StoreRaw,
+        };
+
+        apply_privacy_redaction(&mut out, &privacy);
+
+        let raw_json = out
+            .raw_row
+            .get("raw_json")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            raw_json.contains("[REDACTED:openai_api_key]"),
+            "raw_json should be redacted: {}",
+            raw_json
+        );
+        assert!(!raw_json.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+
+        let event = out
+            .event_rows
+            .iter()
+            .find(|r| r.get("event_kind") == Some(&json!("message")))
+            .expect("message event");
+        let text_content = event
+            .get("text_content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            text_content.contains("[REDACTED:openai_api_key]"),
+            "text_content should be redacted: {}",
+            text_content
+        );
+        assert!(!text_content.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn privacy_redaction_disabled_is_noop() {
+        let record = json!({
+            "timestamp": "2026-02-14T02:28:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "content": [{ "type": "text", "text": "key=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQR" }]
+            }
+        });
+
+        let mut out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/tmp/s1.jsonl",
+            1,
+            1,
+            1,
+            0,
+            "",
+            "",
+        )
+        .expect("should normalize");
+
+        let privacy = moraine_config::PrivacyConfig {
+            enabled: false,
+            redaction_policy_version: "1".to_string(),
+            raw_events_mode: moraine_config::RedactionMode::RedactRaw,
+            text_content_mode: moraine_config::RedactionMode::RedactRaw,
+            payload_json_mode: moraine_config::RedactionMode::StoreRaw,
+            tool_io_mode: moraine_config::RedactionMode::StoreRaw,
+        };
+
+        apply_privacy_redaction(&mut out, &privacy);
+
+        let raw_json = out
+            .raw_row
+            .get("raw_json")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(raw_json.contains("sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQR"));
     }
 }

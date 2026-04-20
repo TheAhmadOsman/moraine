@@ -21,6 +21,7 @@ same-file = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+moraine-privacy = { path = "../moraine-privacy" }
 
 [dev-dependencies]
 axum = "0.7"

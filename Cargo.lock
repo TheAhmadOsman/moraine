@@ -1176,6 +1176,7 @@ dependencies = [
  "glob",
  "moraine-clickhouse",
  "moraine-config",
+ "moraine-privacy",
  "notify",
  "regex",
  "rusqlite",
@@ -1237,6 +1238,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "moraine-privacy"
+version = "0.4.3"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
