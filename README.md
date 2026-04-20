@@ -2,7 +2,7 @@
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes all of your agent harness traces (Claude Code, Codex, Kimi CLI, Hermes Agent, ...) in realtime into a searchable, unified database.
+Moraine indexes all of your agent harness traces (Claude Code, Codex, Kimi CLI, OpenCode, Hermes Agent, ...) in realtime into a searchable, unified database.
 
 🤖 **Your Agents Get**: a searchable long-term memory.
 
@@ -127,6 +127,7 @@ By default, Moraine watches:
 | Codex | `~/.codex/sessions/**/*.jsonl` |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Kimi CLI | `~/.kimi/sessions/**/wire.jsonl` |
+| OpenCode | `~/.local/share/opencode/opencode.db` |
 | Hermes (live sessions) | `~/.hermes/sessions/session_*.json` |
 | Hermes (trajectories) | user-defined, opt-in |
 

@@ -17,9 +17,11 @@ pub struct IngestSource {
     pub watch_root: String,
     /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
     /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
-    /// dumps) or `"session_json"` (single-file-per-session JSON rewritten in
-    /// place via atomic rename — used by live Hermes agent sessions). Empty means
-    /// "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
+    /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
+    /// place via atomic rename — used by live Hermes agent sessions), or
+    /// `"opencode_sqlite"` (OpenCode's local SQLite session database). Empty
+    /// means "infer": hermes + `*.json` glob → `session_json`, opencode +
+    /// `*.db` glob → `opencode_sqlite`, otherwise `jsonl`.
     #[serde(default)]
     pub format: String,
 }
@@ -296,11 +298,20 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.kimi/sessions".to_string(),
             format: String::new(),
         },
+        IngestSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            enabled: true,
+            glob: "~/.local/share/opencode/opencode.db".to_string(),
+            watch_root: "~/.local/share/opencode".to_string(),
+            format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
+        },
     ]
 }
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
+pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
@@ -308,6 +319,8 @@ fn infer_source_format(harness: &str, glob: &str) -> &'static str {
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
     if harness == "hermes" && looks_like_json {
         SOURCE_FORMAT_SESSION_JSON
+    } else if harness == "opencode" && glob_lower.ends_with(".db") {
+        SOURCE_FORMAT_OPENCODE_SQLITE
     } else {
         SOURCE_FORMAT_JSONL
     }
@@ -327,9 +340,11 @@ fn normalize_source_format(
         trimmed
     };
     match resolved.as_str() {
-        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON => Ok(resolved),
+        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_OPENCODE_SQLITE => {
+            Ok(resolved)
+        }
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
             format.trim(),
             source_name
         )),
@@ -338,10 +353,11 @@ fn normalize_source_format(
 
 impl IngestSource {
     /// Returns the file extension (without leading `.`) this source's format
-    /// records are stored in: `jsonl` or `json`.
+    /// records are stored in: `jsonl`, `json`, or `db`.
     pub fn tracked_extension(&self) -> &'static str {
         match self.format.as_str() {
             SOURCE_FORMAT_SESSION_JSON => "json",
+            SOURCE_FORMAT_OPENCODE_SQLITE => "db",
             _ => "jsonl",
         }
     }
@@ -625,12 +641,13 @@ fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Res
         || normalized == "claude-code"
         || normalized == "hermes"
         || normalized == "kimi-cli"
+        || normalized == "opencode"
     {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, kimi-cli",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, kimi-cli, opencode",
         harness.trim(),
         source_name
     ))
@@ -945,7 +962,8 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
+            format!("{err:#}")
+                .contains("expected one of: codex, claude-code, hermes, kimi-cli, opencode"),
             "unexpected error: {err:#}"
         );
     }
@@ -966,7 +984,8 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
+            format!("{err:#}")
+                .contains("expected one of: codex, claude-code, hermes, kimi-cli, opencode"),
             "unexpected error: {err:#}"
         );
     }
@@ -1044,5 +1063,30 @@ watch_root = "~/.kimi/sessions"
             .expect("kimi-cli source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn load_config_accepts_opencode_sqlite_harness_and_format() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "opencode"
+harness = "opencode"
+enabled = true
+glob = "~/.local/share/opencode/opencode.db"
+watch_root = "~/.local/share/opencode"
+"#,
+            "opencode-harness",
+        );
+        let cfg = load_config(&path).expect("opencode harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "opencode")
+            .expect("opencode source");
+        assert_eq!(source.format, SOURCE_FORMAT_OPENCODE_SQLITE);
+        assert_eq!(source.tracked_extension(), "db");
     }
 }

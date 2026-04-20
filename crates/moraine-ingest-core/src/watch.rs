@@ -140,11 +140,34 @@ fn event_is_relevant(kind: &EventKind) -> bool {
     }
 }
 
+fn tracked_path_for_event(path: &std::path::Path, extension: &str) -> Option<String> {
+    if path.extension().and_then(|s| s.to_str()) == Some(extension) {
+        return Some(path.to_string_lossy().to_string());
+    }
+
+    if extension == "db" {
+        let raw = path.to_string_lossy();
+        for suffix in ["-wal", "-shm"] {
+            if let Some(base) = raw.strip_suffix(suffix) {
+                if std::path::Path::new(base)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    == Some("db")
+                {
+                    return Some(base.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn event_tracked_paths(event: &Event, extension: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
-        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-            dedup.insert(path.to_string_lossy().to_string());
+        if let Some(path) = tracked_path_for_event(path, extension) {
+            dedup.insert(path);
         }
     }
     dedup.into_iter().collect()
@@ -427,6 +450,20 @@ mod tests {
 
         let session_json = event_tracked_paths(&event, "json");
         assert_eq!(session_json, vec!["/tmp/c.json".to_string()]);
+    }
+
+    #[test]
+    fn tracked_paths_map_sqlite_wal_siblings_to_database() {
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![
+            PathBuf::from("/tmp/opencode.db-wal"),
+            PathBuf::from("/tmp/opencode.db-shm"),
+            PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/other.sqlite-wal"),
+        ];
+
+        let db = event_tracked_paths(&event, "db");
+        assert_eq!(db, vec!["/tmp/opencode.db".to_string()]);
     }
 
     #[test]

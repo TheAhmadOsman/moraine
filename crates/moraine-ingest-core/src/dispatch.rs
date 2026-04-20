@@ -2,10 +2,12 @@ use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::normalize_record;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
-use anyhow::{Context, Result};
-use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
+use anyhow::{anyhow, Context, Result};
+use moraine_config::{AppConfig, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 #[cfg(not(unix))]
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -28,10 +30,16 @@ use std::time::UNIX_EPOCH;
 /// the checkpoint key and `event_uid` derivation stay stable across saves.
 const SESSION_JSON_INODE: u64 = 0;
 const SESSION_JSON_GENERATION: u32 = 1;
+#[cfg(not(test))]
+const OPENCODE_SQLITE_PAGE_LIMIT: usize = 500;
+#[cfg(test)]
+const OPENCODE_SQLITE_PAGE_LIMIT: usize = 2;
 
 fn work_extension(work: &WorkItem) -> &'static str {
     if work.format == SOURCE_FORMAT_SESSION_JSON {
         "json"
+    } else if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        "db"
     } else {
         "jsonl"
     }
@@ -325,6 +333,9 @@ pub(crate) async fn process_file(
     if work.format == SOURCE_FORMAT_SESSION_JSON {
         return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
     }
+    if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        return process_opencode_sqlite_file(config, work, checkpoints, sink_tx, metrics).await;
+    }
 
     let source_file = &work.path;
 
@@ -530,6 +541,349 @@ pub(crate) async fn process_file(
         debug!(
             "{}:{} caught up at offset {}",
             work.source_name, source_file, offset
+        );
+    }
+
+    Ok(())
+}
+
+fn stable_u64(material: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(material.as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    u64::from_str_radix(&hex[..16], 16).unwrap_or(1).max(1)
+}
+
+fn parse_json_field(raw: String) -> Value {
+    serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({ "raw": raw }))
+}
+
+fn opencode_sqlite_user_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("failed to read OpenCode sqlite user_version")
+}
+
+fn sqlite_table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("failed to inspect OpenCode sqlite table {table}"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = HashSet::<String>::new();
+    for row in rows {
+        columns.insert(row?);
+    }
+    Ok(columns)
+}
+
+fn validate_opencode_sqlite_schema(conn: &Connection) -> Result<i64> {
+    let user_version = opencode_sqlite_user_version(conn)?;
+    let required: &[(&str, &[&str])] = &[
+        (
+            "session",
+            &[
+                "id",
+                "project_id",
+                "parent_id",
+                "slug",
+                "directory",
+                "title",
+                "version",
+                "share_url",
+                "summary_additions",
+                "summary_deletions",
+                "summary_files",
+                "summary_diffs",
+                "time_created",
+                "time_updated",
+            ],
+        ),
+        (
+            "message",
+            &["id", "session_id", "time_created", "time_updated", "data"],
+        ),
+        (
+            "part",
+            &[
+                "id",
+                "message_id",
+                "session_id",
+                "time_created",
+                "time_updated",
+                "data",
+            ],
+        ),
+    ];
+
+    let mut missing = Vec::<String>::new();
+    for (table, columns) in required {
+        let present = sqlite_table_columns(conn, table)?;
+        if present.is_empty() {
+            missing.push(format!("{table}.*"));
+            continue;
+        }
+        for column in *columns {
+            if !present.contains(*column) {
+                missing.push(format!("{table}.{column}"));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "unsupported OpenCode sqlite schema user_version={user_version}: missing {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(user_version)
+}
+
+fn opencode_query_json_rows(
+    conn: &Connection,
+    checkpoint_watermark: u64,
+    cursor_watermark: u64,
+    cursor_row_key: &str,
+    limit: usize,
+) -> Result<Vec<(u64, String, Value)>> {
+    let mut stmt = conn.prepare(
+        "WITH candidate_rows AS (
+            SELECT max(coalesce(time_updated, 0), coalesce(time_created, 0)) AS watermark,
+                   'session:' || id AS row_key,
+                   json_object(
+                     'type','opencode_session',
+                     'timestamp', strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(time_created, 0) / 1000.0, 'unixepoch'),
+                     'row_id', id,
+                     'session_id', id,
+                     'project_id', project_id,
+                     'parent_id', parent_id,
+                     'slug', slug,
+                     'directory', directory,
+                     'title', title,
+                     'version', version,
+                     'share_url', share_url,
+                     'summary_additions', summary_additions,
+                     'summary_deletions', summary_deletions,
+                     'summary_files', summary_files,
+                     'summary_diffs', summary_diffs,
+                     'time_created', time_created,
+                     'time_updated', time_updated
+                   ) AS record
+            FROM session
+            UNION ALL
+            SELECT max(coalesce(m.time_updated, 0), coalesce(m.time_created, 0)) AS watermark,
+                   'message:' || m.id AS row_key,
+                   json_object(
+                     'type','opencode_message',
+                     'timestamp', strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(m.time_created, 0) / 1000.0, 'unixepoch'),
+                     'row_id', m.id,
+                     'session_id', m.session_id,
+                     'message_id', m.id,
+                     'message', json(m.data),
+                     'time_created', m.time_created,
+                     'time_updated', m.time_updated
+                   ) AS record
+            FROM message m
+            UNION ALL
+            SELECT max(coalesce(p.time_updated, 0), coalesce(p.time_created, 0),
+                       coalesce(m.time_updated, 0), coalesce(m.time_created, 0)) AS watermark,
+                   'part:' || p.id AS row_key,
+                   json_object(
+                     'type','opencode_part',
+                     'timestamp', strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(p.time_created, 0) / 1000.0, 'unixepoch'),
+                     'row_id', p.id,
+                     'session_id', p.session_id,
+                     'message_id', p.message_id,
+                     'part_id', p.id,
+                     'message', json(m.data),
+                     'part', json(p.data),
+                     'time_created', p.time_created,
+                     'time_updated', p.time_updated
+                   ) AS record
+            FROM part p
+            LEFT JOIN message m ON m.id = p.message_id
+        )
+        SELECT watermark, row_key, record
+        FROM candidate_rows
+        WHERE watermark > ?1
+          AND (watermark > ?2 OR (watermark = ?2 AND row_key > ?3))
+        ORDER BY watermark, row_key
+        LIMIT ?4",
+    )?;
+
+    let rows = stmt.query_map(
+        params![
+            checkpoint_watermark as i64,
+            cursor_watermark as i64,
+            cursor_row_key,
+            limit as i64
+        ],
+        |row| {
+            let watermark: i64 = row.get(0)?;
+            let row_key: String = row.get(1)?;
+            let raw: String = row.get(2)?;
+            Ok((watermark.max(0) as u64, row_key, raw))
+        },
+    )?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (watermark, row_key, raw) = row?;
+        out.push((watermark, row_key, parse_json_field(raw)));
+    }
+    Ok(out)
+}
+
+async fn process_opencode_sqlite_file(
+    config: &AppConfig,
+    work: &WorkItem,
+    checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    sink_tx: mpsc::Sender<SinkMessage>,
+    metrics: &Arc<Metrics>,
+) -> Result<()> {
+    let source_file = &work.path;
+    let meta = match std::fs::metadata(source_file) {
+        Ok(meta) => meta,
+        Err(exc) => {
+            debug!(
+                "opencode sqlite metadata missing for {}: {}",
+                source_file, exc
+            );
+            return Ok(());
+        }
+    };
+    let inode = source_inode_for_file(source_file, &meta);
+    let cp_key = checkpoint_key(&work.source_name, source_file);
+    let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let checkpoint = committed.unwrap_or(Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: inode,
+        source_generation: 1,
+        last_offset: 0,
+        last_line_no: 0,
+        status: "active".to_string(),
+    });
+
+    let conn = Connection::open_with_flags(
+        source_file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open OpenCode sqlite database {}", source_file))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to set sqlite busy_timeout")?;
+    let user_version = validate_opencode_sqlite_schema(&conn)?;
+    debug!(
+        "{}:{} opencode_sqlite schema user_version={}",
+        work.source_name, source_file, user_version
+    );
+
+    let mut batch = RowBatch::default();
+    let mut max_watermark = checkpoint.last_offset;
+    let mut cursor_watermark = checkpoint.last_offset;
+    let mut cursor_row_key = String::new();
+    let mut processed_rows = 0u64;
+    let mut session_hint = String::new();
+    let mut model_hint = String::new();
+
+    loop {
+        let records = opencode_query_json_rows(
+            &conn,
+            checkpoint.last_offset,
+            cursor_watermark,
+            &cursor_row_key,
+            OPENCODE_SQLITE_PAGE_LIMIT,
+        )?;
+        if records.is_empty() {
+            break;
+        }
+
+        let page_len = records.len();
+        for (watermark, row_key, record) in records {
+            cursor_watermark = watermark;
+            cursor_row_key = row_key.clone();
+            max_watermark = max_watermark.max(watermark);
+            processed_rows = processed_rows.saturating_add(1);
+            let line_no = stable_u64(&row_key);
+            let raw_json = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
+            match normalize_record(
+                &record,
+                &work.source_name,
+                &work.harness,
+                source_file,
+                inode,
+                1,
+                line_no,
+                watermark,
+                &session_hint,
+                &model_hint,
+            ) {
+                Ok(normalized) => {
+                    session_hint = normalized.session_hint;
+                    model_hint = normalized.model_hint;
+                    batch.raw_rows.push(normalized.raw_row);
+                    batch.event_rows.extend(normalized.event_rows);
+                    batch.link_rows.extend(normalized.link_rows);
+                    batch.tool_rows.extend(normalized.tool_rows);
+                    batch.error_rows.extend(normalized.error_rows);
+                    batch.lines_processed = batch.lines_processed.saturating_add(1);
+                }
+                Err(exc) => batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": 1,
+                    "source_line_no": line_no,
+                    "source_offset": watermark,
+                    "error_kind": "normalize_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&raw_json, 20_000),
+                })),
+            }
+
+            if batch.row_count() >= config.ingest.batch_size {
+                let mut chunk = RowBatch::default();
+                chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
+                chunk.event_rows = std::mem::take(&mut batch.event_rows);
+                chunk.link_rows = std::mem::take(&mut batch.link_rows);
+                chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
+                chunk.error_rows = std::mem::take(&mut batch.error_rows);
+                chunk.lines_processed = batch.lines_processed;
+                batch.lines_processed = 0;
+                sink_tx
+                    .send(SinkMessage::Batch(chunk))
+                    .await
+                    .context("sink channel closed while sending opencode chunk")?;
+            }
+        }
+
+        if page_len < OPENCODE_SQLITE_PAGE_LIMIT {
+            break;
+        }
+    }
+
+    if processed_rows == 0 {
+        return Ok(());
+    }
+
+    batch.checkpoint = Some(Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: inode,
+        source_generation: 1,
+        last_offset: max_watermark,
+        last_line_no: processed_rows,
+        status: "active".to_string(),
+    });
+    sink_tx
+        .send(SinkMessage::Batch(batch))
+        .await
+        .context("sink channel closed while sending opencode final batch")?;
+
+    if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
+        debug!(
+            "{}:{} opencode_sqlite caught up at high_watermark={}",
+            work.source_name, source_file, max_watermark
         );
     }
 
@@ -917,12 +1271,14 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enrich_claude_model_latency,
-        infer_vendor_from_base_url, path_matches_extension, process_session_json_file,
-        run_work_item, source_inode_for_file, work_extension, SessionCursor,
-        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        infer_vendor_from_base_url, path_matches_extension, process_opencode_sqlite_file,
+        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
+        SessionCursor, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
+    use crate::checkpoint::checkpoint_key;
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+    use rusqlite::{params, Connection};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
@@ -1152,6 +1508,194 @@ mod tests {
             ..session.clone()
         };
         assert!(!path_matches_extension(&wrong.path, work_extension(&wrong)));
+
+        let opencode = WorkItem {
+            source_name: "s".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: "/tmp/opencode.db".to_string(),
+        };
+        assert_eq!(work_extension(&opencode), "db");
+        assert!(path_matches_extension(
+            &opencode.path,
+            work_extension(&opencode)
+        ));
+    }
+
+    fn create_opencode_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                parent_id TEXT,
+                slug TEXT,
+                directory TEXT,
+                title TEXT,
+                version TEXT,
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs INTEGER,
+                time_created INTEGER,
+                time_updated INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT,
+                session_id TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT
+            );",
+        )
+        .expect("create opencode schema");
+    }
+
+    fn insert_opencode_fixture_rows(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO session
+             (id, project_id, parent_id, slug, directory, title, version, share_url,
+              summary_additions, summary_deletions, summary_files, summary_diffs,
+              time_created, time_updated)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, 0, 0, 0, 0, ?7, ?8)",
+            params![
+                "ses_test",
+                "proj_test",
+                "test-session",
+                "/repo",
+                "Trace support",
+                "1.4.11",
+                1_715_000_000_000i64,
+                1_715_000_000_000i64
+            ],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "msg_assistant",
+                "ses_test",
+                1_715_000_001_000i64,
+                1_715_000_001_000i64,
+                r#"{"id":"msg_assistant","role":"assistant","providerID":"anthropic","modelID":"claude-sonnet-4.6"}"#,
+            ],
+        )
+        .expect("insert message");
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "part_tool",
+                "msg_assistant",
+                "ses_test",
+                1_715_000_002_000i64,
+                1_715_000_003_000i64,
+                r#"{"id":"part_tool","type":"tool","tool":"read","callID":"call_test","state":{"status":"completed","input":{"path":"Cargo.toml"},"output":"ok"}}"#,
+            ],
+        )
+        .expect("insert part");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_opencode_sqlite_emits_rows_and_checkpoint() {
+        let path = unique_test_file("opencode-sqlite").with_extension("db");
+        let conn = Connection::open(&path).expect("create fixture sqlite db");
+        create_opencode_schema(&conn);
+        insert_opencode_fixture_rows(&conn);
+        drop(conn);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1000;
+        let work = WorkItem {
+            source_name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        process_opencode_sqlite_file(&config, &work, checkpoints.clone(), sink_tx, &metrics)
+            .await
+            .expect("process opencode sqlite");
+
+        let SinkMessage::Batch(batch) = timeout(Duration::from_millis(500), sink_rx.recv())
+            .await
+            .expect("batch recv should not time out")
+            .expect("batch should be emitted");
+        assert!(batch.error_rows.is_empty());
+        assert_eq!(batch.raw_rows.len(), 3);
+        assert_eq!(batch.tool_rows.len(), 1);
+        assert!(batch.event_rows.iter().any(|row| {
+            row.get("event_kind").and_then(Value::as_str) == Some("session_meta")
+                && row.get("session_id").and_then(Value::as_str) == Some("opencode:ses_test")
+        }));
+        assert!(batch.event_rows.iter().any(|row| {
+            row.get("event_kind").and_then(Value::as_str) == Some("tool_result")
+                && row.get("tool_call_id").and_then(Value::as_str) == Some("call_test")
+                && row.get("model").and_then(Value::as_str) == Some("claude-sonnet-4.6")
+        }));
+
+        let checkpoint = batch.checkpoint.expect("checkpoint emitted");
+        assert_eq!(checkpoint.last_offset, 1_715_000_003_000);
+        assert_eq!(checkpoint.last_line_no, 3);
+
+        checkpoints
+            .write()
+            .await
+            .insert(checkpoint_key(&work.source_name, &work.path), checkpoint);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+        process_opencode_sqlite_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("strict watermark should process cleanly");
+        if let Ok(Some(_)) = timeout(Duration::from_millis(200), sink_rx.recv()).await {
+            panic!("strict > watermark should not re-emit rows at the checkpoint");
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_opencode_sqlite_reports_schema_drift_with_user_version() {
+        let path = unique_test_file("opencode-schema-drift").with_extension("db");
+        let conn = Connection::open(&path).expect("create fixture sqlite db");
+        conn.execute_batch(
+            "PRAGMA user_version = 123;
+             CREATE TABLE session (id TEXT PRIMARY KEY);",
+        )
+        .expect("create incomplete schema");
+        drop(conn);
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, _sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        let err = process_opencode_sqlite_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect_err("schema drift should fail clearly");
+        let text = format!("{err:#}");
+        assert!(text.contains("user_version=123"));
+        assert!(text.contains("message.*"));
+        assert!(text.contains("part.*"));
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

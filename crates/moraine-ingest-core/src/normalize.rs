@@ -69,6 +69,7 @@ enum Harness {
     ClaudeCode,
     Hermes,
     KimiCli,
+    OpenCode,
 }
 
 impl Harness {
@@ -78,8 +79,9 @@ impl Harness {
             "claude-code" => Ok(Self::ClaudeCode),
             "hermes" => Ok(Self::Hermes),
             "kimi-cli" => Ok(Self::KimiCli),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, kimi-cli",
+                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, kimi-cli, opencode",
                 raw.trim()
             )),
         }
@@ -91,6 +93,7 @@ impl Harness {
             Self::ClaudeCode => "claude-code",
             Self::Hermes => "hermes",
             Self::KimiCli => "kimi-cli",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -103,6 +106,7 @@ impl Harness {
             Self::ClaudeCode => "anthropic",
             Self::Hermes => "",
             Self::KimiCli => "moonshot",
+            Self::OpenCode => "",
         }
     }
 }
@@ -231,6 +235,36 @@ fn extract_content_types(content: &Value) -> Vec<String> {
 
 fn parse_json_string(value: &str) -> Option<Value> {
     serde_json::from_str::<Value>(value.trim()).ok()
+}
+
+trait NonEmptyStringExt {
+    fn or_else_nonempty<F: FnOnce() -> String>(self, fallback: F) -> String;
+}
+
+impl NonEmptyStringExt for String {
+    fn or_else_nonempty<F: FnOnce() -> String>(self, fallback: F) -> String {
+        if self.is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
+fn opencode_provider_model(record: &Value) -> (String, String) {
+    let message = record.get("message").unwrap_or(record);
+    let part = record.get("part").unwrap_or(&Value::Null);
+
+    let provider = to_str(message.get("providerID"))
+        .or_else_nonempty(|| to_str(message.get("provider_id")))
+        .or_else_nonempty(|| to_str(message.get("model").and_then(|m| m.get("providerID"))))
+        .or_else_nonempty(|| to_str(part.get("model").and_then(|m| m.get("providerID"))));
+    let model = to_str(message.get("modelID"))
+        .or_else_nonempty(|| to_str(message.get("model_id")))
+        .or_else_nonempty(|| to_str(message.get("model").and_then(|m| m.get("modelID"))))
+        .or_else_nonempty(|| to_str(part.get("model").and_then(|m| m.get("modelID"))));
+
+    (provider, canonicalize_model("opencode", &model))
 }
 
 fn update_string_field(row: &mut Value, key: &str, value: &str) {
@@ -3062,6 +3096,256 @@ fn normalize_kimi_cli_event(
     }
 }
 
+fn normalize_opencode_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    top_type: &str,
+    base_uid: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+    let payload_json = compact_json(record);
+    let message = record.get("message").unwrap_or(&Value::Null);
+    let part = record.get("part").unwrap_or(&Value::Null);
+    let role = to_str(message.get("role"));
+    let actor = if role == "user" { "user" } else { "assistant" };
+    let stamp_model = |row: &mut Map<String, Value>| {
+        if !model.is_empty() {
+            row.insert("model".to_string(), json!(model));
+        }
+        row.insert("item_id".to_string(), json!(to_str(record.get("row_id"))));
+        row.insert(
+            "agent_label".to_string(),
+            json!(to_str(message.get("agent"))),
+        );
+        row.insert("op_kind".to_string(), json!(to_str(part.get("type"))));
+    };
+
+    match top_type {
+        "opencode_session" => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "session_meta",
+                "session_meta",
+                "system",
+                &to_str(record.get("title")),
+                &payload_json,
+            )));
+        }
+        "opencode_message" => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "progress",
+                "progress",
+                actor,
+                &extract_message_text(message),
+                &payload_json,
+            );
+            stamp_model(&mut row);
+            events.push(Value::Object(row));
+        }
+        "opencode_part" => match to_str(part.get("type")).as_str() {
+            "text" => {
+                let text = to_str(part.get("text"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "message",
+                    if actor == "user" {
+                        "user_message"
+                    } else {
+                        "agent_message"
+                    },
+                    actor,
+                    &text,
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            "reasoning" => {
+                let text = to_str(part.get("text"));
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "reasoning",
+                    "thinking",
+                    "assistant",
+                    &text,
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                row.insert("has_reasoning".to_string(), json!(1u8));
+                events.push(Value::Object(row));
+            }
+            "tool" => {
+                let state = part.get("state").unwrap_or(&Value::Null);
+                let status = to_str(state.get("status"));
+                let call_id = to_str(part.get("callID"));
+                let tool_name = to_str(part.get("tool"));
+                let input = state.get("input").cloned().unwrap_or(Value::Null);
+                let input_json = compact_json(&input);
+                let input_text = extract_message_text(&input);
+                if status == "pending" || status == "running" {
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_call",
+                        "tool_use",
+                        "assistant",
+                        if input_text.is_empty() {
+                            &input_json
+                        } else {
+                            &input_text
+                        },
+                        &compact_json(part),
+                    );
+                    stamp_model(&mut row);
+                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+                    row.insert("tool_name".to_string(), json!(tool_name.clone()));
+                    row.insert("op_status".to_string(), json!(status));
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "request",
+                        0,
+                        &input_json,
+                        "",
+                        "",
+                    ));
+                } else {
+                    let output_text = if status == "error" {
+                        to_str(state.get("error"))
+                    } else {
+                        to_str(state.get("output"))
+                    };
+                    let error = u8::from(status == "error");
+                    let mut row = base_event_obj(
+                        ctx,
+                        base_uid,
+                        "tool_result",
+                        "tool_result",
+                        "tool",
+                        &output_text,
+                        &compact_json(part),
+                    );
+                    stamp_model(&mut row);
+                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
+                    row.insert("tool_name".to_string(), json!(tool_name.clone()));
+                    row.insert("tool_error".to_string(), json!(error));
+                    row.insert("op_status".to_string(), json!(status));
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        base_uid,
+                        &call_id,
+                        "",
+                        &tool_name,
+                        "response",
+                        error,
+                        "",
+                        &compact_json(state),
+                        &output_text,
+                    ));
+                }
+            }
+            "step-finish" => {
+                let tokens = part.get("tokens").unwrap_or(&Value::Null);
+                let cache = tokens.get("cache").unwrap_or(&Value::Null);
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "progress",
+                    "progress",
+                    "system",
+                    &to_str(part.get("reason")),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                row.insert("op_status".to_string(), json!(to_str(part.get("reason"))));
+                row.insert(
+                    "input_tokens".to_string(),
+                    json!(to_u32(tokens.get("input"))),
+                );
+                row.insert(
+                    "output_tokens".to_string(),
+                    json!(to_u32(tokens.get("output"))),
+                );
+                row.insert(
+                    "cache_read_tokens".to_string(),
+                    json!(to_u32(cache.get("read"))),
+                );
+                row.insert(
+                    "cache_write_tokens".to_string(),
+                    json!(to_u32(cache.get("write"))),
+                );
+                row.insert("token_usage_json".to_string(), json!(compact_json(tokens)));
+                events.push(Value::Object(row));
+            }
+            "patch" | "file" | "snapshot" => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "file_history_snapshot",
+                    "file-history-snapshot",
+                    "system",
+                    &extract_message_text(part),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            "compaction" => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "summary",
+                    "compacted",
+                    "system",
+                    "",
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+            _ => {
+                let mut row = base_event_obj(
+                    ctx,
+                    base_uid,
+                    "progress",
+                    "progress",
+                    "system",
+                    &extract_message_text(part),
+                    &compact_json(part),
+                );
+                stamp_model(&mut row);
+                events.push(Value::Object(row));
+            }
+        },
+        _ => {
+            events.push(Value::Object(base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                "unknown",
+                "system",
+                &extract_message_text(record),
+                &payload_json,
+            )));
+        }
+    }
+
+    (events, links, tools)
+}
+
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
@@ -3081,11 +3365,18 @@ pub fn normalize_record(
     // harness. Hermes is different: the vendor is encoded inside the record's
     // `model` field as `vendor/model`, so we parse it here and use the parsed
     // value throughout the context.
-    let (inference_provider, hermes_model) = if harness == Harness::Hermes {
+    let (inference_provider, hermes_model, opencode_model) = if harness == Harness::Hermes {
         let (vendor, model) = split_hermes_vendor_model(&to_str(record.get("model")));
-        (vendor, model)
+        (vendor, model, String::new())
+    } else if harness == Harness::OpenCode {
+        let (provider, model) = opencode_provider_model(record);
+        (provider, String::new(), model)
     } else {
-        (harness.inference_provider().to_string(), String::new())
+        (
+            harness.inference_provider().to_string(),
+            String::new(),
+            String::new(),
+        )
     };
 
     let (record_ts, event_ts, event_ts_parse_failed) = if harness == Harness::KimiCli {
@@ -3125,6 +3416,12 @@ pub fn normalize_record(
     } else {
         String::new()
     };
+    if harness == Harness::OpenCode {
+        let explicit = to_str(record.get("session_id"));
+        if !explicit.is_empty() {
+            session_id = format!("opencode:{explicit}");
+        }
+    }
     if session_id.is_empty() && harness != Harness::Hermes && harness != Harness::KimiCli {
         session_id = if session_hint.is_empty() {
             infer_session_id_from_file(source_file)
@@ -3145,12 +3442,27 @@ pub fn normalize_record(
 
     let raw_json = compact_json(record);
     let stored_raw_json = truncate_chars(&raw_json, RAW_JSON_LIMIT);
+    let effective_source_offset = if harness == Harness::OpenCode {
+        0
+    } else {
+        source_offset
+    };
+    let record_fingerprint = if harness == Harness::OpenCode {
+        let row_id = to_str(record.get("row_id"));
+        if row_id.is_empty() {
+            raw_json.clone()
+        } else {
+            format!("{top_type}:{row_id}")
+        }
+    } else {
+        raw_json.clone()
+    };
     let base_uid = event_uid(
         source_file,
         source_generation,
         source_line_no,
-        source_offset,
-        &raw_json,
+        effective_source_offset,
+        &record_fingerprint,
         "raw",
     );
     if harness == Harness::Hermes {
@@ -3170,7 +3482,7 @@ pub fn normalize_record(
         "source_inode": source_inode,
         "source_generation": source_generation,
         "source_line_no": source_line_no,
-        "source_offset": source_offset,
+        "source_offset": effective_source_offset,
         "record_ts": record_ts,
         "top_type": top_type,
         "session_id": session_id,
@@ -3189,7 +3501,7 @@ pub fn normalize_record(
             "source_inode": source_inode,
             "source_generation": source_generation,
             "source_line_no": source_line_no,
-            "source_offset": source_offset,
+            "source_offset": effective_source_offset,
             "error_kind": "timestamp_parse_error",
             "error_text": format!(
                 "timestamp is missing or not supported ISO8601/RFC3339; used {} UTC fallback",
@@ -3209,7 +3521,7 @@ pub fn normalize_record(
         source_inode,
         source_generation,
         source_line_no,
-        source_offset,
+        source_offset: effective_source_offset,
         record_ts: &record_ts,
         event_ts: &event_ts,
     };
@@ -3225,6 +3537,9 @@ pub fn normalize_record(
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
         Harness::KimiCli => normalize_kimi_cli_event(record, &ctx, &top_type, &base_uid),
+        Harness::OpenCode => {
+            normalize_opencode_event(record, &ctx, &top_type, &base_uid, &opencode_model)
+        }
     };
 
     // For Hermes, resolve_model_hint's fallback should be the already-split
@@ -3232,6 +3547,8 @@ pub fn normalize_record(
     // the verbatim model rather than the combined `vendor/model` string.
     let hint_fallback = if harness == Harness::Hermes {
         hermes_model.as_str()
+    } else if harness == Harness::OpenCode {
+        opencode_model.as_str()
     } else {
         model_hint
     };

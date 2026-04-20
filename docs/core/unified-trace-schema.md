@@ -1,6 +1,6 @@
 # Unified Trace Schema Mapping
 
-This page maps raw trace fields into the unified `moraine.events` table so you can move directly from source data to canonical columns when querying ClickHouse. Codex, Claude Code, Kimi CLI, and Hermes normalize into the same table, with format-specific notes after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs]
+This page maps raw trace fields into the unified `moraine.events` table so you can move directly from source data to canonical columns when querying ClickHouse. Codex, Claude Code, Kimi CLI, OpenCode, and Hermes normalize into the same table, with format-specific notes after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs]
 
 ## Field Mapping Table
 
@@ -93,3 +93,7 @@ Live Hermes CLI / gateway sessions land at `~/.hermes/sessions/session_<ts>_<id>
 Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Wire records with `message.type=TurnBegin` or `SteerInput` become `message` / `user_message` rows. `ContentPart` with `type=text` becomes an assistant message, while `type=think` becomes a `reasoning` / `thinking` row. `ToolCall` and `ToolResult` map to `tool_call` and `tool_result` plus `tool_io` rows keyed by the Kimi tool call id. `StatusUpdate.token_usage` maps input, output, and cache token counters. Session ids are derived from the parent session directory and namespaced as `kimi-cli:<session-id>`.
 
 Kimi `context.jsonl` can be configured explicitly for role-based replay. It lacks per-line timestamps, so Moraine assigns deterministic synthetic timestamps to preserve stable ordering without producing timestamp parse errors.
+
+## OpenCode Mapping
+
+OpenCode defaults to `~/.local/share/opencode/opencode.db` with `format = "opencode_sqlite"`. Moraine opens the database read-only and synthesizes records from `session`, `message`, and `part` tables. Session rows become `session_meta`; text parts become user or assistant message rows according to their parent message role; reasoning parts become `reasoning`; tool parts become `tool_call` or `tool_result` with `tool_io`; and step-finish parts map token usage into the canonical token columns. `providerID` and `modelID` populate `inference_provider` and `model`.
