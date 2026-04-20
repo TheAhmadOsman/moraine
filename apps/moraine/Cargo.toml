@@ -15,3 +15,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }
+moraine-source-status = { path = "../../crates/moraine-source-status" }

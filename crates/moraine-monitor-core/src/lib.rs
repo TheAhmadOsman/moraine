@@ -19,11 +19,13 @@ use tokio::time::Instant;
 
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
+use moraine_source_status::build_source_status_snapshot;
 
 #[derive(Clone)]
 struct AppState {
     clickhouse: ClickHouseClient,
     static_dir: PathBuf,
+    cfg: AppConfig,
 }
 
 #[derive(Deserialize)]
@@ -52,11 +54,12 @@ pub async fn run_server(
 ) -> Result<()> {
     validate_static_dir(&static_dir)?;
 
-    let clickhouse = ClickHouseClient::new(cfg.clickhouse)?;
+    let clickhouse = ClickHouseClient::new(cfg.clickhouse.clone())?;
 
     let state = AppState {
         clickhouse,
         static_dir,
+        cfg,
     };
 
     let app = Router::new()
@@ -67,6 +70,7 @@ pub async fn run_server(
         .route("/api/web-searches", get(api_web_searches))
         .route("/api/tables/:table", get(api_table_rows))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/sources", get(api_sources))
         .fallback(get(static_fallback))
         .with_state(state.clone());
 
@@ -689,6 +693,19 @@ async fn api_sessions(
         Ok(payload) => json_response(payload, StatusCode::OK),
         Err(error) => json_response(
             json!({"ok": false, "error": format!("sessions query failed: {error}")}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    }
+}
+
+async fn api_sources(State(state): State<AppState>) -> Response {
+    match build_source_status_snapshot(&state.cfg, true).await {
+        Ok(snapshot) => json_response(
+            json!({"ok": true, "sources": snapshot.sources, "query_error": snapshot.query_error}),
+            StatusCode::OK,
+        ),
+        Err(error) => json_response(
+            json!({"ok": false, "error": error.to_string()}),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
     }

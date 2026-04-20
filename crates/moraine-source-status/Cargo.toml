@@ -1,0 +1,11 @@
+[package]
+name = "moraine-source-status"
+version = "0.4.3"
+edition = "2021"
+description = "Shared ingest source health snapshot builder for CLI and monitor"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+moraine-config = { path = "../moraine-config" }
+moraine-clickhouse = { path = "../moraine-clickhouse" }

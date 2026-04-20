@@ -14,3 +14,4 @@ serde_json = "1.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs"] }
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+moraine-source-status = { path = "../moraine-source-status" }

@@ -2,10 +2,11 @@
   import { get } from 'svelte/store';
   import { onMount } from 'svelte';
   import AnalyticsPanel from './lib/components/AnalyticsPanel.svelte';
+  import SourcesStrip from './lib/components/SourcesStrip.svelte';
   import StatusStrip from './lib/components/StatusStrip.svelte';
   import SessionsPanel from './lib/components/sessions/SessionsPanel.svelte';
   import TopBar from './lib/components/TopBar.svelte';
-  import { fetchAnalytics, fetchHealth, fetchStatus } from './lib/api/client';
+  import { fetchAnalytics, fetchHealth, fetchSources, fetchStatus } from './lib/api/client';
   import { fetchSessions } from './lib/api/sessions';
   import { FAST_POLL_INTERVAL_MS, SLOW_POLL_INTERVAL_MS } from './lib/constants';
   import { analyticsRangeStore } from './lib/state/monitor';
@@ -21,6 +22,7 @@
     AnalyticsRangeKey,
     AnalyticsResponse,
     HealthResponse,
+    SourcesResponse,
     StatusResponse,
   } from './lib/types/api';
   import type { Harness, Session, SessionsFilter } from './lib/types/sessions';
@@ -36,6 +38,9 @@
 
   let analyticsPayload: AnalyticsResponse | null = null;
   let analyticsError: string | null = null;
+
+  let sourcesData: SourcesResponse | null = null;
+  let sourcesError: string | null = null;
 
   $: sessions = $sessionsStore;
   $: filteredSessions = $filteredSessionsStore;
@@ -95,6 +100,16 @@
     }
   }
 
+  async function loadSources(): Promise<void> {
+    try {
+      sourcesData = await fetchSources();
+      sourcesError = null;
+    } catch (error) {
+      sourcesError = errorMessage(error);
+      sourcesData = null;
+    }
+  }
+
   async function loadSessions(): Promise<void> {
     sessionsLoadingStore.set(true);
     try {
@@ -109,7 +124,7 @@
   }
 
   async function hydrateFast(): Promise<void> {
-    await Promise.all([loadHealth(), loadStatus()]);
+    await Promise.all([loadHealth(), loadStatus(), loadSources()]);
   }
 
   async function hydrateSlow(): Promise<void> {
@@ -160,6 +175,12 @@
 
   <main class="layout">
     <StatusStrip health={healthData} {healthError} status={statusData} {statusError} />
+
+    <SourcesStrip
+      sources={sourcesData?.sources ?? null}
+      error={sourcesError}
+      queryError={sourcesData?.query_error ?? null}
+    />
 
     <AnalyticsPanel
       payload={analyticsPayload}
