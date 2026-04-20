@@ -2,80 +2,138 @@
 
 ## Runtime Responsibility
 
-`moraine-ingest` is the sole writer that transforms configured agent traces into canonical event rows. It tails append-only JSONL sources for Codex, Claude Code, Kimi CLI, and Hermes trajectory exports; reads rewritten Hermes live-session JSON snapshots; and reads OpenCode's local SQLite session database through the `opencode_sqlite` source format. It owns file-change detection, append-safe or format-aware consumption, schema-aware normalization, and batched persistence with checkpoint advancement. Although retrieval runs elsewhere, this service defines the invariants retrieval depends on: stable event identity and source provenance. [src: crates/moraine-ingest-core/src/lib.rs, crates/moraine-ingest-core/src/dispatch.rs, crates/moraine-ingest-core/src/normalize.rs, config/moraine.toml]
+`moraine-ingest` is the sole writer that transforms configured agent traces into canonical event rows. It tails append-oriented JSONL sources, handles rewritten Hermes session JSON snapshots, reads OpenCode SQLite databases, records non-fatal errors, advances checkpoints, and emits ingest heartbeats. Retrieval and monitor surfaces depend on this service for stable event identity, source provenance, and freshness. [src: apps/moraine-ingest, crates/moraine-ingest-core]
 
-The process is started with a multi-thread Tokio runtime and a TOML config. At startup it pings ClickHouse, loads checkpoint state from `ingest_checkpoints`, instantiates channels and concurrency guards, and then starts watcher, debounce, reconcile, worker, sink, and heartbeat loops. The startup sequence intentionally front-loads dependency failure: if ClickHouse is unreachable, ingestion does not enter a partially alive state. [src: rust/ingestor/src/main.rs:L28, rust/ingestor/src/ingestor.rs:L47, rust/ingestor/src/ingestor.rs:L49, rust/ingestor/src/ingestor.rs:L145]
+Supported configured source formats are:
+
+| Format | Typical sources | Processing model |
+|---|---|---|
+| `jsonl` | Codex, Claude Code, Kimi wire logs, Hermes trajectories | Resume by byte offset and line number. |
+| `session_json` | Hermes live sessions | Read whole rewritten JSON document and emit newly appeared messages. |
+| `opencode_sqlite` | OpenCode local database | Open read-only SQLite, validate schema, page rows by strict watermark. |
+
+Sources are declared in `[[ingest.sources]]` with `name`, `harness`, `glob`, `watch_root`, `enabled`, and `format`. Empty `format` is inferred where possible, but explicit formats are preferred for non-JSONL sources. [src: crates/moraine-config/src/lib.rs, config/moraine.toml]
 
 ## Execution Model
 
-The runtime is a hybrid of event-driven and reconciliation-driven scheduling. A watcher thread forwards file events to debounce logic, while reconcile periodically scans the full sessions glob. This dual path exists because watcher streams can drop events; reconcile guarantees eventual reinspection. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L230, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L752]
+The runtime is a hybrid of event-driven and reconciliation-driven scheduling. Watcher threads forward source path events to the dispatch queue, while reconcile periodically enumerates all enabled sources. This dual path exists because filesystem notifications are latency hints, not a completeness guarantee. [src: crates/moraine-ingest-core/src/watch.rs, crates/moraine-ingest-core/src/reconcile.rs]
 
-Dispatch state uses `pending`, `inflight`, and `dirty`. Updates that arrive while a path is inflight are marked dirty, then replayed immediately after inflight completion. This preserves edits that race with long reads without queue blow-up. [src: rust/ingestor/src/ingestor.rs:L23, rust/ingestor/src/ingestor.rs:L124, rust/ingestor/src/ingestor.rs:L135, rust/ingestor/src/ingestor.rs:L536]
+Dispatch state tracks pending, inflight, and dirty work. If a source changes while it is already being processed, the path is marked dirty and replayed after the current run finishes. This avoids dropping writes that race with long reads without allowing unbounded duplicate work.
 
-Concurrency is bounded by a semaphore (`max_file_workers`) and channel capacities (`max_inflight_batches`, derived process queue capacity). Worker tasks are spawned per file with owned semaphore permits, and sink writes are serialized by a single sink task. This architecture avoids lock-heavy shared mutable write paths while still allowing high parallelism in read/parse/normalize stages. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L106]
+Concurrency is bounded by `max_file_workers` and channel capacities. Worker tasks parse and normalize source data; a single sink task serializes batched ClickHouse writes and checkpoint updates. This keeps the write path simple and makes flush ordering auditable. [src: crates/moraine-ingest-core/src/dispatch.rs, crates/moraine-ingest-core/src/sink.rs]
+
+## Watchers, WAL Siblings, and Reconcile
+
+Each enabled source registers a watcher on its `watch_root`. Native watchers are preferred; poll watchers are used as fallback when native setup fails. Watcher metrics are recorded in heartbeats, including backend label, registration count, watcher errors, reset count, and last reset timestamp. [src: crates/moraine-ingest-core/src/watch.rs, crates/moraine-ingest-core/src/sink.rs]
+
+OpenCode writes live data through SQLite WAL sidecars. The watcher maps `opencode.db-wal` and `opencode.db-shm` events back to the configured base `.db` path, so OpenCode live writes can trigger ingest promptly instead of waiting for the next reconcile scan.
+
+Reconcile remains the recovery path for missed watcher events, newly copied files, directory changes, and watcher resets. Disabling or starving reconcile weakens completeness guarantees.
 
 ## Checkpoint and File Identity Semantics
 
-Checkpoint state is persisted in ClickHouse and cached in memory. Identity is `(source_file, source_inode, source_generation, last_offset, last_line_no)` plus status. `source_generation` is the anti-corruption key: if inode changes or file size drops below offset, generation increments and offsets reset, making rotation/truncation safe. [src: rust/ingestor/src/model.rs:L5, rust/ingestor/src/ingestor.rs:L584, rust/ingestor/src/ingestor.rs:L586, sql/001_schema.sql:L95]
+Checkpoint state is persisted in ClickHouse and cached in memory. The logical identity includes source name, source file, inode, generation, offset, and line/message/watermark cursor. The exact cursor meaning depends on format:
 
-A file is skipped when current size equals checkpoint offset and generation is unchanged. This optimization removes unnecessary scans on quiet files. Conversely, any generation change causes processing even if no new bytes are present, because downstream consumers need the checkpoint transition persisted to avoid stale inode assumptions later. [src: rust/ingestor/src/ingestor.rs:L593, rust/ingestor/src/ingestor.rs:L711]
+- `jsonl`: byte offset plus line number.
+- `session_json`: emitted message count stored in `last_line_no`.
+- `opencode_sqlite`: strict high watermark over extracted OpenCode rows.
 
-Checkpoint updates are merged in-memory before flush. Replacement policy prefers higher generation, then higher offset within generation. This ensures that out-of-order chunk completion cannot regress progress. Because updates are eventually persisted through `ReplacingMergeTree(updated_at)`, retries are safe and idempotent at the logical checkpoint level. [src: rust/ingestor/src/ingestor.rs:L427, rust/ingestor/src/ingestor.rs:L434, sql/001_schema.sql:L104]
+Generation rollover protects append logs from truncation and rotation. If inode changes or file size drops below the stored offset, the source generation advances and offsets reset. Replacement policy prefers higher generation and then higher progress within a generation.
+
+Checkpoint writes happen after data writes in the sink flush order. If a flush fails before the checkpoint lands, the source can be retried and may re-emit rows, but it will not skip unseen data.
 
 ## Normalization Contract
 
-Normalization starts with a raw ledger row storing original JSON, top-level type, hash, inferred session ID, and source coordinates. This row is emitted for every parseable object and remains the forensic replay surface. [src: rust/ingestor/src/normalize.rs:L372, sql/001_schema.sql:L3]
+Every parseable source object first becomes a `raw_events` row with original JSON, hash, top-level type, inferred session ID, source coordinates, and source name. Canonical rows are then produced from typed normalizer branches and inserted into `events`, `event_links`, and `tool_io` as appropriate. [src: crates/moraine-ingest-core/src/normalize.rs, sql/001_schema.sql]
 
-Canonical event rows are produced by branching on top-level type and payload subtype. Modern envelopes and legacy top-level records are mapped into shared fields (`event_class`, `payload_type`, `actor_role`, `call_id`, `name`, `text_content`), preserving compatibility across historical formats. [src: rust/ingestor/src/normalize.rs:L469, rust/ingestor/src/normalize.rs:L614, rust/ingestor/src/normalize.rs:L664]
+Ingest-time privacy redaction runs after source-specific normalization and before sink batching. When enabled, it mutates configured string surfaces in the normalized record before ClickHouse insertion, so `raw_events`, `events`, and `tool_io` store the redacted, hashed, or dropped representation for future rows. [src: crates/moraine-ingest-core/src/normalize.rs, crates/moraine-privacy/src/lib.rs]
 
-Event identity is deterministic and source-based. `event_uid` is SHA-256 over source coordinates, generation, payload fingerprint, and suffix. That means replay of unchanged input yields stable IDs, while semantically distinct expansions (for example compacted-history children) receive unique suffix-scoped IDs. Deterministic identity is foundational for replacement-table semantics and trace joins. [src: rust/ingestor/src/normalize.rs:L100, rust/ingestor/src/normalize.rs:L108, rust/ingestor/src/normalize.rs:L675]
+Canonical event identity is deterministic and source-based. `event_uid` derives from source coordinates, generation, payload fingerprint, and suffix. When one raw record expands into several semantic events, each child receives a distinct suffix-scoped UID.
 
-`compacted` records are represented as one parent `compacted_raw` row plus expanded children from `replacement_history`, each linked by `compacted_parent_uid`. This preserves both compaction boundaries and chronological detail. [src: rust/ingestor/src/normalize.rs:L674, rust/ingestor/src/normalize.rs:L694, rust/ingestor/src/normalize.rs:L716, sql/002_views.sql:L6]
+Payload size is bounded. Raw JSON and canonical `payload_json` are capped before ClickHouse insertion, and text extraction walks known structures with limits. This prevents one pathological source record from amplifying memory or storage usage without bound.
 
-Text extraction is recursively schema-aware but bounded. Message extraction walks nested arrays/objects and collects string fields from known keys, truncating very large strings to cap memory. Function arguments and tool output are similarly bounded at high character limits. This keeps indexing useful for verbose payloads without allowing unbounded per-row memory amplification. [src: rust/ingestor/src/normalize.rs:L53, rust/ingestor/src/normalize.rs:L89, rust/ingestor/src/normalize.rs:L498, rust/ingestor/src/normalize.rs:L526]
+Token accounting is preserved in `token_usage_json` instead of being forced into provider-specific fixed columns. Downstream analytics can parse provider-specific token payloads when needed.
 
-Hermes trajectories require one additional normalization rule: a single ShareGPT JSONL line can contain an entire completed rollout. The normalizer therefore emits one synthetic session per raw trajectory row, expands `conversations[]` into ordered canonical events, and assigns microsecond offsets from the trajectory timestamp so `v_conversation_trace` preserves in-trajectory ordering even though the source format only stores one top-level timestamp. Tool calls are extracted from embedded `<tool_call>` blocks, tool results from `<tool_response>` blocks, and `<think>` content becomes canonical `reasoning` rows.
+## Source-Specific Behavior
 
-Hermes **live sessions** use a different on-disk format and a different processor path. The agent writes one JSON file per conversation at `~/.hermes/sessions/session_<ts>_<id>.json` and rewrites it in place via atomic rename on every turn, so the append-only byte-offset tailing the JSONL path relies on would break (new inode every save, no "appended bytes" to diff). Sources with `format = "session_json"` on `IngestSource` dispatch to a dedicated processor that loads the whole document, compares `messages.len()` to the checkpoint's `last_line_no` cursor, and synthesises one `session_meta` plus one `session_message` pseudo-record per newly appeared message. Event identity is pinned with synthetic `source_inode = 0` / `source_generation = 1` so `event_uid`s stay stable across saves and the ReplacingMergeTree on `events` dedupes any re-emits that slip through. Each OpenAI chat-completions message is mapped one-for-one: `role=user` → `message`/user, `role=assistant` → optional `reasoning` + optional `message` + one `tool_call` per `tool_calls[]` entry, `role=tool` → `tool_result` with correlation via `tool_call_id`. The inference vendor is pre-prepended to the session's bare `model` string from `base_url` (e.g. `https://api.anthropic.com` → `anthropic/claude-opus-4-6`) before it reaches the shared Hermes normalizer, keeping `inference_provider` consistent across the trajectory and live paths. [src: crates/moraine-ingest-core/src/dispatch.rs, crates/moraine-ingest-core/src/normalize.rs]
+### Codex
 
-Kimi CLI support uses `~/.kimi/sessions/**/wire.jsonl` by default. The wire log carries UNIX-second timestamps and typed envelopes such as `TurnBegin`, `ContentPart`, `ToolCall`, `ToolResult`, and `StatusUpdate`; Moraine maps those to user/assistant messages, reasoning rows, tool I/O, progress rows, and token-count events. If a user explicitly configures Kimi `context.jsonl`, Moraine also handles role-based records (`user`, `assistant`, `tool`, `_system_prompt`, `_usage`, `_checkpoint`) and assigns deterministic synthetic timestamps because that file does not carry per-record times.
+Codex JSONL records are normalized into messages, reasoning, tool calls/results, compacted-history links, token usage, and provider/model metadata. Modern and legacy payload shapes are handled in the shared normalizer.
 
-OpenCode support uses `format = "opencode_sqlite"` against `~/.local/share/opencode/opencode.db`. The dispatcher opens the database read-only, validates the expected `session`, `message`, and `part` tables with `PRAGMA user_version` included in schema errors, and pages rows in strict watermark order. SQLite WAL sibling events (`opencode.db-wal` and `opencode.db-shm`) are mapped back to the base database path so live writes do not have to wait for the reconcile interval. `part` rows are the primary searchable content: text parts become user or assistant messages, reasoning parts become `reasoning` rows, tool parts become tool result/call rows with `tool_io`, and step-finish parts carry token fields.
+### Claude Code
 
-Token accounting is preserved rather than normalized into fixed numeric columns. For `event_msg` payloads with `token_count` type, the service stores a compact JSON blob in `token_usage_json`. This keeps ingestion schema-forward compatible with evolving token metadata while allowing downstream extraction in SQL when needed. [src: rust/ingestor/src/normalize.rs:L624, sql/001_schema.sql:L43]
+Claude Code JSONL records map user/assistant/tool events into the same canonical fields as Codex. External IDs and tool-use/result relationships are split into stable event UIDs and links so conversation reconstruction and tool lineage remain queryable.
 
-## Sink, Flush, and Durability Semantics
+### Kimi CLI
 
-The sink task is the ingestion durability boundary. Workers send `RowBatch` messages; sink aggregates rows and flushes on batch threshold or timer. Heartbeats are emitted from the same loop to expose queue depth, flush latency, and counters. [src: rust/ingestor/src/ingestor.rs:L311, rust/ingestor/src/ingestor.rs:L345, rust/ingestor/src/ingestor.rs:L362, rust/ingestor/src/ingestor.rs:L390]
+Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Wire events carry typed envelopes such as turn boundaries, content parts, tool calls/results, status updates, and token counters. The normalizer splits Kimi parsing into context-record and wire-event paths.
 
-Flush order is fixed and intentional: `raw_events` first, `events` second, `event_links` third, `tool_io` fourth, `ingest_errors` fifth, and `ingest_checkpoints` last. The ordering prioritizes data availability before progress advancement. If flush fails before checkpoint insert, retried processing may duplicate rows but will not skip unseen data; this is exactly the intended at-least-once safety property. [src: rust/ingestor/src/ingestor.rs:L597, rust/ingestor/src/ingestor.rs:L598, rust/ingestor/src/ingestor.rs:L599, rust/ingestor/src/ingestor.rs:L600, rust/ingestor/src/ingestor.rs:L601, rust/ingestor/src/ingestor.rs:L603]
+If Kimi `context.jsonl` is explicitly configured, Moraine supports role-based records such as user, assistant, tool, system prompt, usage, and checkpoint. Untimestamped Kimi rows receive deterministic synthetic timestamps based on source line number; append-to-visible latency statistics skip those synthetic Kimi timestamps so latency metrics are not polluted by synthetic epoch-derived times. [src: crates/moraine-ingest-core/src/normalize.rs, crates/moraine-ingest-core/src/sink.rs]
 
-On successful flush, counters and checkpoint cache advance. On failure, buffers remain resident and `flush_failures` increments; the service does not crash immediately. This favors continuity under transient DB instability but requires operators to monitor heartbeat error fields and queue depth. [src: rust/ingestor/src/ingestor.rs:L492, rust/ingestor/src/ingestor.rs:L500, rust/ingestor/src/ingestor.rs:L513, sql/003_ingest_heartbeats.sql:L14]
+### OpenCode
 
-## Backpressure and Scheduling Under Load
+OpenCode uses `format = "opencode_sqlite"` against `~/.local/share/opencode/opencode.db`. The dispatcher opens SQLite with defensive read-only flags, validates expected `session`, `message`, and `part` tables, includes `PRAGMA user_version` in schema drift errors, and pages rows in strict watermark order with limits. [src: crates/moraine-ingest-core/src/dispatch.rs]
 
-Backpressure emerges naturally from bounded channels and semaphore limits. If workers produce faster than sink can flush, sink channel saturation slows worker sends. If enqueue rate exceeds worker drain rate, `queue_depth` rises and can be observed in heartbeat rows. This architecture avoids runaway memory on the happy path while providing clear observability when the system nears capacity. [src: rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L393, rust/ingestor/src/ingestor.rs:L545]
+OpenCode `part` rows are the primary searchable content. Text parts become user/assistant messages, reasoning parts become reasoning rows, tool parts become tool I/O rows, and step-finish rows preserve token usage.
 
-Debounce interval tuning materially changes behavior under churn. Very low debounce values reduce trigger latency but increase duplicate scheduling pressure; higher values coalesce better but delay visibility. The default of 50 ms is a compromise oriented toward fast local append workloads. Reconcile interval similarly trades CPU scan cost for missed-event recovery delay; default is 30 s. [src: config/moraine.toml:L18-19, rust/ingestor/src/ingestor.rs:L238]
+### Hermes
 
-Batch size and flush interval jointly define visibility cadence and insert efficiency. Larger batches and longer flush intervals reduce insert overhead and improve throughput; smaller values improve freshness at higher request rates and write amplification. The sink’s timer-based flush means low-traffic files still become visible promptly without waiting for high batch thresholds. [src: config/moraine.toml:L12-13, rust/ingestor/src/ingestor.rs:L326, rust/ingestor/src/ingestor.rs:L362]
+Hermes trajectories are JSONL exports where one row can represent a completed rollout. Moraine expands ShareGPT-style conversations into canonical events with synthetic ordering offsets inside the trajectory.
 
-## Failure Modes and Recovery Behavior
+Hermes live sessions use `format = "session_json"` because the files are rewritten snapshots. The processor reads the whole file, compares message count to checkpoint progress, emits session metadata plus newly appeared messages, and keeps event IDs stable across atomic rewrites.
 
-The highest-risk correctness failure mode is stale progress across file lifecycle changes. Generation rollover resets offsets on inode change or shrink; removing this logic can silently skip rotated data. [src: rust/ingestor/src/ingestor.rs:L584, rust/ingestor/src/ingestor.rs:L587]
+## Sink, Flush, and Durability
 
-Watcher unreliability is handled by design: reconcile rescans for eventual rediscovery, and checkpoints guarantee resumed offsets. If reconcile is disabled, correctness is no longer defensible under missed events. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, rust/ingestor/src/ingestor.rs:L572]
+The sink is the ingestion durability boundary. It receives `RowBatch` messages from workers, aggregates rows, flushes by threshold or timer, and emits heartbeats on the configured interval.
 
-Malformed records are logged to `ingest_errors` and skipped. This prevents pipeline stalls but can hide upstream regressions if error rates are not observed. Operational policy should treat increasing `ingest_errors` as a schema drift signal requiring normalization updates, not as harmless noise. [src: rust/ingestor/src/ingestor.rs:L648, sql/001_schema.sql:L80]
+Flush order is fixed:
 
-During prolonged ClickHouse outages, in-memory buffers can grow because failed flushes keep data resident. The system does not currently implement disk-backed queue spill or adaptive throttling. For heavy ingestion workloads, this is the primary known limitation and should inform incident response: restore DB availability quickly or temporarily reduce input rate. [src: rust/ingestor/src/ingestor.rs:L512, rust/ingestor/src/clickhouse.rs:L62]
+1. `raw_events`
+2. `events`
+3. `event_links`
+4. `tool_io`
+5. `ingest_errors`
+6. `ingest_checkpoints`
 
-## Tuning and Extension Guidance
+Data-before-progress ordering is the core safety property. It accepts at-least-once insertion and relies on stable identity plus replacing table semantics for convergence.
 
-When tuning throughput, change one parameter class at a time and observe heartbeats and lag indicators. Typical order is: increase `max_file_workers`, then `batch_size`, then adjust `flush_interval_seconds`, then revisit `max_inflight_batches`. Simultaneous broad changes make causal attribution impossible under bursty append traffic. [src: config/moraine.toml:L11-L12, config/moraine.toml:L15-L16, sql/003_ingest_heartbeats.sql:L5]
+On successful flush, counters and checkpoint cache advance. On failure, buffers remain resident and flush failure metrics increase. Moraine does not currently spill failed batches to disk, so prolonged ClickHouse outages under sustained input can create memory pressure.
 
-When adding new event payload shapes, extend `normalize_record` rather than branching downstream SQL to interpret raw payload blobs. Canonical field population is the contract boundary; if it weakens, retrieval and analytics logic accumulate format-specific conditionals and eventually diverge. Every new branch should preserve source coordinates, deterministic UID behavior, and payload JSON preservation semantics. [src: rust/ingestor/src/normalize.rs:L157, rust/ingestor/src/normalize.rs:L177, rust/ingestor/src/normalize.rs:L336]
+## Heartbeats and Observability
 
-When changing extraction or token-usage capture, verify impacts in both canonical tables and search projections. Search materialized views depend on non-empty `text_content`; extraction regressions directly reduce recall and can appear as retrieval quality failures rather than ingestion incidents. This coupling is subtle and should be tested explicitly after normalization edits. [src: sql/004_search_index.sql:L53, sql/004_search_index.sql:L80, rust/ingestor/src/normalize.rs:L651]
+Ingest heartbeats report queue depth, active/watched files, flush counters, flush latency, watcher backend, watcher errors/resets, and latest error text. `moraine status` reads heartbeat data for service-level health. `moraine sources status` and monitor `/api/sources` read checkpoint/raw/error tables for source-level health. [src: crates/moraine-ingest-core/src/sink.rs, crates/moraine-source-status/src/lib.rs]
 
-The implementation is intentionally explicit. Preserve that property when extending the service.
+Use source health to answer questions heartbeats cannot answer alone:
+
+- Which configured source has no data yet?
+- Which source has errors but still has usable rows?
+- Which source is disabled?
+- Which source path/glob is being watched?
+- What is the latest source-specific ingest error?
+
+## Failure Modes and Recovery
+
+Stale progress across source lifecycle changes is the highest-risk correctness failure. Preserve generation rollover and strict watermark behavior when editing dispatch code.
+
+Malformed records are logged and skipped. This prevents pipeline stalls but can hide upstream schema drift if operators ignore `ingest_errors`.
+
+Watcher failures are recoverable through reconcile, but only if reconcile remains enabled and source globs are correct.
+
+OpenCode schema drift is recoverable by updating the dispatcher once upstream structure is understood. Until then, schema errors should be visible in source health and logs rather than silently producing partial rows.
+
+ClickHouse outages should be handled by restoring DB availability quickly or reducing input rate. The current system is not a durable disk-backed queue.
+
+## Extension Guidance
+
+When adding a new source or payload shape:
+
+1. Add or validate config harness/format semantics in `moraine-config`.
+2. Keep dispatch format-specific behavior in `moraine-ingest-core/src/dispatch.rs`.
+3. Keep canonical field mapping in `moraine-ingest-core/src/normalize.rs`.
+4. Preserve source coordinates and deterministic event UID behavior.
+5. Bound raw and canonical payload sizes.
+6. Add fixture tests that cover raw-to-canonical behavior and checkpoint behavior.
+7. Verify search projection if `text_content` changes.
+8. Verify source health if checkpoints or error behavior changes.
+
+Avoid format-specific branching in retrieval and monitor layers. Those layers should consume canonical tables, source status snapshots, and repository abstractions rather than parsing raw source records.

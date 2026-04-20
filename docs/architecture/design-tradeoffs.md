@@ -86,6 +86,36 @@ The cost is additional write volume per query. The benefit is long-term leverage
 
 Revisit trigger: if query throughput grows enough that sync logging becomes a measurable latency contributor, enable async logging or move telemetry writes to a buffered pathway while preserving schema compatibility.
 
+## ADR-009: Shared Source Health Model
+
+Source health is implemented in `moraine-source-status` and reused by both `moraine sources status` and monitor `/api/sources`. This explicitly rejects separate CLI and monitor classifiers. [src: crates/moraine-source-status/src/lib.rs, apps/moraine/src/main.rs, crates/moraine-monitor-core/src/lib.rs]
+
+The alternative was to let the monitor backend compute its own status labels from the same ClickHouse tables. That looks cheaper initially, but it creates two definitions of `ok`, `warning`, `error`, and `unknown`. Source health is an operational contract; if the dashboard and CLI disagree during an incident, operators lose time deciding which surface to trust.
+
+The shared model also encodes an important severity choice: nonzero errors plus existing data is `warning`, while error-only with no data is `error`. This prevents one malformed record in an otherwise useful source from being represented as a total source failure.
+
+Revisit trigger: if source health grows into a larger domain with per-format diagnostics, add structured sub-status fields to the shared snapshot rather than adding another classifier in a downstream UI.
+
+## ADR-010: Strict MCP Tool Schemas and Safety Envelope
+
+MCP tools publish strict input schemas, tool-specific output schemas, and a retrieval safety envelope. Unknown arguments are rejected, full responses include `_safety` metadata, and prose responses include an untrusted-memory preamble. [src: crates/moraine-mcp-core/src/lib.rs]
+
+The alternative was a looser JSON interface where tool handlers ignored unknown fields and response shapes were only documented in prose. That is easier to evolve informally but worse for agent hosts, which need reliable schemas to decide which arguments are legal and how to interpret structured content.
+
+The safety envelope is descriptive rather than magical. It does not attempt to classify every source payload semantically or enforce host policy. It labels retrieved content as memory, records provenance and query timing, and reports redaction/filter counters the server can compute honestly. Strict mode only reduces exposure; it does not add a raw bypass.
+
+Revisit trigger: if downstream hosts adopt a newer MCP protocol feature for result metadata, migrate `_safety` into that standard field while keeping the same content semantics and tests.
+
+## ADR-011: Ingest-Time Redaction Is Explicit and Non-Retroactive
+
+Secret redaction is implemented as an optional ingest-time transform over normalized records, not as an implicit ClickHouse view or retrieval-only filter. This makes storage policy explicit: when enabled, future rows store the configured redacted, hashed, or dropped representation in the canonical tables. [src: crates/moraine-privacy/src/lib.rs, crates/moraine-ingest-core/src/normalize.rs]
+
+The alternative was response-time filtering only. That is easier to add at MCP boundaries but leaves raw secrets in `raw_events`, `events`, and `tool_io`, which weakens the local database as an audit surface and creates inconsistent behavior for direct SQL consumers.
+
+The cost is operational responsibility. Policy changes are not retroactive, and redacting `text_content` changes future search documents. Operators must back up, reindex, and rebuild search state when they want historical rows to reflect a new policy.
+
+Revisit trigger: when real encryption key management exists, replace the current `encrypt_raw` marker behavior with reversible encryption and document key rotation, backup, and recovery semantics.
+
 ## Decision Summary
 
 Across all decisions, the consistent pattern is this: Moraine spends complexity in deterministic ingestion semantics and schema design so that retrieval remains thin and operational debugging remains tractable. The system is intentionally not minimal in table count or code paths. It is minimal in hidden behavior. That distinction should remain the bar for future changes.

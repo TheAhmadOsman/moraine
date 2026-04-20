@@ -58,13 +58,15 @@ moraine status
 
 Open the monitor UI at `http://127.0.0.1:8080`.
 
-Run an agent session as you normally would, you'll see row counts and the ingest heartbeat move as your sessions are indexed.
+Run an agent session as you normally would, you'll see row counts, source health, and the ingest heartbeat move as your sessions are indexed.
 
-Use `moraine status --output rich --verbose` for a detailed breakdown.
+Use `moraine --output rich --verbose status` for a detailed breakdown and `moraine sources status --include-disabled` for per-source checkpoints, raw row counts, latest ingest errors, watch roots, globs, and health classification.
 
 ## Connect an Agent (MCP)
 
-While Moraine can be used for many purposes, a direct one is the MCP server we've built for agent self-retrieval **across agent harnesses**. It exposes five tools: `search` (BM25 over indexed events), `search_conversations` (session-scoped), `list_sessions`, `get_session`, and `open` (fetch an event and its surrounding window).
+While Moraine can be used for many purposes, a direct one is the MCP server we've built for agent self-retrieval **across agent harnesses**. It exposes six tools: `search` (BM25 over indexed events), `search_conversations` (session-scoped retrieval), `list_sessions`, `get_session`, `get_session_events`, and `open` (fetch an event context window or a paged session transcript).
+
+The MCP interface publishes strict input schemas (`additionalProperties: false`), tool-specific output schemas, and a retrieval safety envelope. Full responses include `_safety` metadata in `structuredContent`; prose responses include a short preamble that labels retrieved content as untrusted memory rather than instructions. `safety_mode="strict"` is available when an agent should suppress payload JSON and low-information system event expansion.
 
 To wire it into Claude Code, add this to your `.mcp.json`:
 
@@ -154,6 +156,8 @@ To customize, copy `config/moraine.toml` to `~/.moraine/config.toml` and edit.
 
 Moraine stores all runtime state under `~/.moraine`. If ClickHouse is not already installed, `moraine up` auto-installs a managed build.
 
+Optional ingest-time privacy redaction is configured under `[privacy]`. It can independently redact, hash, drop, or preserve `raw_events.raw_json`, `events.text_content`, `events.payload_json`, and `tool_io` payloads before rows are written. See `docs/operations/privacy-and-redaction.md` before changing this on an existing database because the policy is not retroactive without reindexing.
+
 ## Install From Source
 
 Requires a Rust toolchain (`cargo`, `rustc`):
@@ -169,6 +173,8 @@ done
 ## Further Reading
 
 - Operations runbook: `docs/operations/build-and-operations.md`
+- Monitor and source health: `docs/operations/source-health-and-monitor.md`
+- Privacy redaction: `docs/operations/privacy-and-redaction.md`
 - Migration notes: `docs/operations/migration-guide.md`
 - System internals: `docs/core/system-architecture.md`
 - MCP tool contract: `docs/mcp/agent-interface.md`

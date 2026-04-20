@@ -8,11 +8,11 @@ The practical consequence is that this documentation is not a user tutorial; it 
 
 This corpus targets two audiences. The first audience is the engineer operating the stack locally and needing to debug ingestion lag, missed events, index drift, or retrieval quality regressions. The second audience is the engineer extending the stack with new event types, ranking signals, or agent interfaces while preserving trace fidelity.
 
-The corpus is now split by subsystem boundary: `Moraine Core` (data plane), `Moraine Search` (index and ranking substrate), and `Moraine MCP` (agent-facing retrieval interface). This partition matches code ownership and incident response paths, so readers can go deep in one layer without losing causal links to adjacent layers.
+The corpus is split by subsystem boundary: `Moraine Core` (data plane), `Moraine Search` (index and ranking substrate), `Moraine MCP` (agent-facing retrieval interface), `Development`, and `Operations`. This partition matches code ownership and incident response paths, so readers can go deep in one layer without losing causal links to adjacent layers.
 
 ## Reading Path
 
-Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/unified-trace-schema.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, field-level normalization mapping, runtime behavior, search structures, interface contract, then architectural and operational consequences.
+Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/unified-trace-schema.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/operations/source-health-and-monitor.md`, `docs/operations/privacy-and-redaction.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, field-level normalization mapping, runtime behavior, search structures, interface contract, source/monitor operations, privacy policy, then architectural and operational consequences.
 
 ## External References
 

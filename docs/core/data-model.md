@@ -8,7 +8,7 @@ A useful way to read the schema is to classify tables by lifecycle role. `raw_ev
 
 ## Canonical Event Tables
 
-`raw_events` is the immutable ingestion ledger. Each row records source file identity, source generation, line and byte offsets, top-level type, inferred session ID, full serialized JSON, and a hash. There is no attempt to deduplicate raw rows. This table exists so any downstream interpretation can be re-derived and audited against exact input bytes. [src: sql/001_schema.sql:L3, sql/001_schema.sql:L15]
+`raw_events` is the ingestion ledger. Each row records source file identity, source generation, line and byte offsets, top-level type, inferred session ID, serialized JSON, and a hash. There is no attempt to deduplicate raw rows. With default privacy settings this table preserves exact input bytes; if ingest-time privacy redaction is enabled, `raw_json` reflects the configured redaction mode. [src: sql/001_schema.sql:L3, sql/001_schema.sql:L15, crates/moraine-ingest-core/src/normalize.rs]
 
 `events` is the primary canonical event stream for modern and legacy records after classification. It is stored with `ReplacingMergeTree(event_version)` and sorted by session/time/source coordinates. The replacing engine choice acknowledges at-least-once ingestion: duplicates or superseded versions may appear transiently, but converged reads reflect the highest `event_version` per sort key. This is eventual idempotence, not immediate uniqueness. [src: sql/001_schema.sql:L23, sql/001_schema.sql:L73, sql/001_schema.sql:L88]
 
@@ -40,7 +40,7 @@ A useful way to read the schema is to classify tables by lifecycle role. `raw_ev
 
 `search_postings` stores sparse term-doc rows with term frequency, document length, and context metadata. It is partitioned by `cityHash64(term) % 32` and ordered by `(term, doc_id)`, optimizing term-constrained lookups and reducing scan footprint under high cardinality vocabularies. Postings are built by array-joining extracted tokens and grouping by `(term, doc)` with length bounds 2..64. [src: sql/004_search_index.sql:L82, sql/004_search_index.sql:L97, sql/004_search_index.sql:L129, sql/004_search_index.sql:L133]
 
-`search_term_stats` and `search_corpus_stats` use `SummingMergeTree` to maintain incremental DF and corpus totals. They are not the sole source of truth; the MCP service includes fallback aggregate queries over base tables if stats are absent or incomplete. This dual path protects query behavior during schema bootstrap or temporary MV lag. [src: sql/004_search_index.sql:L147, sql/004_search_index.sql:L162, rust/codex-mcp/src/main.rs:L572, rust/codex-mcp/src/main.rs:L609]
+`search_term_stats` and `search_corpus_stats` expose DF and corpus totals. They are not the sole source of truth; the conversation repository includes fallback aggregate queries over base tables if stats are absent or incomplete. This dual path protects query behavior during schema bootstrap or temporary MV lag. [src: sql/004_search_index.sql, crates/moraine-conversations/src/clickhouse_repo.rs]
 
 Query telemetry is captured in `search_query_log` and `search_hit_log`, with optional external feedback storage in `search_interaction_log`. These tables allow relevance diagnostics and evaluation loops without changing retrieval response format. They are also useful for understanding workload shape, query latency distribution, and result sparsity patterns over time. [src: sql/004_search_index.sql:L180, sql/004_search_index.sql:L201, sql/004_search_index.sql:L220]
 
@@ -56,7 +56,7 @@ To reconstruct a full conversation deterministically, query `v_conversation_trac
 
 Tool call lineage is represented through `call_id` in `v_all_events` (mapped from `events.tool_call_id`) and event class pairings such as `tool_call` and `tool_result`. Compacted lineage is represented through `compacted_parent_uid` (mapped from `events.origin_event_id`) and optional `event_links` rows with `link_type='compacted_parent'`. Together, these fields support both conversational and execution-trace reconstruction without a separate expansion table. [src: sql/001_schema.sql:L47, sql/001_schema.sql:L49, sql/001_schema.sql:L103, sql/002_views.sql:L10, sql/002_views.sql:L25]
 
-Token accounting payloads are preserved in `token_usage_json` rather than exploded into rigid columns. When token-level analytics are needed, parse JSON at query time into derived metrics. This keeps ingestion and schema evolution decoupled from provider-specific token metadata changes. [src: sql/001_schema.sql:L43, rust/ingestor/src/normalize.rs:L624]
+Token accounting payloads are preserved in `token_usage_json` rather than exploded into rigid columns. When token-level analytics are needed, parse JSON at query time into derived metrics. This keeps ingestion and schema evolution decoupled from provider-specific token metadata changes. [src: sql/001_schema.sql, crates/moraine-ingest-core/src/normalize.rs]
 
 ## Schema Evolution Guidance
 
@@ -64,6 +64,6 @@ Treat SQL files as contract surfaces, not migration suggestions. The bootstrap p
 
 When changing normalization fields that feed retrieval, evaluate the full chain: canonical columns, document projection MVs, posting generation, stats maintenance, and MCP filters. If tokenization or text projection semantics change, run `bin/backfill-search-index` to avoid mixed historical semantics across pre-change and post-change rows. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, bin/backfill-search-index:L74]
 
-When adding new event classes, ensure they are reflected consistently in both canonical classification and retrieval policy. MCP defaults intentionally exclude high-noise operational payload types and optionally exclude codex-mcp self-events; adding new classes without policy review can inflate recall noise and degrade ranking quality. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L517, rust/codex-mcp/src/main.rs:L523]
+When adding new event classes, ensure they are reflected consistently in both canonical classification and retrieval policy. MCP defaults intentionally exclude high-noise operational payload types and optionally exclude codex-MCP self-events; adding new classes without policy review can inflate recall noise and degrade ranking quality. [src: crates/moraine-conversations/src/clickhouse_repo.rs, crates/moraine-mcp-core/src/lib.rs]
 
 The schema is compact enough that drift is usually introduced by small, local edits with broad downstream impact. Make those impacts explicit in docs and QC artifacts before changing production interpretation.

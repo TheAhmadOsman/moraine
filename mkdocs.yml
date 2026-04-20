@@ -56,6 +56,7 @@ nav:
       - Ingestion Service: core/ingestion-service.md
   - Moraine Search:
       - Retrieval and BM25: search/indexing-and-retrieval.md
+      - Search Quality Evaluation: operations/search-quality-evaluation.md
   - Moraine MCP:
       - Agent Interface: mcp/agent-interface.md
   - Python Bindings:
@@ -67,6 +68,8 @@ nav:
       - Dev Sandbox: development/sandbox.md
   - Operations:
       - Build and Operations: operations/build-and-operations.md
+      - Monitor and Source Health: operations/source-health-and-monitor.md
+      - Privacy and Redaction: operations/privacy-and-redaction.md
       - Environment Variables: operations/environment-variables.md
       - Replay Search Latency Benchmark: operations/replay-search-latency-benchmark.md
       - Migration Guide: operations/migration-guide.md

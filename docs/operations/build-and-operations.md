@@ -169,10 +169,10 @@ Detailed options, output fields, and troubleshooting are in `operations/replay-s
 ```bash
 cd ~/src/moraine
 bin/moraine status
-bin/moraine status --output rich --verbose
-bin/moraine status --output json
+bin/moraine --output rich --verbose status
+bin/moraine --output json status
 bin/moraine logs
-bin/moraine logs ingest --lines 200 --output plain
+bin/moraine --output plain logs ingest --lines 200
 bin/moraine down
 ```
 
@@ -184,6 +184,59 @@ All subcommands support output control:
 
 - `--output auto|rich|plain|json` (default `auto`, rich on TTY).
 - `--verbose` for expanded diagnostics in rich/plain output.
+
+## Source health
+
+Use source health when the stack is alive but one configured source appears stale, empty, or noisy:
+
+```bash
+bin/moraine sources status
+bin/moraine sources status --include-disabled
+bin/moraine --output json sources status --include-disabled
+```
+
+The command returns all enabled configured sources by default, or all configured sources with `--include-disabled`. Each row includes harness, format, glob, watch root, status, checkpoint count, raw event count, ingest error count, and latest error metadata. Status classification is shared with the monitor `/api/sources` endpoint through `moraine-source-status`.
+
+Status meanings:
+
+- `disabled`: configured with `enabled=false`.
+- `unknown`: enabled but no data/checkpoint yet, or source-health queries were partial.
+- `ok`: data exists and no ingest errors are present.
+- `warning`: data exists and ingest errors are present.
+- `error`: ingest errors exist but no raw rows have landed.
+
+Detailed operator guidance is in `source-health-and-monitor.md`.
+
+## Privacy Redaction
+
+Optional ingest-time privacy redaction is configured under `[privacy]` in the resolved config. It is disabled by default. When enabled, it runs after source-specific normalization and before ClickHouse writes, so it changes what future rows store in `raw_events.raw_json`, `events.text_content`, `events.payload_json`, and `tool_io` JSON payloads.
+
+Use this layer for storage policy, not response policy. MCP `safety_mode` can reduce what a tool response exposes, but it cannot remove secrets that were already stored raw. Changing privacy config is not retroactive; historical rows require a backup, clean reindex or targeted rebuild, and search index refresh if `text_content_mode` changed.
+
+Detailed policy guidance is in `privacy-and-redaction.md`.
+
+## Monitor APIs
+
+The monitor serves static web assets and JSON APIs on the configured monitor host/port. Key operational endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `/api/health` | Monitor and ClickHouse reachability. |
+| `/api/status` | Table/process status and heartbeat-derived ingest state. |
+| `/api/sources` | Configured ingest source health, counts, checkpoints, and latest errors. |
+| `/api/analytics` | Dashboard time series. |
+| `/api/sessions` | Session list for the monitor explorer. |
+| `/api/tables` | Table inventory/debug surface. |
+
+`/api/sources` returns partial data with `query_error` when one of the ClickHouse source-health table queries fails after config was loaded. It should not be treated as an all-or-nothing health gate.
+
+## MCP contracts
+
+`bin/moraine run mcp` exposes six tools: `search`, `search_conversations`, `list_sessions`, `get_session`, `get_session_events`, and `open`.
+
+`tools/list` publishes strict input schemas (`additionalProperties: false`) and tool-specific output schemas. Runtime argument decoding is also strict, so unknown fields fail fast. Successful responses include a retrieval safety envelope: full responses add `_safety` to `structuredContent`, while prose responses start with a short untrusted-memory preamble. Use `safety_mode="strict"` when an agent should suppress payload JSON and low-information system event expansion.
+
+See `mcp/agent-interface.md` for the full contract.
 
 ## Legacy scripts
 
@@ -204,5 +257,7 @@ Legacy wrappers remain only as fail-fast stubs:
 
 1. If `up` fails before migration, run `bin/moraine db doctor` and inspect ClickHouse logs via `bin/moraine logs clickhouse`.
 2. If ingest stalls, run `bin/moraine status` and confirm heartbeat recency/queue depth.
-3. If monitor APIs degrade, run `bin/moraine run monitor` in foreground for direct error output.
-4. If MCP retrieval degrades, verify `search_*` tables in doctor output and rerun `db migrate`.
+3. If one source is stale or noisy, run `bin/moraine sources status --include-disabled` and inspect `latest_error_*`.
+4. If monitor APIs degrade, run `bin/moraine run monitor` in foreground for direct error output.
+5. If MCP retrieval degrades, verify `search_*` tables in doctor output and rerun `db migrate`.
+6. If MCP hosts reject tool calls, inspect `tools/list`; unknown input fields are intentionally rejected by strict schemas.

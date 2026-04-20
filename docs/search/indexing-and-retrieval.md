@@ -2,72 +2,142 @@
 
 ## Retrieval Objective
 
-Moraine retrieval is designed around one principle: ranking should be cheap at query time because expensive corpus transformation has already been paid incrementally at ingest time. This is the operational equivalent of [BM25S](https://bm25s.github.io/) thinking, but implemented with [ClickHouse](https://github.com/ClickHouse/ClickHouse) tables and materialized views instead of in-memory sparse matrices. The consequence is a thin MCP process that computes scores and formats responses while delegating index freshness and persistence to the database layer. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L337]
+Moraine retrieval is designed around one principle: ranking should be cheap at query time because corpus transformation has already been paid incrementally at ingest time. ClickHouse materialized views maintain search documents, postings, and statistics as canonical events land. The MCP process stays thin: it validates requests, asks `moraine-conversations` for bounded reads, formats results, and adds safety metadata. [src: sql/004_search_index.sql, crates/moraine-conversations/src/clickhouse_repo.rs, crates/moraine-mcp-core/src/lib.rs]
 
-The retrieval stack has three cooperating stages. Stage one is document projection from canonical events into `search_documents`. Stage two is sparse postings and corpus statistics maintenance. Stage three is query-time BM25 scoring with runtime filters in `codex-mcp`. Understanding this separation is essential for debugging: if search quality degrades, determine whether the issue is in projection, indexing, or ranking policy before tuning constants. [src: sql/004_search_index.sql:L1, sql/004_search_index.sql:L82, rust/codex-mcp/src/main.rs:L482]
+The stack has four cooperating stages:
+
+1. Ingestion normalizes source records into canonical `events`.
+2. ClickHouse projects searchable text into `search_documents`.
+3. ClickHouse explodes documents into sparse `search_postings` and derives term/corpus statistics.
+4. MCP tools run event-level or conversation-level queries over those indexed surfaces.
+
+When search quality degrades, debug those stages in order. Formula tuning cannot recover text that was never normalized or indexed.
+
+Ingest-time privacy redaction happens before stage 2. If `text_content_mode` redacts, hashes, or drops a secret-bearing string, the search index sees that transformed representation for future rows. Historical search rows keep prior semantics until reingested or rebuilt.
 
 ## Index Construction in ClickHouse
 
-`search_documents` is the document surface. It stores event UID, session metadata, class/type fields, payload JSON, and textual content plus computed `doc_len`. `doc_len` is materialized using regex token extraction over lowercased text. This materialization means average document length and BM25 denominator terms are cheap to compute later, with no repeated tokenization in the MCP process. [src: sql/004_search_index.sql:L1, sql/004_search_index.sql:L22]
+`search_documents` is the document surface. It stores event UID, session metadata, class/type fields, payload JSON, text content, and `doc_len`. `doc_len` is materialized from regex token extraction on lowercased text so average document length and BM25 denominator terms are available cheaply at query time. [src: sql/004_search_index.sql]
 
-Documents are produced by one materialized view, `mv_search_documents_from_events`, sourced from `events`. The projection maps canonical event fields into retrieval columns, carries `origin_event_id` as `compacted_parent_uid`, and filters out rows whose text is only whitespace. This keeps corpus size aligned with retrieval utility and avoids ranking overhead on structural events without textual payloads. [src: sql/004_search_index.sql:L42, sql/004_search_index.sql:L49, sql/004_search_index.sql:L68, sql/004_search_index.sql:L69]
+`mv_search_documents_from_events` feeds `search_documents` from canonical `events`. It carries compacted lineage, filters whitespace-only text, and keeps document refresh aligned with event replacement semantics.
 
-`search_postings` is the sparse index. The MV explodes each document into tokens via `arrayJoin(extractAll(...))`, filters term lengths to 2..64, groups by `(term, doc)`, and stores `tf` along with document and context metadata. This table is partitioned by hashed term buckets and ordered by `(term, doc_id)`, making term-constrained scans efficient even as corpus grows. [src: sql/004_search_index.sql:L97, sql/004_search_index.sql:L100, sql/004_search_index.sql:L129, sql/004_search_index.sql:L133]
+`search_postings` is the sparse term-doc index. Its materialized view tokenizes each document, filters term lengths, groups by `(term, doc)`, and stores term frequency plus enough context metadata for result hydration. The table is partitioned by hashed term buckets and ordered by `(term, doc_id)`, which makes term-constrained scans the dominant access path instead of full-corpus scans.
 
-Two stats views are defined over indexed data. `search_term_stats` computes per-term document counts from `search_postings FINAL`, while `search_corpus_stats` computes corpus-wide document count and summed doc length from `search_documents FINAL`. This keeps stats derivation aligned with the current index state without separate additive-maintenance tables. [src: sql/004_search_index.sql:L151, sql/004_search_index.sql:L156, sql/004_search_index.sql:L161, sql/004_search_index.sql:L167]
+`search_term_stats` and `search_corpus_stats` expose document-frequency and corpus-wide totals. The repository can fall back to direct aggregate queries when stats are absent or incomplete, which keeps bootstrap and partial-repair states searchable.
 
-## Query Processing in `codex-mcp`
+## Event Search
 
-Search starts with query tokenization using `[A-Za-z0-9_]+`, lowercasing, and length limits. Term count is capped by config (`max_query_terms`). The service preserves token order and term frequency in the tokenizer output, but current SQL scoring path treats each unique token once through term-level postings and IDF maps. Query validation rejects empty or non-searchable inputs early. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L989, rust/codex-mcp/src/main.rs:L1000]
+The `search` MCP tool maps to event-level search. It accepts:
 
-Runtime bounds are applied next. Requested limit is clamped to `max_results`, `min_should_match` is clamped to `[1, term_count]`, and default flags for tool-event inclusion and codex-mcp exclusion are applied from config. Optional `session_id` is validated against a strict safe-character regex before SQL generation, reducing injection and malformed-filter risks. [src: rust/codex-mcp/src/main.rs:L353, rust/codex-mcp/src/main.rs:L359, rust/codex-mcp/src/main.rs:L366, rust/codex-mcp/src/main.rs:L373, rust/codex-mcp/src/main.rs:L995]
+- `query`
+- optional `limit`
+- optional `session_id`
+- optional `min_score`
+- optional `min_should_match`
+- optional `include_tool_events`
+- optional `event_kind`
+- optional `exclude_codex_mcp`
+- optional `include_payload_json`
+- optional `safety_mode`
+- optional `verbosity`
 
-The service fetches corpus totals and term DF values before building ranking SQL. Corpus stats are read from `search_corpus_stats`, with fallback aggregation from `search_documents` if stats are absent. DF values are read from `search_term_stats`, with fallback counts from `search_postings` for missing terms. These fallbacks make retrieval resilient during bootstrap and partial index repair. [src: rust/codex-mcp/src/main.rs:L578, rust/codex-mcp/src/main.rs:L582, rust/codex-mcp/src/main.rs:L588, rust/codex-mcp/src/main.rs:L597]
+The repository tokenizes query text, clamps term count, validates safe filters, computes or loads BM25 statistics, builds SQL over `search_postings`, hydrates event hits, applies content policy, and logs telemetry best-effort. [src: crates/moraine-conversations/src/clickhouse_repo.rs, crates/moraine-mcp-core/src/lib.rs]
 
-## BM25 Formula and SQL Realization
+By default, payload JSON is not exposed and non-user-facing content is redacted in returned hits. `include_payload_json=true` only affects user-facing message events and can be suppressed by `safety_mode="strict"`.
 
-IDF is computed per query term in-process using an [Okapi BM25](https://en.wikipedia.org/wiki/Okapi_BM25)-style smoothing expression. For unseen terms (`df=0`), the service uses a high fallback IDF derived from corpus size; for seen terms it uses `ln(1 + ((N - df + 0.5)/(df + 0.5)))` with non-negative clamping. This keeps ranking numerically stable and prevents negative-term contributions from high-frequency terms. [src: rust/codex-mcp/src/main.rs:L398, rust/codex-mcp/src/main.rs:L401, rust/codex-mcp/src/main.rs:L405]
+## Conversation Search
 
-The SQL query embeds `k1`, `b`, `avgdl`, term array, and aligned IDF array in a `WITH` clause. For each posting row, term-specific IDF is selected with `transform(term, q_terms, q_idf, 0.0)`, and BM25 contribution is computed as `tf*(k1+1)/(tf + k1*(1-b+b*doc_len/avgdl))`. Contributions are summed per document; `matched_terms` and `score` filters are applied in `HAVING`, then results are ordered by score and limited. [src: rust/codex-mcp/src/main.rs:L532, rust/codex-mcp/src/main.rs:L551, rust/codex-mcp/src/main.rs:L554, rust/codex-mcp/src/main.rs:L564]
+The `search_conversations` MCP tool ranks whole sessions rather than individual events. It uses session-level candidate generation and exact fallback paths so each returned hit represents one conversation. It accepts time bounds, conversation `mode`, tool-event inclusion, codex-MCP exclusion, payload opt-in, and BM25 thresholds.
 
-Because ranking is executed over postings constrained by query terms, dominant cost is posting fanout, not corpus cardinality. This is the key performance behavior that enables real-time local search at scale within one node, provided token normalization keeps term selectivity reasonable. [src: rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L560]
+Conversation mode classification is exclusive and precedence-based:
 
-## Retrieval Policy Filters
+```text
+web_search > mcp_internal > tool_calling > chat
+```
 
-By default, retrieval excludes several operationally noisy payloads and prefers semantically meaningful event classes (`message`, `reasoning`, `event_msg`). When `include_tool_events` is false, additional payload-type exclusions remove lifecycle chatter such as `task_started` and `turn_aborted`. This default policy is tuned for agent consumption quality rather than maximal recall of low-signal events. [src: rust/codex-mcp/src/main.rs:L513, rust/codex-mcp/src/main.rs:L515, rust/codex-mcp/src/main.rs:L517]
+Mode filtering is useful for high-level questions like “show me sessions involving web search” or “find tool-heavy debugging sessions” without relying on brittle keyword-only queries. [src: crates/moraine-conversations/src/domain.rs, crates/moraine-conversations/src/clickhouse_repo.rs]
 
-A second policy filter optionally excludes codex-mcp self-reference. It removes rows whose payload mentions `codex-mcp` and rows with tool names `search` or `open`. This prevents retrieval loops where prior search/open traces dominate subsequent search results. The filter can be disabled when self-observation is intentionally desired. [src: rust/codex-mcp/src/main.rs:L523, rust/codex-mcp/src/main.rs:L525, config/moraine.toml:L41]
+## Session Navigation Tools
 
-Session scoping is supported through exact `session_id` filtering in postings query conditions. In scoped mode, ranking is still BM25-based but corpus statistics remain global in current implementation. That means scores are comparable within scoped results for ranking order, but absolute values should not be interpreted as session-local calibrated relevance probabilities. [src: rust/codex-mcp/src/main.rs:L507, rust/codex-mcp/src/main.rs:L572]
+MCP retrieval includes deterministic navigation tools that do not depend on BM25 ranking:
 
-## `open` Tool and Context Reconstruction
+- `list_sessions` lists session summaries with cursor pagination, optional time bounds, optional mode filter, and asc/desc sort.
+- `get_session` returns stable summary metadata for one session ID and uses `found=false` for misses.
+- `get_session_events` returns a paginated session timeline in forward or reverse order with optional event-kind filtering.
+- `open` reconstructs either an event context window by `event_uid` or a paged session transcript by `session_id`.
 
-`open` resolves one event UID to a session and event order using `v_conversation_trace`, then fetches an ordered context window around that order. This is intentionally separate from lexical ranking and relies on the trace view’s deterministic ordering semantics. If UID is not found, the tool returns `found=false` instead of an error payload. [src: rust/codex-mcp/src/main.rs:L728, rust/codex-mcp/src/main.rs:L733, rust/codex-mcp/src/main.rs:L735]
+These tools all read from the same conversation repository abstraction as search. They are useful when an agent already knows a session or event identity and needs deterministic trace traversal instead of ranked discovery.
 
-Returned rows include both concise fields (actor, class, payload type, text) and full payload/token JSON for deep inspection. In prose mode, context is rendered in deterministic order and partitioned into before/target/after blocks to improve agent readability while preserving event order metadata. [src: rust/codex-mcp/src/main.rs:L745, rust/codex-mcp/src/main.rs:L755, rust/codex-mcp/src/main.rs:L905]
+## BM25 Formula and Query Cost
+
+IDF is computed with Okapi-style smoothing:
+
+```text
+ln(1 + ((N - df + 0.5) / (df + 0.5)))
+```
+
+The SQL scoring path embeds query terms, aligned IDF values, `k1`, `b`, and average document length. It constrains postings by query terms, sums BM25 contributions per document, applies `matched_terms` and score thresholds, orders by score, and limits results.
+
+Because scoring runs over postings constrained by query terms, dominant cost is posting fanout and term selectivity, not total corpus size. Long queries with broad terms can still be expensive, so `mcp.max_query_terms`, `mcp.max_results`, and `min_should_match` remain important guardrails. [src: crates/moraine-conversations/src/clickhouse_repo.rs, config/moraine.toml]
+
+## Policy Filters
+
+Retrieval defaults optimize agent answer quality, not maximal low-signal recall.
+
+Event search can exclude tool events unless explicitly requested. It can also exclude codex-MCP self-observation to prevent loops where prior search/open tool traces dominate later retrieval. Event kind filters (`message`, `reasoning`, `tool_call`, `tool_result`) let callers narrow result classes more explicitly than broad text filters.
+
+The MCP layer applies response content policy after repository retrieval:
+
+- Non-user-facing event hits lose `text_content` and `payload_json`.
+- Payload JSON is omitted unless explicitly requested.
+- Strict safety mode suppresses payload JSON opt-ins and filters low-information system events where applicable.
+
+These policies affect returned payloads, not the underlying ClickHouse corpus.
+
+## Safety Envelope
+
+Every successful MCP retrieval response includes safety framing. In full mode, `_safety` is part of `structuredContent`; in prose mode, a preamble states that retrieved content is untrusted memory and reports mode, source, duration, redaction count, and filter count.
+
+The envelope includes:
+
+- `content_classification = "memory_content"`
+- `provenance.source = "moraine-mcp"`
+- query timing
+- redaction counters
+- filter counters
+- an untrusted-memory notice
+
+`safety_mode="normal"` preserves existing defaults with metadata. `safety_mode="strict"` only reduces exposure: it suppresses payload JSON requests, system-event expansion requests, low-information system events, and payload JSON fields where the tool can directly modify the response. [src: crates/moraine-mcp-core/src/lib.rs]
 
 ## Freshness and Rebuild Behavior
 
-Steady-state freshness is push-driven: ingestor writes canonical rows, MVs update documents and postings, and MCP queries read latest committed state. No periodic full-corpus reindex is required for normal operation. This architecture is robust under continuous append workloads because index maintenance is amortized over ingest writes. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L422]
+Steady-state freshness is push-driven: ingestor writes canonical rows, materialized views update search tables, and MCP reads the latest committed index state. No periodic full-corpus reindex is required for normal operation.
 
-For schema changes or index corruption repair, `bin/backfill-search-index` truncates search tables and rehydrates documents from canonical event tables. Postings and stats repopulate through MVs after inserts. Operators should run this explicitly after tokenization/projection changes to avoid mixed-semantics corpora. [src: bin/backfill-search-index:L74, bin/backfill-search-index:L79, bin/backfill-search-index:L81]
+When tokenization, document projection, or search schema changes, backfill search tables before drawing conclusions from mixed historical and new index semantics. The operational rule is simple: if a change alters what should be in `search_documents` or `search_postings`, rebuild those tables or explicitly accept mixed semantics while testing. [src: sql/004_search_index.sql]
 
 ## Query and Interaction Logging
 
-Each search writes a `search_query_log` row with normalized terms, filter settings, response latency, result count, and BM25 metadata (`docs`, `avgdl`, `k1`, `b`). Ranked results are written to `search_hit_log` with per-hit rank, score, and contextual metadata. These writes can be synchronous or async, controlled by config. [src: rust/codex-mcp/src/main.rs:L621, rust/codex-mcp/src/main.rs:L637, rust/codex-mcp/src/main.rs:L667, rust/codex-mcp/src/main.rs:L689]
+Event search writes `search_query_log` rows and `search_hit_log` rows when telemetry tables are available. Logging is best-effort and should not fail retrieval. These tables are useful for workload inspection, latency replay, and relevance-evaluation fixtures.
 
-`search_interaction_log` is reserved for external feedback capture and is not currently auto-populated by MCP. Keeping this table in baseline schema is strategic: it allows later relevance-learning loops to ingest click/selection/annotation events without schema migration pressure. [src: sql/004_search_index.sql:L220]
+`search_interaction_log` is reserved for external feedback capture. It is not auto-populated by MCP today, but it remains part of the schema for future evaluation or learning loops.
 
 ## Performance and Quality Tuning
 
-High-impact knobs are `k1`, `b`, `min_should_match`, result limit, and inclusion filters. Raising `min_should_match` increases precision by requiring broader term overlap; lowering it increases recall for short queries or sparse terms. `k1` and `b` should be tuned against corpus characteristics, but defaults (`1.2`, `0.75`) are reasonable starting points for mixed conversational and tool text. [src: config/moraine.toml:L46-47, config/moraine.toml:L49]
+High-impact knobs:
 
-If ranking quality looks noisy, first inspect corpus inputs, not formula constants. Common root causes are weak `text_content` extraction, inclusion of operational chatter, or stale/misaligned index tables after schema changes. Constants cannot recover information that never entered `search_documents` correctly. [src: sql/004_search_index.sql:L53, rust/ingestor/src/normalize.rs:L651, bin/backfill-search-index:L72]
+- `mcp.max_results`
+- `mcp.default_include_tool_events`
+- `mcp.default_exclude_codex_mcp`
+- `bm25.k1`
+- `bm25.b`
+- `bm25.default_min_score`
+- `bm25.default_min_should_match`
+- `bm25.max_query_terms`
 
-If latency regresses, inspect posting fanout and query term shape. Extremely broad terms and long query token lists increase candidate set size. The max-query-terms cap provides a hard guardrail; if you raise it, do so with observed workload data and not by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L1016, config/moraine.toml:L50]
+If ranking quality looks noisy, inspect `text_content` extraction, operational-event inclusion, codex-MCP self-observation, and stale search tables before tuning constants. If latency regresses, inspect query term shape and posting fanout before raising limits.
 
 ## Known Limits
 
-The current implementation uses simple regex tokenization with no stemming, lemmatization, phrase scoring, or field weighting. This keeps indexing fast and predictable for code-like and operational text, but leaves semantic recall on the table for morphology-heavy language domains. Advanced linguistic normalization can be layered later, but should only be introduced with explicit rebuild and relevance-evaluation plans. [src: sql/004_search_index.sql:L22, sql/004_search_index.sql:L129, rust/codex-mcp/src/main.rs:L989]
+Moraine currently uses simple regex tokenization with no stemming, lemmatization, phrase scoring, semantic embeddings, or field weighting. This keeps indexing fast and predictable for code-like operational text but limits semantic recall for natural-language paraphrases.
 
-Score interpretation should remain relative, not absolute. BM25 scores are useful for rank ordering within one query, but cross-query score comparisons are weak without calibration. Downstream agents should prefer rank and contextual text over raw score thresholds unless query distributions are controlled.
+BM25 scores are relative within a query. Do not compare raw scores across unrelated queries without calibration. Agents should prefer rank, snippet quality, and opened context over absolute score thresholds unless the query distribution is controlled.

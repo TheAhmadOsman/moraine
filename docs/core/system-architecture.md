@@ -2,72 +2,120 @@
 
 ## System Objective
 
-Moraine converts local agent traces into a queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. Default sources include Codex JSONL under `~/.codex/sessions/**/*.jsonl`, Claude Code JSONL under `~/.claude/projects/**/*.jsonl`, Kimi CLI `wire.jsonl` under `~/.kimi/sessions/**/wire.jsonl`, OpenCode's `~/.local/share/opencode/opencode.db`, and Hermes session exports. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.moraine`, and lifecycle is managed through `moraine`.
+Moraine converts local agent traces into a queryable corpus that supports operational inspection, faithful trace reconstruction, and agent self-retrieval. Default sources include Codex JSONL, Claude Code JSONL, Kimi CLI wire logs, OpenCode SQLite, Hermes live session snapshots, and optional Hermes trajectory exports. The system is single-node by design: ClickHouse binds locally, runtime state lives under `~/.moraine`, and lifecycle is managed through the `moraine` binary. [src: config/moraine.toml, crates/moraine-config/src/lib.rs]
 
-The design prioritizes low append-to-visibility latency, replay fidelity across evolving record formats, and a thin retrieval process that relies on write-time index maintenance. These priorities drive the ingestion/runtime and schema choices documented below. [src: rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, sql/004_search_index.sql:L28, rust/codex-mcp/src/main.rs:L337]
+The design priorities are:
+
+- Low append-to-visibility latency.
+- Replay fidelity across evolving source formats.
+- Deterministic source provenance and event identity.
+- Durable write-time lexical indexing.
+- Explicit storage policy for optional secret redaction.
+- A thin local MCP retrieval process with explicit safety framing.
+- Operator visibility through CLI status, source health, and the monitor UI.
 
 ## Component Topology
 
-The system is composed of four layers with explicit ownership boundaries.
+The storage layer is a local ClickHouse instance. It owns canonical tables, reconstruction views, search documents/postings, source checkpoints, heartbeats, ingest errors, and query telemetry. Services interact with it through SQL and the shared ClickHouse client crate.
 
-The storage layer is a local ClickHouse instance configured from templated XML and started by `moraine up`. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only.
+The ingestion layer is `moraine-ingest` plus `moraine-ingest-core`. It owns watcher and reconcile scheduling, format-aware dispatch, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw source records to canonical event classes. [src: apps/moraine-ingest, crates/moraine-ingest-core]
 
-The ingestion layer is Rust `moraine-ingest`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
+The privacy layer is `moraine-privacy` plus `[privacy]` config. It is invoked by ingestion after normalization and before rows are written, so storage redaction policy is explicit and independent from MCP response-time safety. [src: crates/moraine-privacy, crates/moraine-config/src/lib.rs, crates/moraine-ingest-core/src/normalize.rs]
 
-Indexing is implemented with ClickHouse materialized views that incrementally maintain `search_documents`, `search_postings`, and stats tables as canonical rows land. This shifts cost from corpus scans to sparse term lookups. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, sql/004_search_index.sql:L154, sql/004_search_index.sql:L170]
+The source-status layer is `moraine-source-status`. It reads configured sources and ClickHouse source state, then returns shared status snapshots for both CLI and monitor. This keeps `moraine sources status` and `/api/sources` aligned. [src: crates/moraine-source-status, apps/moraine/src/main.rs, crates/moraine-monitor-core/src/lib.rs]
 
-The retrieval layer is `moraine-mcp`, a stdio JSON-RPC server exposing `search` and `open`. It performs BM25 scoring over prebuilt postings and returns prose or full JSON output without owning index-state lifecycle.
+The retrieval layer is `moraine-mcp` plus `moraine-mcp-core` and `moraine-conversations`. It exposes six MCP tools, validates strict schemas, reads ClickHouse-backed conversation/search structures, formats prose/full responses, and attaches retrieval safety metadata. It does not own index lifecycle. [src: apps/moraine-mcp, crates/moraine-mcp-core, crates/moraine-conversations]
+
+The monitor layer is `moraine-monitor`, `moraine-monitor-core`, and `web/monitor`. It serves operational APIs and a Svelte UI for health, status, analytics, sessions, and source health. [src: apps/moraine-monitor, crates/moraine-monitor-core, web/monitor]
+
+The control-plane layer is `moraine`. It resolves config, supervises local services, starts managed ClickHouse when needed, runs migrations, reports status, exposes `sources status`, and provides service entrypoints. [src: apps/moraine]
 
 ## End-to-End Causal Flow
 
-A concrete append event follows a deterministic path. A JSONL line is appended in a session file. The watcher thread receives a file event and forwards the path to a debounce queue. After debounce expiration, the path is enqueued unless it is already inflight, in which case it is marked dirty for replay after current processing completes. This dirty-path rule prevents lost updates when writes race with in-progress file reads. [src: rust/ingestor/src/ingestor.rs:L124, rust/ingestor/src/ingestor.rs:L195, rust/ingestor/src/ingestor.rs:L230, rust/ingestor/src/ingestor.rs:L535]
+A typical append path begins when an agent writes a JSONL line, rewrites a Hermes session snapshot, or commits OpenCode rows to SQLite. Watchers and reconcile logic turn those source changes into work items. Reconcile remains mandatory because filesystem watchers can drop events; watcher events are an optimization for latency, not the only correctness path. [src: crates/moraine-ingest-core/src/watch.rs, crates/moraine-ingest-core/src/reconcile.rs]
 
-A worker resumes from checkpoint offset, parses appended lines, and emits raw rows plus canonical `events` rows. When lineage or tool payloads are present, it also emits `event_links` and `tool_io` rows. Invalid or non-object lines are captured in `ingest_errors` and do not halt processing. [src: rust/ingestor/src/ingestor.rs:L597, rust/ingestor/src/ingestor.rs:L632, rust/ingestor/src/ingestor.rs:L635, sql/001_schema.sql:L23, sql/001_schema.sql:L92, sql/001_schema.sql:L112]
+Dispatch chooses the processor by source format:
 
-Batch chunks flow to a sink that flushes by size or timer in fixed order: `raw_events`, `events`, `event_links`, `tool_io`, `ingest_errors`, `ingest_checkpoints`. Success advances counters/cache; failure retains buffers for retry. [src: rust/ingestor/src/ingestor.rs:L597, rust/ingestor/src/ingestor.rs:L598, rust/ingestor/src/ingestor.rs:L599, rust/ingestor/src/ingestor.rs:L600, rust/ingestor/src/ingestor.rs:L601, rust/ingestor/src/ingestor.rs:L603]
+- `jsonl` tails append-oriented logs.
+- `session_json` reads whole rewritten session snapshots and emits only newly appeared messages.
+- `opencode_sqlite` opens the OpenCode database read-only, validates expected tables, and pages rows by strict watermark.
 
-As canonical rows commit, MVs update searchable documents, postings, and stats. MCP search then tokenizes input, loads corpus/DF stats, builds BM25 SQL over postings, and returns ranked hits without scanning the full trace view. [src: sql/004_search_index.sql:L22, sql/004_search_index.sql:L129, sql/004_search_index.sql:L147, rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L533, rust/codex-mcp/src/main.rs:L572]
+Each processor emits raw rows, canonical event rows, optional link/tool rows, errors, and checkpoint updates. The sink flushes data before checkpoints so failed writes retry without skipping unseen data. [src: crates/moraine-ingest-core/src/dispatch.rs, crates/moraine-ingest-core/src/sink.rs]
+
+As canonical rows land, ClickHouse materialized views update `search_documents` and `search_postings`. MCP search tools read those structures for ranked retrieval, while navigation tools read session and trace views through `moraine-conversations`. [src: sql/002_views.sql, sql/004_search_index.sql, crates/moraine-conversations/src/clickhouse_repo.rs]
+
+Operators observe the system through:
+
+- `moraine status` for process, DB, migration, and heartbeat status.
+- `moraine sources status` for per-source inventory, counts, checkpoints, and latest errors.
+- Monitor APIs and UI for health, analytics, sessions, and source chips.
+- ClickHouse tables for direct investigation.
 
 ## Architectural Invariants
 
-Invariant one is source-addressable provenance. Every canonical event row carries source coordinates (`source_file`, `source_generation`, `source_line_no`, `source_offset`) plus `source_ref`. This allows reconstruction to be traced back to an exact byte region in an original log file. Without this invariant, replay debugging would degrade into heuristic matching of payload text. [src: sql/001_schema.sql:L27, rust/ingestor/src/normalize.rs:L166]
+Source-addressable provenance is required. Canonical events preserve source file, generation, line, offset, and source reference so trace rows can be traced back to input records.
 
-Invariant two is monotonic checkpoint advancement within a generation, with generation rollover on inode change or truncation. If the file inode changes or file length shrinks below stored offset, generation increments and offset/line reset to zero. This is the anti-corruption rule that makes log rotation and truncation safe without global rewinds. [src: rust/ingestor/src/ingestor.rs:L584, rust/ingestor/src/ingestor.rs:L586, rust/ingestor/src/model.rs:L8]
+Checkpoint progress is monotonic within a source generation. Rotation or shrink resets offsets by moving to a new generation, preventing stale offsets from silently skipping data.
 
-Invariant three is at-least-once processing with eventual replacement semantics. Reprocessing can occur due to retries, dirty-path rescheduling, or reconcile scans. Idempotence is achieved by stable event UIDs and `ReplacingMergeTree(event_version)` in mutable canonical tables, accepting transient duplicates until merges converge. The architecture explicitly trades immediate dedup for robust ingestion continuity. [src: rust/ingestor/src/normalize.rs:L100, sql/001_schema.sql:L46, sql/001_schema.sql:L76, rust/ingestor/src/ingestor.rs:L294]
+Processing is at-least-once with eventual replacement semantics. Reprocessing can happen from retries, dirty-path scheduling, or reconcile scans. Stable event UIDs and replacing table engines make this safe after convergence.
 
-Invariant four is deterministic conversation ordering derived at query time. `v_conversation_trace` computes `event_order` using an ordered window over parsed record timestamp fallback plus source coordinates, then derives `turn_seq` as cumulative `turn_context` count clamped to at least one. This keeps ordering logic centralized and reproducible across callers. [src: sql/002_views.sql:L72-73, sql/002_views.sql:L77]
+Conversation ordering is deterministic and query-time derived. `v_conversation_trace` centralizes event ordering and turn derivation so callers do not invent separate ordering rules.
 
-Invariant five is retrieval-service thinness. `codex-mcp` does not own corpus state and does not rebuild lexical indexes. It expects postings and statistics to exist, with fallback aggregate queries when stats are missing, and applies lightweight SQL generation and formatting only. This keeps the MCP process simple enough to run per-client without state synchronization concerns. [src: rust/codex-mcp/src/main.rs:L572, rust/codex-mcp/src/main.rs:L591, rust/codex-mcp/src/main.rs:L716]
+Retrieval is index-backed and bounded. MCP does not rebuild global indexes, does not keep a private corpus cache as the source of truth, and does not widen result limits beyond config.
+
+Retrieved memory is untrusted content. MCP responses label retrieved data as memory content, include `moraine-mcp` provenance, and support strict mode to reduce exposure of raw payloads and low-information system events.
+
+Ingest-time privacy is non-retroactive. If redaction policy changes, historical ClickHouse rows and search index rows keep their old representation until explicitly rebuilt.
+
+CLI and monitor source health share one status model. If source classification changes, it must change in `moraine-source-status`, not independently in the monitor UI or CLI renderer.
 
 ## Failure and Recovery Model
 
-Watcher loss is treated as expected, not exceptional. The reconcile task scans the sessions glob on a fixed interval and enqueues matching files. If filesystem events are dropped, reconcile eventually repairs visibility by re-queueing files and relying on checkpoints to skip already consumed offsets. Recovery latency is bounded by reconcile interval and queue pressure. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, config/moraine.toml:L19]
+Watcher loss is expected. Reconcile periodically enumerates configured sources and requeues tracked files/databases. Recovery latency is bounded by reconcile interval, queue pressure, and sink health.
 
-Parse errors are quarantined. A malformed JSON line yields a row in `ingest_errors` with source coordinates and truncated fragment, then ingestion continues with the next line. This keeps corruption blast radius local to one record and preserves forward progress under partially malformed logs. [src: rust/ingestor/src/ingestor.rs:L647, rust/ingestor/src/ingestor.rs:L654, sql/001_schema.sql:L80]
+Malformed records are quarantined into `ingest_errors`. The source continues processing subsequent records. Rising error counts should be treated as schema drift or corrupted source data until proven otherwise.
 
-ClickHouse unavailability blocks startup and appears later as flush/heartbeat failures. The service currently retains unsent batches in memory and retries; it does not spill to disk. Prolonged outages therefore translate directly into memory pressure under sustained input. [src: rust/ingestor/src/ingestor.rs:L47, rust/ingestor/src/ingestor.rs:L405, rust/ingestor/src/ingestor.rs:L512]
+OpenCode schema drift is detected before scanning. The dispatcher validates expected tables and includes `PRAGMA user_version` in schema errors, making upstream OpenCode changes visible during reconciliation.
 
-MCP failures are intentionally narrow: inputs are regex-sanitized, SQL literals escaped, missing `open` targets return `found=false`, and telemetry write failures do not fail query responses. [src: rust/codex-mcp/src/main.rs:L701, rust/codex-mcp/src/main.rs:L721, rust/codex-mcp/src/main.rs:L734, rust/codex-mcp/src/main.rs:L1034]
+SQLite WAL writes are handled by watcher path mapping. `opencode.db-wal` and `opencode.db-shm` notifications map back to the configured base database path so live writes do not rely only on periodic reconcile.
+
+ClickHouse unavailability blocks startup and later appears as flush failures, heartbeat issues, monitor query errors, or source-health `query_error`. The system currently retries in memory; it does not spill ingest batches to disk.
+
+MCP failures are narrow. Invalid JSON-RPC methods or arguments produce protocol errors; tool execution failures produce tool error results; telemetry write failures are best-effort warnings. Missing event/session targets are successful `found=false` payloads where the tool contract supports that shape.
 
 ## Performance Envelope
 
-The ingestion runtime controls throughput through four principal knobs: file-worker concurrency, inflight channel capacity, batch size, and flush interval. The defaults are not arbitrary; they reflect a bias toward sustained throughput with bounded latency (`max_file_workers=8`, `max_inflight_batches=64`, `batch_size=4000`, `flush_interval_seconds=0.5`). This setup performs well under concurrent append streams while keeping write amplification manageable. [src: config/moraine.toml:L11-L12, config/moraine.toml:L15-L16]
+Ingestion throughput is controlled primarily by file-worker concurrency, queue/channel bounds, batch size, and flush interval. The defaults are biased toward fast local visibility while still batching enough rows to avoid excessive ClickHouse write amplification.
 
-Backpressure is explicit: bounded processing/sink channels, semaphore-limited workers, and heartbeat queue-depth telemetry that surfaces pressure before visible staleness. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L393]
+Backpressure is explicit. Bounded channels, semaphore-limited workers, and heartbeat queue-depth metrics surface pressure before it becomes silent data loss.
 
-Retrieval runtime cost scales primarily with query term count and posting list fanout, not total corpus size. Query tokenization caps terms (`max_query_terms`) and BM25 SQL applies `term IN [..]`, `matched_terms` thresholds, and result limits, all of which bound compute. The practical implication is that interactive latency remains predictable so long as term selectivity is reasonable and tool-event noise filters remain enabled by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L564, config/moraine.toml:L50]
+Retrieval runtime cost scales with query term count and posting fanout. `max_query_terms`, `max_results`, `min_should_match`, event-kind filters, tool-event filters, and codex-MCP self-exclusion are the main guardrails.
+
+Monitor source health is lightweight but not free. It performs grouped table reads over checkpoint, raw event, and error tables. The endpoint returns partial snapshots when one query fails; it should not become an all-or-nothing health gate.
 
 ## Design Pressure and Rejected Alternatives
 
-A pure filesystem event pipeline without reconcile was rejected because it optimizes latency at the cost of silent completeness failures. For this domain, eventual correctness is more valuable than minimal background work; missed events are unacceptable for trace reconstruction. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296]
+A watcher-only ingestion design is insufficient because local filesystem event streams are not a correctness guarantee. Reconcile remains part of the architecture even though it adds background work.
 
-An in-memory-only BM25 index in the MCP process was rejected for freshness and operational reasons. It would force full or partial index rebuilds in process memory and introduce state lifecycle coupling between retrieval process uptime and index correctness. ClickHouse materialized views already provide the incremental maintenance primitive with durable state. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L410]
+An MCP-owned in-memory BM25 index was rejected because it would couple retrieval correctness to process uptime and rebuild behavior. ClickHouse materialized views already provide durable incremental maintenance.
 
-An exactly-once ingest guarantee was rejected because file-based append streams with rotation and watcher nondeterminism make strict exactly-once expensive and brittle. The selected model is at-least-once plus replacing semantics, which is simpler, resilient, and sufficient for this workload. [src: rust/ingestor/src/ingestor.rs:L584, sql/001_schema.sql:L46, sql/001_schema.sql:L104]
+Exactly-once ingest was rejected as too brittle for file-based sources with rotation, rewrites, database WAL sidecars, watcher nondeterminism, and transient DB failures. At-least-once plus stable identity and replacement semantics is simpler and more resilient for this workload.
+
+A separate monitor-specific source-health classifier was rejected because it would drift from CLI semantics. The shared `moraine-source-status` crate is the ownership boundary.
+
+Protocol-version changes are treated separately from MCP schema metadata changes. Strict schemas and output schemas can improve tool contract clarity without bundling an operational protocol bump.
 
 ## Operator Implications
 
-Operators should treat schema and normalization as contracts. Changes to event classification, tokenization, or checkpoint semantics have cross-layer effects that can silently degrade retrieval or recovery behavior if not reviewed together.
+Health is a chain. A healthy stack includes running processes, reachable ClickHouse, applied migrations, recent heartbeats, source checkpoint/raw row progress, low or understood ingest errors, and MCP search tables that match current schema expectations.
 
-For day-to-day operation, health should be interpreted as a chain, not a single ping. A healthy chain includes ClickHouse availability, progressing `raw_events` and canonical event counts, and recent heartbeat timestamps with stable flush latency. A broken link anywhere in this chain predicts stale retrieval even when one service appears alive. Use `bin/moraine status` as the primary health entrypoint.
+Use this escalation order:
+
+1. `moraine --output rich --verbose status`
+2. `moraine sources status --include-disabled`
+3. Monitor UI source strip and sessions panel.
+4. `moraine logs ingest --lines 200`
+5. `moraine db doctor`
+6. Direct ClickHouse queries against `ingest_errors`, `ingest_checkpoints`, `raw_events`, `events`, and search tables.
+
+For code changes, review cross-layer impact. A small normalization edit can alter search recall, source health, monitor displays, MCP output schemas, and benchmark fixtures. Preserve deterministic identity, bounded payload behavior, explicit schemas, and shared status semantics when extending the system.

@@ -43,6 +43,18 @@ bun run preview -- --host 127.0.0.1 --port 4173
 
 Note: the app calls `/api/*` on the same origin. When running `bun run dev`, API calls fail unless you provide a same-origin proxy/backend.
 
+Core runtime endpoints used by the dashboard:
+
+| Endpoint | Consumer | Purpose |
+|---|---|---|
+| `/api/health` | `StatusStrip` | Monitor and ClickHouse reachability. |
+| `/api/status` | `StatusStrip` | Table counts and ingest heartbeat status. |
+| `/api/sources` | `SourcesStrip` | Configured ingest sources, health labels, counts, checkpoints, and latest errors. |
+| `/api/analytics` | `AnalyticsPanel` | Time-series dashboard metrics. |
+| `/api/sessions` | `SessionsPanel` | Session explorer data. |
+
+`/api/sources` can return `ok=true` with a `query_error` string when ClickHouse source-health queries are partial. The UI should render the configured source inventory plus a warning instead of treating this as a hard dashboard failure.
+
 ## Test Workflow
 
 - Typecheck:

@@ -6,7 +6,7 @@ Moraine is organized as a Rust workspace with explicit app/core boundaries.
 
 - Apps (`apps/*`) are transport/runtime entrypoints.
 - Core crates (`crates/*-core`) hold service domain logic.
-- Shared infra crates (`moraine-config`, `moraine-clickhouse`) hold cross-cutting concerns.
+- Shared infra/domain crates (`moraine-config`, `moraine-clickhouse`, `moraine-conversations`, `moraine-source-status`, `moraine-privacy`) hold cross-cutting concerns or shared read models.
 
 Legacy source trees remain in-repo only as historical reference snapshots and are non-authoritative:
 
@@ -35,7 +35,7 @@ Legacy source trees remain in-repo only as historical reference snapshots and ar
 
 ### `crates/moraine-monitor-core`
 
-- Owns monitor API/query behavior (`health`, `status`, `analytics`, `tables`, `web-searches`).
+- Owns monitor API/query behavior (`health`, `status`, `analytics`, `tables`, `web-searches`, `sessions`, `sources`).
 - Owns SQL safety helpers and DTO shaping.
 
 ### `apps/moraine-mcp`
@@ -45,7 +45,18 @@ Legacy source trees remain in-repo only as historical reference snapshots and ar
 
 ### `crates/moraine-mcp-core`
 
-- Owns MCP JSON-RPC handling, tool routing (`search`, `open`), SQL building, and formatting.
+- Owns MCP JSON-RPC handling, strict tool schemas, tool routing, response formatting, and retrieval safety envelope metadata.
+- Delegates durable retrieval/query semantics to `moraine-conversations`.
+
+### `crates/moraine-conversations`
+
+- Owns read-only conversation repository traits and ClickHouse implementation.
+- Owns session listing, session lookup, event timeline, event search, conversation search, and open-context query semantics.
+
+### `crates/moraine-source-status`
+
+- Owns configured source inventory snapshots and source health classification.
+- Is shared by `apps/moraine` CLI rendering and `crates/moraine-monitor-core` `/api/sources`.
 
 ### `apps/moraine`
 
@@ -64,10 +75,16 @@ Legacy source trees remain in-repo only as historical reference snapshots and ar
 - Owns migration runner + migration ledger (`schema_migrations`).
 - Owns doctor report contract.
 
+### `crates/moraine-privacy`
+
+- Owns configurable secret redaction policy used by ingest normalization.
+
 ## Boundary rules
 
 1. App crates must stay thin and avoid embedding service domain SQL/format/business logic.
 2. Core crates may depend on shared crates but not on app crates.
 3. Shared crates must not depend on service-specific core crates.
 4. Changes to shared config or ClickHouse APIs should be made once in shared crates and consumed by all services.
-5. Do not add new runtime logic under `rust/*` or `moraine-monitor/backend`; treat those paths as legacy reference-only trees.
+5. Source-health semantics belong in `moraine-source-status`; do not duplicate classifiers in CLI or monitor code.
+6. Conversation read semantics belong in `moraine-conversations`; MCP, monitor, and future clients should consume that abstraction instead of rebuilding SQL independently.
+7. Do not add new runtime logic under `rust/*` or `moraine-monitor/backend`; treat those paths as legacy reference-only trees.
