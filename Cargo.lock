@@ -1104,6 +1104,7 @@ dependencies = [
  "clap",
  "moraine-clickhouse",
  "moraine-config",
+ "moraine-source-status",
  "ratatui",
  "reqwest",
  "serde",
@@ -1235,6 +1236,7 @@ dependencies = [
  "mime_guess",
  "moraine-clickhouse",
  "moraine-config",
+ "moraine-source-status",
  "serde",
  "serde_json",
  "tokio",
@@ -1249,6 +1251,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "moraine-source-status"
+version = "0.4.3"
+dependencies = [
+ "anyhow",
+ "moraine-clickhouse",
+ "moraine-config",
+ "serde",
 ]
 
 [[package]]

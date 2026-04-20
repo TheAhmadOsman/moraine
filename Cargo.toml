@@ -7,6 +7,7 @@ members = [
   "crates/moraine-ingest-core",
   "crates/moraine-mcp-core",
   "crates/moraine-monitor-core",
+  "crates/moraine-source-status",
   "crates/moraine-privacy",
   "apps/moraine-ingest",
   "apps/moraine-mcp",
