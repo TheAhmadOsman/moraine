@@ -2,6 +2,7 @@
   import { get } from 'svelte/store';
   import { onMount } from 'svelte';
   import AnalyticsPanel from './lib/components/AnalyticsPanel.svelte';
+  import SourceDetail from './lib/components/SourceDetail.svelte';
   import SourcesStrip from './lib/components/SourcesStrip.svelte';
   import StatusStrip from './lib/components/StatusStrip.svelte';
   import SessionsPanel from './lib/components/sessions/SessionsPanel.svelte';
@@ -41,6 +42,7 @@
 
   let sourcesData: SourcesResponse | null = null;
   let sourcesError: string | null = null;
+  let selectedSource: string | null = null;
 
   $: sessions = $sessionsStore;
   $: filteredSessions = $filteredSessionsStore;
@@ -140,6 +142,10 @@
     setTheme(event.detail);
   }
 
+  function handleSourceSelect(event: CustomEvent<string>): void {
+    selectedSource = event.detail;
+  }
+
   function handleFilterChange(event: CustomEvent<SessionsFilter>): void {
     sessionsFilterStore.set(event.detail);
   }
@@ -180,7 +186,10 @@
       sources={sourcesData?.sources ?? null}
       error={sourcesError}
       queryError={sourcesData?.query_error ?? null}
+      on:select={handleSourceSelect}
     />
+
+    <SourceDetail bind:sourceName={selectedSource} />
 
     <AnalyticsPanel
       payload={analyticsPayload}

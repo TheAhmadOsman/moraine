@@ -19,7 +19,9 @@ use tokio::time::Instant;
 
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
-use moraine_source_status::build_source_status_snapshot;
+use moraine_source_status::{
+    build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -71,6 +73,8 @@ pub async fn run_server(
         .route("/api/tables/:table", get(api_table_rows))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sources", get(api_sources))
+        .route("/api/sources/:source/files", get(api_source_files))
+        .route("/api/sources/:source/errors", get(api_source_errors))
         .fallback(get(static_fallback))
         .with_state(state.clone());
 
@@ -708,6 +712,64 @@ async fn api_sources(State(state): State<AppState>) -> Response {
             json!({"ok": false, "error": error.to_string()}),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+    }
+}
+
+#[derive(Deserialize)]
+struct SourceErrorsQuery {
+    limit: Option<u32>,
+}
+
+async fn api_source_files(Path(source): Path<String>, State(state): State<AppState>) -> Response {
+    match build_source_files_snapshot(&state.cfg, &source).await {
+        Ok(snapshot) => json_response(
+            json!({
+                "ok": true,
+                "source_name": snapshot.source_name,
+                "watch_root": snapshot.watch_root,
+                "glob": snapshot.glob,
+                "files": snapshot.files,
+                "glob_match_count": snapshot.glob_match_count,
+                "fs_error": snapshot.fs_error,
+                "query_error": snapshot.query_error,
+            }),
+            StatusCode::OK,
+        ),
+        Err(error) => {
+            let status = if error.to_string().contains("not found in config") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(json!({"ok": false, "error": error.to_string()}), status)
+        }
+    }
+}
+
+async fn api_source_errors(
+    Path(source): Path<String>,
+    Query(params): Query<SourceErrorsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let limit = params.limit.unwrap_or(50);
+    match build_source_errors_snapshot(&state.cfg, &source, limit).await {
+        Ok(snapshot) => json_response(
+            json!({
+                "ok": true,
+                "source_name": snapshot.source_name,
+                "errors": snapshot.errors,
+                "query_error": snapshot.query_error,
+            }),
+            StatusCode::OK,
+        ),
+        Err(error) => {
+            let status = if error.to_string().contains("not found in config") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(json!({"ok": false, "error": error.to_string()}), status)
+        }
     }
 }
 

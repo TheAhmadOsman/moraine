@@ -102,3 +102,45 @@ export interface SourcesResponse {
   sources: SourceHealth[];
   query_error?: string;
 }
+
+export interface SourceFileRow {
+  path: string;
+  size_bytes: number;
+  modified_at: string | null;
+  checkpoint_offset: number | null;
+  checkpoint_line_no: number | null;
+  checkpoint_status: string | null;
+  checkpoint_updated_at: string | null;
+  raw_event_count: number;
+  latest_error_at: string | null;
+  latest_error_kind: string | null;
+  latest_error_text: string | null;
+}
+
+export interface SourceFilesResponse {
+  ok: boolean;
+  source_name: string;
+  watch_root: string;
+  glob: string;
+  files: SourceFileRow[];
+  glob_match_count: number;
+  fs_error?: string;
+  query_error?: string;
+}
+
+export interface SourceErrorRow {
+  ingested_at: string;
+  source_file: string;
+  source_line_no: number;
+  source_offset: number;
+  error_kind: string;
+  error_text: string;
+  raw_fragment: string;
+}
+
+export interface SourceErrorsResponse {
+  ok: boolean;
+  source_name: string;
+  errors: SourceErrorRow[];
+  query_error?: string;
+}

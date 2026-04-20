@@ -7,5 +7,6 @@ description = "Shared ingest source health snapshot builder for CLI and monitor"
 [dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+glob = "0.3"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }

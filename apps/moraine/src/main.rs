@@ -2,7 +2,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use moraine_clickhouse::{ClickHouseClient, DoctorReport};
 use moraine_config::AppConfig;
-use moraine_source_status::{build_source_status_snapshot, SourceStatusSnapshot};
+use moraine_source_status::{
+    build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
+    SourceErrorsSnapshot, SourceFilesSnapshot, SourceStatusSnapshot,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -155,12 +158,28 @@ struct SourcesArgs {
 #[derive(Debug, Subcommand)]
 enum SourcesCommand {
     Status(SourcesStatusArgs),
+    Files(SourcesFilesArgs),
+    Errors(SourcesErrorsArgs),
 }
 
 #[derive(Debug, Args)]
 struct SourcesStatusArgs {
     #[arg(long, default_value_t = false)]
     include_disabled: bool,
+}
+
+#[derive(Debug, Args)]
+struct SourcesFilesArgs {
+    #[arg(value_name = "SOURCE")]
+    source: String,
+}
+
+#[derive(Debug, Args)]
+struct SourcesErrorsArgs {
+    #[arg(value_name = "SOURCE")]
+    source: String,
+    #[arg(long, default_value_t = 50)]
+    limit: u32,
 }
 
 #[derive(Debug, Args)]
@@ -1596,6 +1615,18 @@ async fn cmd_sources_status(
     build_source_status_snapshot(cfg, include_disabled).await
 }
 
+async fn cmd_sources_files(cfg: &AppConfig, source: &str) -> Result<SourceFilesSnapshot> {
+    build_source_files_snapshot(cfg, source).await
+}
+
+async fn cmd_sources_errors(
+    cfg: &AppConfig,
+    source: &str,
+    limit: u32,
+) -> Result<SourceErrorsSnapshot> {
+    build_source_errors_snapshot(cfg, source, limit).await
+}
+
 fn quote_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
@@ -2220,6 +2251,155 @@ fn render_sources_status(output: &CliOutput, snapshot: &SourceStatusSnapshot) ->
     Ok(())
 }
 
+fn render_sources_files(output: &CliOutput, snapshot: &SourceFilesSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    if let Some(error) = &snapshot.fs_error {
+        output.section("Filesystem", &[format!("warning: {error}")]);
+    }
+    if let Some(error) = &snapshot.query_error {
+        output.section("Query", &[format!("warning: {error}")]);
+    }
+
+    if snapshot.files.is_empty() {
+        output.section(
+            &format!("Source Files: {}", snapshot.source_name),
+            &["no files matched".to_string()],
+        );
+        return Ok(());
+    }
+
+    let rows = snapshot
+        .files
+        .iter()
+        .map(|file| {
+            let mut row = vec![
+                file.path.clone(),
+                file.size_bytes.to_string(),
+                file.modified_at.clone().unwrap_or_else(|| "-".to_string()),
+                file.raw_event_count.to_string(),
+                file.checkpoint_offset
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                file.checkpoint_status
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ];
+            if output.verbose {
+                row.push(
+                    file.checkpoint_line_no
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                row.push(
+                    file.checkpoint_updated_at
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                row.push(
+                    file.latest_error_kind
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if output.verbose {
+        output.table(
+            &format!(
+                "Source Files: {} ({} matches)",
+                snapshot.source_name, snapshot.glob_match_count
+            ),
+            &[
+                "path",
+                "size",
+                "modified",
+                "raw",
+                "checkpoint",
+                "status",
+                "line",
+                "updated",
+                "latest error",
+            ],
+            &rows,
+        );
+    } else {
+        output.table(
+            &format!(
+                "Source Files: {} ({} matches)",
+                snapshot.source_name, snapshot.glob_match_count
+            ),
+            &["path", "size", "modified", "raw", "checkpoint", "status"],
+            &rows,
+        );
+    }
+    Ok(())
+}
+
+fn render_sources_errors(output: &CliOutput, snapshot: &SourceErrorsSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    if let Some(error) = &snapshot.query_error {
+        output.section("Query", &[format!("warning: {error}")]);
+    }
+
+    if snapshot.errors.is_empty() {
+        output.section(
+            &format!("Source Errors: {}", snapshot.source_name),
+            &["no errors recorded".to_string()],
+        );
+        return Ok(());
+    }
+
+    let rows = snapshot
+        .errors
+        .iter()
+        .map(|err| {
+            let mut row = vec![
+                err.ingested_at.clone(),
+                err.error_kind.clone(),
+                err.source_file.clone(),
+            ];
+            if output.verbose {
+                row.push(err.error_text.clone());
+                row.push(err.raw_fragment.clone());
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if output.verbose {
+        output.table(
+            &format!(
+                "Source Errors: {} ({})",
+                snapshot.source_name,
+                snapshot.errors.len()
+            ),
+            &["time", "kind", "file", "text", "raw fragment"],
+            &rows,
+        );
+    } else {
+        output.table(
+            &format!(
+                "Source Errors: {} ({})",
+                snapshot.source_name,
+                snapshot.errors.len()
+            ),
+            &["time", "kind", "file"],
+            &rows,
+        );
+    }
+    Ok(())
+}
+
 fn render_db_migrate(output: &CliOutput, outcome: &MigrationOutcome) -> Result<()> {
     if output.is_json() {
         println!("{}", serde_json::to_string_pretty(outcome)?);
@@ -2562,6 +2742,16 @@ async fn main() -> Result<ExitCode> {
                     render_sources_status(&output, &snapshot)?;
                     Ok(ExitCode::SUCCESS)
                 }
+                SourcesCommand::Files(files) => {
+                    let snapshot = cmd_sources_files(&cfg, &files.source).await?;
+                    render_sources_files(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                SourcesCommand::Errors(errors) => {
+                    let snapshot = cmd_sources_errors(&cfg, &errors.source, errors.limit).await?;
+                    render_sources_errors(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
             }
         }
         CliCommand::Run(run) => {
@@ -2848,6 +3038,31 @@ mod tests {
                 command: SourcesCommand::Status(status),
             }) => assert!(status.include_disabled),
             _ => panic!("expected sources status command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_sources_files_command() {
+        let cli = Cli::parse_from(["moraine", "sources", "files", "codex"]);
+        match cli.command {
+            CliCommand::Sources(SourcesArgs {
+                command: SourcesCommand::Files(files),
+            }) => assert_eq!(files.source, "codex"),
+            _ => panic!("expected sources files command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_sources_errors_command() {
+        let cli = Cli::parse_from(["moraine", "sources", "errors", "codex", "--limit", "10"]);
+        match cli.command {
+            CliCommand::Sources(SourcesArgs {
+                command: SourcesCommand::Errors(errors),
+            }) => {
+                assert_eq!(errors.source, "codex");
+                assert_eq!(errors.limit, 10);
+            }
+            _ => panic!("expected sources errors command"),
         }
     }
 
