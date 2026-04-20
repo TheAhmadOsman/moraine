@@ -142,6 +142,52 @@ pub struct RuntimeConfig {
     pub start_mcp_on_up: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionMode {
+    StoreRaw,
+    HashRaw,
+    RedactRaw,
+    DropRaw,
+    EncryptRaw,
+}
+
+impl Default for RedactionMode {
+    fn default() -> Self {
+        RedactionMode::StoreRaw
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_redaction_policy_version")]
+    pub redaction_policy_version: String,
+    #[serde(default)]
+    pub raw_events_mode: RedactionMode,
+    #[serde(default)]
+    pub text_content_mode: RedactionMode,
+    #[serde(default)]
+    pub payload_json_mode: RedactionMode,
+    #[serde(default)]
+    pub tool_io_mode: RedactionMode,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redaction_policy_version: default_redaction_policy_version(),
+            raw_events_mode: RedactionMode::StoreRaw,
+            text_content_mode: RedactionMode::StoreRaw,
+            payload_json_mode: RedactionMode::StoreRaw,
+            tool_io_mode: RedactionMode::StoreRaw,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -157,6 +203,8 @@ pub struct AppConfig {
     pub monitor: MonitorConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 impl Default for ClickHouseConfig {
@@ -473,6 +521,10 @@ fn default_healthcheck_interval_ms() -> u64 {
 
 fn default_clickhouse_version() -> String {
     "v25.12.5.44-stable".to_string()
+}
+
+fn default_redaction_policy_version() -> String {
+    "0".to_string()
 }
 
 fn default_true() -> bool {

@@ -1,6 +1,6 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
-use crate::normalize::normalize_record;
+use crate::normalize::{apply_privacy_redaction, normalize_record};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{anyhow, Context, Result};
 use moraine_config::{AppConfig, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON};
@@ -484,6 +484,8 @@ pub(crate) async fn process_file(
             &mut session_cursors,
         );
 
+        apply_privacy_redaction(&mut normalized, &config.privacy);
+
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
         batch.raw_rows.push(normalized.raw_row);
@@ -817,7 +819,8 @@ async fn process_opencode_sqlite_file(
                 &session_hint,
                 &model_hint,
             ) {
-                Ok(normalized) => {
+                Ok(mut normalized) => {
+                    apply_privacy_redaction(&mut normalized, &config.privacy);
                     session_hint = normalized.session_hint;
                     model_hint = normalized.model_hint;
                     batch.raw_rows.push(normalized.raw_row);
@@ -1023,7 +1026,8 @@ async fn process_session_json_file(
             &session_hint,
             &model_hint,
         ) {
-            Ok(normalized) => {
+            Ok(mut normalized) => {
+                apply_privacy_redaction(&mut normalized, &config.privacy);
                 session_hint = normalized.session_hint;
                 model_hint = normalized.model_hint;
                 batch.raw_rows.push(normalized.raw_row);
