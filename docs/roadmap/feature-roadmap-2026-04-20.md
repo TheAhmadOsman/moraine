@@ -11,6 +11,10 @@ more useful as durable agent memory, safer as an MCP retrieval surface, easier
 to operate over months of local and remote sessions, and easier to extend as new
 agent harnesses appear.
 
+## Strategic Specifications
+
+P2 and P3 features in this roadmap are too large to implement in a single PR. Detailed design specifications — including schema sketches, API contracts, acceptance criteria, and PR sequencing — are maintained in [`docs/roadmap/specs/`](specs/). Implementation should reference those specs before cutting branches.
+
 ## Sources Used
 
 This roadmap is based on the current repository docs and schema, especially:

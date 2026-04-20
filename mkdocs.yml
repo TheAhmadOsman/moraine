@@ -66,6 +66,28 @@ nav:
       - Workspace Ownership: architecture/workspace-ownership.md
   - Roadmap:
       - Feature Roadmap 2026-04-20: roadmap/feature-roadmap-2026-04-20.md
+      - Strategic Specs Index: roadmap/specs/README.md
+      - Ownership & Review: roadmap/specs/OWNERSHIP.md
+      - P2 Specs:
+          - P01 Session Summaries: roadmap/specs/P01-session-summaries.md
+          - P02 Knowledge Notes: roadmap/specs/P02-knowledge-notes.md
+          - P03 Entity Graph: roadmap/specs/P03-entity-graph.md
+          - P04 Replay Tooling: roadmap/specs/P04-replay.md
+          - P05 Project Profiles: roadmap/specs/P05-project-profiles.md
+          - P06 Client Polish: roadmap/specs/P06-client-polish.md
+          - P07 Monitor UX: roadmap/specs/P07-monitor-ux.md
+          - P08 Performance: roadmap/specs/P08-performance.md
+          - P09 Policy Engine: roadmap/specs/P09-policy-engine.md
+          - P10 Adapter Marketplace: roadmap/specs/P10-adapter-marketplace.md
+      - P3 Specs:
+          - S01 Team Mode: roadmap/specs/S01-team-mode.md
+          - S02 Hosted Mode: roadmap/specs/S02-hosted-mode.md
+          - S03 Cross-Device Sync: roadmap/specs/S03-cross-device-sync.md
+          - S04 Desktop / Extension: roadmap/specs/S04-desktop-extension.md
+          - S05 Anomaly Detection: roadmap/specs/S05-anomaly-detection.md
+          - S06 Multimodal: roadmap/specs/S06-multimodal.md
+      - Changelog:
+          - Strategic Docs 2026-04-20: roadmap/changelog/strategic-docs.md
   - Development:
       - Dev Sandbox: development/sandbox.md
   - Operations:

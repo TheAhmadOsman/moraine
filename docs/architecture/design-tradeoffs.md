@@ -119,3 +119,7 @@ Revisit trigger: when real encryption key management exists, replace the current
 ## Decision Summary
 
 Across all decisions, the consistent pattern is this: Moraine spends complexity in deterministic ingestion semantics and schema design so that retrieval remains thin and operational debugging remains tractable. The system is intentionally not minimal in table count or code paths. It is minimal in hidden behavior. That distinction should remain the bar for future changes.
+
+## Future Architecture Work
+
+For features that extend these decisions — summaries over traces, entity graphs, policy engines, team mode, and multimodal ingest — concrete design specifications are maintained in [`docs/roadmap/specs/`](../roadmap/specs/README.md). Each spec records how the feature respects or revisits the ADRs above, including schema sketches, API contracts, and acceptance criteria. Proposals that contradict an existing ADR should include explicit revisit reasoning.
