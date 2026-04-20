@@ -1,0 +1,48 @@
+{
+  "description": "Sample search quality qrels for offline harness self-check.",
+  "queries": [
+    {
+      "query_id": "q-auth-error",
+      "query_text": "authentication error login failed",
+      "relevant": [
+        {"event_uid": "evt-auth-001", "relevance": 2},
+        {"event_uid": "evt-auth-002", "relevance": 1},
+        {"event_uid": "evt-auth-003", "relevance": 1}
+      ]
+    },
+    {
+      "query_id": "q-db-timeout",
+      "query_text": "database connection timeout",
+      "relevant": [
+        {"event_uid": "evt-db-001", "relevance": 2},
+        {"event_uid": "evt-db-002", "relevance": 1}
+      ]
+    },
+    {
+      "query_id": "q-shell-cmd",
+      "query_text": "shell command execution",
+      "relevant": [
+        {"event_uid": "evt-shell-001", "relevance": 2},
+        {"event_uid": "evt-shell-002", "relevance": 2},
+        {"event_uid": "evt-shell-003", "relevance": 1}
+      ]
+    },
+    {
+      "query_id": "q-model-switch",
+      "query_text": "switch model provider",
+      "relevant": [
+        {"event_uid": "evt-model-001", "relevance": 2}
+      ]
+    },
+    {
+      "query_id": "q-memory-leak",
+      "query_text": "memory leak heap usage",
+      "relevant": [
+        {"event_uid": "evt-mem-001", "relevance": 2},
+        {"event_uid": "evt-mem-002", "relevance": 1},
+        {"event_uid": "evt-mem-003", "relevance": 1},
+        {"event_uid": "evt-mem-004", "relevance": 1}
+      ]
+    }
+  ]
+}
