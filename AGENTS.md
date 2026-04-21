@@ -106,6 +106,26 @@ If you were spawned into a temporary worktree (e.g. `/Users/.../.claude/worktree
 When the user asks you to take on new development work, 
 check out a fresh worktree with an appropriate name for your work to prevent multi-agent collision.
 
+## Operator Settings Sync
+For this workstation's live Moraine deployment, an update is not complete until
+the external settings bundle at `/Users/xmasterrrr/Scratch/agents/moraine/` has
+been reviewed and updated to match the current CLI, config surface, and runtime
+behavior.
+
+Operator-specific paths and hosts live in
+[`/Users/xmasterrrr/Scratch/agents/moraine/.env`](/Users/xmasterrrr/Scratch/agents/moraine/.env)
+and
+[`/Users/xmasterrrr/Scratch/agents/moraine/.env.example`](/Users/xmasterrrr/Scratch/agents/moraine/.env.example).
+Do not duplicate or edit those values inline in this file; update the env files
+and the settings bundle docs/scripts instead.
+
+When updating Moraine, always:
+- create a timestamped backup under `MORAINE_SETTINGS_BACKUP_DIR` from `.env`
+- review and update `.env`, `.env.example`, `README.md`, `moraine.example.toml`, `moraine.toml`, and any helper scripts in the settings bundle
+- keep `[privacy]`, `[imports.*]`, backup/restore guidance, source diagnostics, and MCP wiring aligned with the current build
+- keep helper scripts aligned with the real mirror topology and the configured import profiles
+- run `post-update-check` and `sync-imports plan all` from the settings bundle; both scripts source `.env` automatically
+
 ## Writing PRs
 History uses concise, Conventional-Commit-like subjects such as:
 - `feat: ...`
