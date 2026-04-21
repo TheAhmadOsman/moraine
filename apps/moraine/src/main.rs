@@ -778,6 +778,17 @@ struct RestorePlanSnapshot {
     warnings: Vec<String>,
     table_count: usize,
     total_rows: u64,
+    restored_tables: Vec<RestoreTableResult>,
+    skipped_tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RestoreTableResult {
+    name: String,
+    kind: String,
+    file: String,
+    expected_rows: u64,
+    restored_rows: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4281,6 +4292,31 @@ fn read_backup_manifest(path: &Path) -> Result<BackupManifest> {
         .with_context(|| format!("invalid backup manifest {}", manifest_path.display()))
 }
 
+fn restore_skipped_table_reason(table: &BackupTableManifest) -> Option<String> {
+    if table.name == "schema_migrations" {
+        return Some(format!(
+            "{}: schema ledger is recreated from bundled migrations for the staging database",
+            table.name
+        ));
+    }
+    if table.kind == "derived" {
+        return Some(format!(
+            "{}: derived/search table is rebuilt from restored canonical events in this slice",
+            table.name
+        ));
+    }
+    None
+}
+
+fn restore_importable_tables(
+    manifest: &BackupManifest,
+) -> impl Iterator<Item = &BackupTableManifest> {
+    manifest
+        .tables
+        .iter()
+        .filter(|table| restore_skipped_table_reason(table).is_none())
+}
+
 async fn cmd_backup_create(
     cfg: &AppConfig,
     args: &BackupCreateArgs,
@@ -4595,13 +4631,19 @@ fn cmd_restore_plan(cfg: &AppConfig, args: &RestoreArgs) -> RestorePlanSnapshot 
     let mut blockers = verify.errors.clone();
     let mut warnings = Vec::new();
 
-    if !dry_run {
+    if !dry_run && args.target_database.is_none() {
         blockers.push(
-            "live restore --execute is not implemented yet; run without --execute to inspect the restore plan"
+            "restore --execute requires --target-database <staging_db>; live database replacement is not implemented"
                 .to_string(),
         );
     }
+    if !dry_run && target_database == cfg.clickhouse.database {
+        blockers.push(format!(
+            "restore --execute target database `{target_database}` is the active database; choose a separate staging database"
+        ));
+    }
 
+    let mut skipped_tables = Vec::new();
     let (table_count, total_rows) = verify
         .manifest
         .as_ref()
@@ -4612,6 +4654,18 @@ fn cmd_restore_plan(cfg: &AppConfig, args: &RestoreArgs) -> RestorePlanSnapshot 
                     manifest.moraine_version,
                     env!("CARGO_PKG_VERSION")
                 ));
+            }
+            skipped_tables.extend(
+                manifest
+                    .tables
+                    .iter()
+                    .filter_map(restore_skipped_table_reason),
+            );
+            if manifest.include_derived {
+                warnings.push(
+                    "backup includes derived tables; restore execution imports corpus/operational tables and leaves derived search tables to materialized views/reindex"
+                        .to_string(),
+                );
             }
             (
                 manifest.tables.len(),
@@ -4629,7 +4683,134 @@ fn cmd_restore_plan(cfg: &AppConfig, args: &RestoreArgs) -> RestorePlanSnapshot 
         warnings,
         table_count,
         total_rows,
+        restored_tables: Vec::new(),
+        skipped_tables,
     }
+}
+
+async fn cmd_restore(cfg: &AppConfig, args: &RestoreArgs) -> Result<RestorePlanSnapshot> {
+    let mut snapshot = cmd_restore_plan(cfg, args);
+    if snapshot.dry_run || !snapshot.can_restore {
+        return Ok(snapshot);
+    }
+
+    let verify = cmd_backup_verify(&args.input);
+    if !verify.ok {
+        snapshot.can_restore = false;
+        snapshot.blockers.extend(verify.errors);
+        return Ok(snapshot);
+    }
+    let Some(manifest) = verify.manifest else {
+        snapshot.can_restore = false;
+        snapshot
+            .blockers
+            .push("backup manifest was not available after verification".to_string());
+        return Ok(snapshot);
+    };
+
+    let importable_tables = restore_importable_tables(&manifest)
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    if importable_tables.is_empty() {
+        snapshot.can_restore = false;
+        snapshot
+            .blockers
+            .push("backup contains no importable corpus or operational tables".to_string());
+        return Ok(snapshot);
+    }
+
+    let control_ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    control_ch.ping().await.context("ClickHouse ping failed")?;
+    let existing_tables =
+        existing_clickhouse_tables(&control_ch, &snapshot.target_database).await?;
+    if !existing_tables.is_empty() {
+        snapshot.can_restore = false;
+        snapshot.blockers.push(format!(
+            "target staging database `{}` already contains {} table(s); choose an empty/new target database",
+            snapshot.target_database,
+            existing_tables.len()
+        ));
+        return Ok(snapshot);
+    }
+
+    let mut restore_clickhouse = cfg.clickhouse.clone();
+    restore_clickhouse.database = snapshot.target_database.clone();
+    let restore_ch = ClickHouseClient::new(restore_clickhouse)?;
+    restore_ch.run_migrations().await.with_context(|| {
+        format!(
+            "failed to create staging schema `{}`",
+            snapshot.target_database
+        )
+    })?;
+
+    let staged_tables = existing_clickhouse_tables(&control_ch, &snapshot.target_database).await?;
+    for table_name in &importable_tables {
+        if !staged_tables.contains(table_name) {
+            snapshot.can_restore = false;
+            snapshot.blockers.push(format!(
+                "staging schema `{}` is missing required table `{table_name}`",
+                snapshot.target_database
+            ));
+        }
+    }
+    if !snapshot.can_restore {
+        return Ok(snapshot);
+    }
+
+    for table in restore_importable_tables(&manifest) {
+        let relative = backup_relative_path(&table.file)?;
+        let table_path = args.input.join(relative);
+        let bytes = fs::read(&table_path)
+            .with_context(|| format!("failed to read backup table {}", table_path.display()))?;
+        if !bytes.is_empty() {
+            let query = format!(
+                "INSERT INTO {}.{} FORMAT JSONEachRow",
+                quote_identifier(&snapshot.target_database),
+                quote_identifier(&table.name)
+            );
+            restore_ch
+                .request_text(
+                    &query,
+                    Some(bytes),
+                    Some(&snapshot.target_database),
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to restore table `{}` into staging database `{}`",
+                        table.name, snapshot.target_database
+                    )
+                })?;
+        }
+
+        let restored_rows = query_count(
+            &restore_ch,
+            &snapshot.target_database,
+            &format!(
+                "SELECT toUInt64(count()) AS rows FROM {}",
+                quote_identifier(&table.name)
+            ),
+        )
+        .await?;
+        snapshot.restored_tables.push(RestoreTableResult {
+            name: table.name.clone(),
+            kind: table.kind.clone(),
+            file: table.file.clone(),
+            expected_rows: table.row_count,
+            restored_rows,
+        });
+        if restored_rows != table.row_count {
+            snapshot.can_restore = false;
+            snapshot.blockers.push(format!(
+                "restored row count mismatch for {}: manifest says {}, staging table has {}",
+                table.name, table.row_count, restored_rows
+            ));
+        }
+    }
+
+    Ok(snapshot)
 }
 
 fn cmd_config_detect() -> ConfigDetectSnapshot {
@@ -4963,6 +5144,15 @@ fn render_restore_plan(output: &CliOutput, snapshot: &RestorePlanSnapshot) -> Re
     }
     for warning in &snapshot.warnings {
         lines.push(format!("  warning: {warning}"));
+    }
+    for table in &snapshot.restored_tables {
+        lines.push(format!(
+            "  restored {}: {} rows ({})",
+            table.name, table.restored_rows, table.file
+        ));
+    }
+    for skipped in &snapshot.skipped_tables {
+        lines.push(format!("  skipped: {skipped}"));
     }
     output.section("Restore Plan", &lines);
     Ok(())
@@ -5327,7 +5517,7 @@ async fn main() -> Result<ExitCode> {
         }
         CliCommand::Restore(args) => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
-            let snapshot = cmd_restore_plan(&cfg, &args);
+            let snapshot = cmd_restore(&cfg, &args).await?;
             render_restore_plan(&output, &snapshot)?;
             Ok(if snapshot.can_restore {
                 ExitCode::SUCCESS
@@ -6454,7 +6644,7 @@ Total transferred file size: 1,024 bytes
     }
 
     #[test]
-    fn restore_plan_blocks_invalid_or_execute_requests() {
+    fn restore_plan_requires_valid_backup_and_staging_execute_target() {
         let root = temp_dir("restore-plan");
         let cfg = AppConfig::default();
         let invalid = cmd_restore_plan(
@@ -6479,15 +6669,93 @@ Total transferred file size: 1,024 bytes
                 input: root.clone(),
                 dry_run: false,
                 execute: true,
-                target_database: Some("restore_db".to_string()),
+                target_database: None,
             },
         );
         assert!(!execute.can_restore);
-        assert_eq!(execute.target_database, "restore_db");
         assert!(execute
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("not implemented")));
+            .any(|blocker| blocker.contains("requires --target-database")));
+
+        let active = cmd_restore_plan(
+            &cfg,
+            &RestoreArgs {
+                input: root.clone(),
+                dry_run: false,
+                execute: true,
+                target_database: Some(cfg.clickhouse.database.clone()),
+            },
+        );
+        assert!(!active.can_restore);
+        assert!(active
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("active database")));
+
+        let staging = cmd_restore_plan(
+            &cfg,
+            &RestoreArgs {
+                input: root.clone(),
+                dry_run: false,
+                execute: true,
+                target_database: Some("restore_db".to_string()),
+            },
+        );
+        assert!(staging.can_restore, "{:?}", staging.blockers);
+        assert_eq!(staging.target_database, "restore_db");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_plan_reports_skipped_schema_and_derived_tables() {
+        let root = temp_dir("restore-plan-skips");
+        let cfg = AppConfig::default();
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let mut manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        manifest.include_derived = true;
+        manifest.tables.push(BackupTableManifest {
+            name: "schema_migrations".to_string(),
+            kind: "schema".to_string(),
+            file: "tables/schema_migrations.jsonl".to_string(),
+            row_count: 0,
+            sha256: sha256_bytes_hex(b""),
+        });
+        manifest.tables.push(BackupTableManifest {
+            name: "search_documents".to_string(),
+            kind: "derived".to_string(),
+            file: "tables/search_documents.jsonl".to_string(),
+            row_count: 0,
+            sha256: sha256_bytes_hex(b""),
+        });
+        write_test_backup(&root, &manifest, table_bytes);
+        fs::write(root.join("tables/schema_migrations.jsonl"), b"").expect("schema file");
+        fs::write(root.join("tables/search_documents.jsonl"), b"").expect("search file");
+
+        let snapshot = cmd_restore_plan(
+            &cfg,
+            &RestoreArgs {
+                input: root.clone(),
+                dry_run: true,
+                execute: false,
+                target_database: Some("restore_db".to_string()),
+            },
+        );
+
+        assert!(snapshot.can_restore, "{:?}", snapshot.blockers);
+        assert!(snapshot
+            .skipped_tables
+            .iter()
+            .any(|skip| skip.contains("schema_migrations")));
+        assert!(snapshot
+            .skipped_tables
+            .iter()
+            .any(|skip| skip.contains("search_documents")));
+        assert!(snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("derived tables")));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -55,10 +55,21 @@ moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20
 moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20 --target-database moraine_restore
 ```
 
-`restore` is intentionally dry-run only in this slice. Passing `--execute`
-returns a blocker instead of mutating ClickHouse. Use the plan and verified
-JSONEachRow files for manual recovery, or reindex from original source files
-when that is safer.
+Execute a verified backup into a staging database:
+
+```bash
+moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20 --target-database moraine_restore --execute
+```
+
+`restore --execute` is staging-only in this slice. It refuses to target the
+active configured database, requires an explicit `--target-database`, and
+refuses a target database that already contains tables. The command creates the
+current bundled schema in the staging database, imports verified corpus and
+operational tables, and validates restored row counts.
+
+Live replacement of the active database is not implemented. After a staging
+restore, inspect the restored database with ClickHouse tools and Moraine doctor
+checks before doing any manual cutover.
 
 All commands support the global output flag:
 
@@ -83,6 +94,13 @@ The base backup includes:
 
 `--include-derived` also exports search and interaction tables when present.
 Derived tables are skipped if they do not exist; base tables are required.
+
+Restore execution currently imports corpus and operational tables only. It skips
+`schema_migrations` because the staging schema is created from the current
+bundled migrations, and it skips derived/search tables because materialized
+views and explicit reindexing are the safer rebuild path. Use
+`moraine reindex --search-only --execute` against a restored staging database
+when you need to rebuild search artifacts there.
 
 ## Verification
 
@@ -146,6 +164,10 @@ incomplete backup.
 If `backup verify` fails, do not use that backup for recovery without manual
 inspection. The error list identifies missing files, checksum mismatches, row
 count mismatches, duplicate manifest entries, and unsafe paths.
+
+If `restore --execute` fails after creating a staging database, leave the
+staging database in place for inspection unless you are certain it can be
+dropped. The command never drops or replaces the active configured database.
 
 If disk space is tight, use `--output json` and external disk checks before a
 large export. The initial implementation writes JSONEachRow files directly under

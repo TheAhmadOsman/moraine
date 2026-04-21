@@ -342,7 +342,7 @@ moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20
 moraine restore --input ~/.moraine/backups/pre-migration-2026-04-20 --target-database moraine_restore
 ```
 
-Backups include a manifest, source inventory, migration metadata, table row counts, and SHA-256 checksums for exported `JSONEachRow` table files. Privacy encryption key material is not included and must be managed separately. Live restore execution is intentionally not enabled yet; `restore --execute` reports a blocker instead of changing ClickHouse.
+Backups include a manifest, source inventory, migration metadata, table row counts, and SHA-256 checksums for exported `JSONEachRow` table files. Privacy encryption key material is not included and must be managed separately. `restore --execute` is staging-only: it requires an explicit `--target-database`, refuses the active database, refuses non-empty targets, creates the bundled schema, imports verified corpus/operational tables, and validates row counts.
 
 Detailed operational guidance is in `backup-and-restore.md`.
 

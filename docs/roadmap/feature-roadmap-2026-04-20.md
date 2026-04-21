@@ -104,7 +104,7 @@ As of `8377a8b`, these foundations are already in `main`:
 
 | Area | Landed foundation | Remaining roadmap work |
 |---|---|---|
-| R01 backup/restore | `backup create/list/verify` exports real ClickHouse `JSONEachRow` files and verifies checksums; `restore` produces a dry-run plan. | Live restore execution, staging database restore, post-restore integrity checks, and sandbox e2e proof. |
+| R01 backup/restore | `backup create/list/verify` exports real ClickHouse `JSONEachRow` files and verifies checksums; `restore --execute` can restore verified backups into a fresh staging database. | Active database replacement, broader post-restore integrity automation, and sandbox e2e proof. |
 | R08 OpenCode hardening | WAL sibling watcher mapping, strict watermark paging, schema drift errors with `PRAGMA user_version`, and fixtures. | Broader OpenCode schema compatibility matrix and user-facing drift remediation. |
 | R09 privacy encryption | AES-256-GCM envelopes, env/file key loading, privacy metadata columns, and fail-closed missing-key behavior. | Key rotation, decrypt/export admin workflow, key backup checks, and re-encryption policy. |
 | R11/R12 MCP safety | Strict input schemas, output schemas, `safety_mode`, safety metadata, prose preamble, and regression tests. | Broader client conformance fixtures, MCP resources/prompts, and hostile-memory corpus tests. |
@@ -193,15 +193,16 @@ Effort: L
 Status: foundation landed in `8377a8b`, not complete.
 
 Moraine now has real `moraine backup create`, `moraine backup list`,
-`moraine backup verify`, and `moraine restore --dry-run` commands. The shipped
-backup includes ClickHouse table exports, migration metadata, source inventory,
-and per-table row counts plus checksums. The remaining work is to turn restore
-planning into a safe, tested restore execution path.
+`moraine backup verify`, `moraine restore --dry-run`, and staging-only
+`moraine restore --execute` commands. The shipped backup includes ClickHouse
+table exports, migration metadata, source inventory, and per-table row counts
+plus checksums. The remaining work is to turn staging restore into a fully
+automated active-database replacement path.
 
 Next slices:
 
 - Keep `~/.moraine/backups/` as the default local backup directory.
-- Add restore execution into a staging database and validate counts before any
+- Extend staging restore with deeper post-restore doctor checks before any
   in-place swap or destructive reset.
 - Add backup age/freshness checks to reindex, migration, and privacy-reprocess
   workflows.
@@ -226,8 +227,8 @@ Edge cases:
 Acceptance criteria:
 
 - Backup and restore are documented and sandbox-tested.
-- Restore can produce a clean database with matching table counts and doctor
-  output.
+- Restore can produce a clean staging database with matching table counts and
+  doctor output.
 - `restore --dry-run` refuses incompatible or incomplete backups before changes.
 
 ### R02 - Clean Reindex and Search Rebuild Orchestration
