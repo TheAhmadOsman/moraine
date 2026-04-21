@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use moraine_clickhouse::{
-    bundled_migrations, ClickHouseClient, DoctorDeepReport, DoctorFinding, DoctorReport,
-    DoctorSeverity,
+    bundled_migrations, ClickHouseClient, ClickHouseVersionCompatibility, DoctorDeepReport,
+    DoctorFinding, DoctorReport, DoctorSeverity,
 };
 use moraine_config::AppConfig;
 use moraine_source_status::{
@@ -39,6 +39,8 @@ const PRIVACY_METADATA_SQL: &str = include_str!("../../../sql/013_privacy_metada
 const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const BACKUP_TABLES_DIR: &str = "tables";
 const BACKUP_MANIFEST_VERSION: u32 = 1;
+const DESTRUCTIVE_BACKUP_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const DESTRUCTIVE_BACKUP_MAX_AGE_LABEL: &str = "24h";
 
 const DEFAULT_CLICKHOUSE_TAG: &str = "v25.12.5.44-stable";
 const CH_URL_MACOS_X86_64: &str = "https://github.com/ClickHouse/ClickHouse/releases/download/v25.12.5.44-stable/clickhouse-macos";
@@ -112,6 +114,8 @@ struct UpArgs {
     monitor: bool,
     #[arg(long)]
     mcp: bool,
+    #[arg(long, default_value_t = false)]
+    no_backup_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -130,8 +134,14 @@ struct DbArgs {
 
 #[derive(Debug, Subcommand)]
 enum DbCommand {
-    Migrate,
+    Migrate(DbMigrateArgs),
     Doctor(DbDoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbMigrateArgs {
+    #[arg(long, default_value_t = false)]
+    no_backup_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -342,6 +352,8 @@ struct ReindexArgs {
     dry_run: bool,
     #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
     execute: bool,
+    #[arg(long, default_value_t = false)]
+    no_backup_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -696,6 +708,13 @@ struct BackupVerifySnapshot {
     ok: bool,
     errors: Vec<String>,
     manifest: Option<BackupManifest>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedBackupSummary {
+    backup_id: String,
+    path: PathBuf,
+    created_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2402,6 +2421,10 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
     if let Some(version) = &snapshot.doctor.clickhouse_version {
         doctor_lines[0].push_str(&format!("  (v{version})"));
     }
+    doctor_lines.push(format!(
+        "  clickhouse compatibility: {}",
+        clickhouse_compatibility_detail(&snapshot.doctor)
+    ));
     if !snapshot.doctor.pending_migrations.is_empty() {
         doctor_lines.push(format!(
             "  pending migrations: {}",
@@ -2798,6 +2821,7 @@ fn doctor_is_healthy(snapshot: &DoctorSnapshot) -> bool {
     let report = doctor_report(snapshot);
     report.clickhouse_healthy
         && report.database_exists
+        && report.clickhouse_version_compatibility != ClickHouseVersionCompatibility::Unsupported
         && report.pending_migrations.is_empty()
         && report.missing_tables.is_empty()
         && report.errors.is_empty()
@@ -2811,6 +2835,36 @@ fn doctor_severity_label(severity: DoctorSeverity) -> &'static str {
         DoctorSeverity::Ok => "ok",
         DoctorSeverity::Warning => "warning",
         DoctorSeverity::Error => "error",
+    }
+}
+
+fn clickhouse_compatibility_label(compatibility: ClickHouseVersionCompatibility) -> &'static str {
+    match compatibility {
+        ClickHouseVersionCompatibility::Supported => "supported",
+        ClickHouseVersionCompatibility::Experimental => "experimental",
+        ClickHouseVersionCompatibility::Unsupported => "unsupported",
+        ClickHouseVersionCompatibility::Unknown => "unknown",
+    }
+}
+
+fn clickhouse_compatibility_detail(report: &DoctorReport) -> String {
+    match (
+        report.clickhouse_version_compatibility,
+        report.clickhouse_version_line.as_deref(),
+    ) {
+        (ClickHouseVersionCompatibility::Supported, Some(line)) => {
+            format!("supported (line {line}, current pinned support line)")
+        }
+        (ClickHouseVersionCompatibility::Experimental, Some(line)) => {
+            format!("experimental (line {line}, named next-candidate line)")
+        }
+        (ClickHouseVersionCompatibility::Unsupported, Some(line)) => {
+            format!("unsupported (line {line})")
+        }
+        (ClickHouseVersionCompatibility::Unknown, Some(line)) => {
+            format!("unknown (parsed line {line})")
+        }
+        _ => clickhouse_compatibility_label(report.clickhouse_version_compatibility).to_string(),
     }
 }
 
@@ -2845,6 +2899,10 @@ fn render_db_doctor(output: &CliOutput, snapshot: &DoctorSnapshot) -> Result<()>
     if let Some(version) = &report.clickhouse_version {
         lines.push(format!("clickhouse version: {version}"));
     }
+    lines.push(format!(
+        "clickhouse compatibility: {}",
+        clickhouse_compatibility_detail(report)
+    ));
     if output.verbose && !report.applied_migrations.is_empty() {
         lines.push(format!(
             "applied migrations: {}",
@@ -3504,6 +3562,13 @@ async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnaps
     let dry_run = preview_mode(args.dry_run, args.execute);
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     ensure_reindex_ready(&ch).await?;
+    if !dry_run {
+        require_recent_verified_backup(
+            cfg,
+            "`moraine reindex --search-only --execute`",
+            args.no_backup_check,
+        )?;
+    }
 
     let documents_select = search_documents_select_sql()?;
     let postings_select = search_postings_select_sql()?;
@@ -3685,6 +3750,25 @@ fn count_jsonl_rows_text(text: &str) -> u64 {
 fn count_jsonl_rows_bytes(bytes: &[u8]) -> Result<u64> {
     let text = std::str::from_utf8(bytes).context("backup table file is not valid utf-8")?;
     Ok(count_jsonl_rows_text(text))
+}
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn format_age_seconds(age_seconds: u64) -> String {
+    if age_seconds < 60 {
+        format!("{age_seconds}s")
+    } else if age_seconds < 60 * 60 {
+        format!("{}m", age_seconds / 60)
+    } else if age_seconds < 24 * 60 * 60 {
+        format!("{}h", age_seconds / (60 * 60))
+    } else {
+        format!("{}d", age_seconds / (24 * 60 * 60))
+    }
 }
 
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3989,6 +4073,98 @@ fn cmd_backup_verify(path: &Path) -> BackupVerifySnapshot {
         errors,
         manifest,
     }
+}
+
+fn latest_verified_backup_for_database(cfg: &AppConfig) -> Result<Option<VerifiedBackupSummary>> {
+    let snapshot = cmd_backup_list(cfg, &BackupListArgs { root: None })?;
+
+    for backup in snapshot.backups {
+        let path = PathBuf::from(&backup.path);
+        let verify = cmd_backup_verify(&path);
+        if !verify.ok {
+            continue;
+        }
+        let Some(manifest) = verify.manifest else {
+            continue;
+        };
+        if manifest.clickhouse_database != cfg.clickhouse.database {
+            continue;
+        }
+
+        return Ok(Some(VerifiedBackupSummary {
+            backup_id: manifest.backup_id,
+            path,
+            created_unix_seconds: manifest.created_unix_seconds,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn require_recent_verified_backup(
+    cfg: &AppConfig,
+    operation: &str,
+    no_backup_check: bool,
+) -> Result<()> {
+    if no_backup_check {
+        return Ok(());
+    }
+
+    let root = backup_default_root(cfg);
+    let heuristic = format!(
+        "heuristic preflight: requires a backup under {} for database `{}` that currently passes `moraine backup verify` and is no older than {}",
+        root.display(),
+        cfg.clickhouse.database,
+        DESTRUCTIVE_BACKUP_MAX_AGE_LABEL
+    );
+
+    let Some(backup) = latest_verified_backup_for_database(cfg)? else {
+        bail!(
+            "{operation} requires a recent verified backup before changing ClickHouse data.\n\
+             no verified backup for database `{}` was found under {}\n\
+             {heuristic}\n\
+             run `moraine backup create`, optionally confirm it with `moraine backup verify <dir>`, or pass `--no-backup-check` to bypass this heuristic",
+            cfg.clickhouse.database,
+            root.display(),
+        );
+    };
+
+    let age_seconds = unix_now_seconds().saturating_sub(backup.created_unix_seconds);
+    if age_seconds <= DESTRUCTIVE_BACKUP_MAX_AGE_SECONDS {
+        return Ok(());
+    }
+
+    bail!(
+        "{operation} requires a recent verified backup before changing ClickHouse data.\n\
+         latest verified backup: {} at {} (age {}, threshold {})\n\
+         {heuristic}\n\
+         create a fresh backup or pass `--no-backup-check` to bypass this heuristic",
+        backup.backup_id,
+        backup.path.display(),
+        format_age_seconds(age_seconds),
+        DESTRUCTIVE_BACKUP_MAX_AGE_LABEL,
+    );
+}
+
+fn migration_backup_required(report: &DoctorReport) -> bool {
+    report.database_exists && !report.pending_migrations.is_empty()
+}
+
+async fn require_recent_verified_backup_for_pending_migrations(
+    cfg: &AppConfig,
+    operation: &str,
+    no_backup_check: bool,
+) -> Result<()> {
+    if no_backup_check {
+        return Ok(());
+    }
+
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let report = ch.doctor_report().await?;
+    if migration_backup_required(&report) {
+        require_recent_verified_backup(cfg, operation, false)?;
+    }
+    Ok(())
 }
 
 fn cmd_restore_plan(cfg: &AppConfig, args: &RestoreArgs) -> RestorePlanSnapshot {
@@ -4435,6 +4611,12 @@ async fn main() -> Result<ExitCode> {
             ensure_runtime_dirs(&paths)?;
 
             let clickhouse = start_clickhouse(&cfg, &paths).await?;
+            require_recent_verified_backup_for_pending_migrations(
+                &cfg,
+                "`moraine up` auto-migration",
+                args.no_backup_check,
+            )
+            .await?;
             let migrations = cmd_db_migrate(&cfg).await?;
 
             let mut started_services = Vec::new();
@@ -4492,7 +4674,13 @@ async fn main() -> Result<ExitCode> {
         CliCommand::Db(args) => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
-                DbCommand::Migrate => {
+                DbCommand::Migrate(migrate) => {
+                    require_recent_verified_backup_for_pending_migrations(
+                        &cfg,
+                        "`moraine db migrate`",
+                        migrate.no_backup_check,
+                    )
+                    .await?;
                     let outcome = cmd_db_migrate(&cfg).await?;
                     render_db_migrate(&output, &outcome)?;
                     Ok(ExitCode::SUCCESS)
@@ -4765,6 +4953,8 @@ mod tests {
         DoctorReport {
             clickhouse_healthy,
             clickhouse_version: None,
+            clickhouse_version_compatibility: ClickHouseVersionCompatibility::Unknown,
+            clickhouse_version_line: None,
             database: "moraine".to_string(),
             database_exists: true,
             applied_migrations: Vec::new(),
@@ -5032,6 +5222,26 @@ mod tests {
                 command: DbCommand::Doctor(doctor),
             }) => assert!(doctor.deep),
             _ => panic!("expected db doctor command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_up_backup_override_flag() {
+        let cli = Cli::parse_from(["moraine", "up", "--no-backup-check"]);
+        match cli.command {
+            CliCommand::Up(up) => assert!(up.no_backup_check),
+            _ => panic!("expected up command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_db_migrate_backup_override_flag() {
+        let cli = Cli::parse_from(["moraine", "db", "migrate", "--no-backup-check"]);
+        match cli.command {
+            CliCommand::Db(DbArgs {
+                command: DbCommand::Migrate(migrate),
+            }) => assert!(migrate.no_backup_check),
+            _ => panic!("expected db migrate command"),
         }
     }
 
@@ -5637,6 +5847,92 @@ Total transferred file size: 1,024 bytes
     }
 
     #[test]
+    fn backup_gate_rejects_missing_verified_backup() {
+        let root = temp_dir("backup-gate-missing");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+
+        let err = require_recent_verified_backup(&cfg, "`moraine db migrate`", false)
+            .expect_err("missing backup should fail");
+        let message = err.to_string();
+        assert!(message.contains("requires a recent verified backup"));
+        assert!(message.contains("heuristic preflight"));
+        assert!(message.contains("--no-backup-check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_gate_rejects_stale_verified_backup() {
+        let root = temp_dir("backup-gate-stale");
+        let backups_root = root.join("backups");
+        let backup_dir = backups_root.join("old");
+        fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let mut manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        manifest.created_unix_seconds =
+            unix_now_seconds() - (DESTRUCTIVE_BACKUP_MAX_AGE_SECONDS + 60);
+        write_test_backup(&backup_dir, &manifest, table_bytes);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+
+        let err = require_recent_verified_backup(&cfg, "`moraine db migrate`", false)
+            .expect_err("stale backup should fail");
+        let message = err.to_string();
+        assert!(message.contains("latest verified backup"));
+        assert!(message.contains("threshold 24h"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_gate_accepts_recent_verified_backup_for_current_database() {
+        let root = temp_dir("backup-gate-fresh");
+        let backups_root = root.join("backups");
+        let backup_dir = backups_root.join("fresh");
+        fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let table_bytes = br#"{"event_uid":"a"}
+"#;
+        let mut manifest = test_backup_manifest("tables/events.jsonl", table_bytes);
+        manifest.created_unix_seconds = unix_now_seconds();
+        write_test_backup(&backup_dir, &manifest, table_bytes);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+
+        require_recent_verified_backup(&cfg, "`moraine db migrate`", false)
+            .expect("fresh verified backup should pass");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_gate_allows_explicit_override() {
+        let cfg = AppConfig::default();
+        require_recent_verified_backup(&cfg, "`moraine db migrate`", true)
+            .expect("override should bypass backup gate");
+    }
+
+    #[test]
+    fn migration_backup_required_only_for_existing_db_with_pending_migrations() {
+        let mut report = test_doctor_report(true);
+        report.database_exists = false;
+        report.pending_migrations = vec!["014".to_string()];
+        assert!(!migration_backup_required(&report));
+
+        report.database_exists = true;
+        report.pending_migrations.clear();
+        assert!(!migration_backup_required(&report));
+
+        report.pending_migrations = vec!["014".to_string()];
+        assert!(migration_backup_required(&report));
+    }
+
+    #[test]
     fn clap_parses_import_sync_name() {
         let cli = Cli::parse_from(["moraine", "import", "sync", "vm503"]);
         match cli.command {
@@ -5785,19 +6081,37 @@ Total transferred file size: 1,024 bytes
             CliCommand::Reindex(args) => {
                 assert!(args.search_only);
                 assert!(preview_mode(args.dry_run, args.execute));
+                assert!(!args.no_backup_check);
             }
             _ => panic!("expected reindex command"),
         }
 
-        let execute = Cli::parse_from(["moraine", "reindex", "--search-only", "--execute"]);
+        let execute = Cli::parse_from([
+            "moraine",
+            "reindex",
+            "--search-only",
+            "--execute",
+            "--no-backup-check",
+        ]);
         match execute.command {
             CliCommand::Reindex(args) => {
                 assert!(args.search_only);
                 assert!(args.execute);
+                assert!(args.no_backup_check);
                 assert!(!preview_mode(args.dry_run, args.execute));
             }
             _ => panic!("expected reindex command"),
         }
+    }
+
+    #[test]
+    fn doctor_is_healthy_fails_on_unsupported_clickhouse_version() {
+        let mut report = test_doctor_report(true);
+        report.clickhouse_version = Some("25.8.1.1".to_string());
+        report.clickhouse_version_compatibility = ClickHouseVersionCompatibility::Unsupported;
+        report.clickhouse_version_line = Some("25.8".to_string());
+
+        assert!(!doctor_is_healthy(&DoctorSnapshot::Basic(report)));
     }
 
     #[test]

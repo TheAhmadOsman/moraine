@@ -28,10 +28,24 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+pub const SUPPORTED_CLICKHOUSE_VERSION_LINE: &str = "25.12";
+pub const EXPERIMENTAL_CLICKHOUSE_VERSION_LINE: &str = "26.3";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClickHouseVersionCompatibility {
+    Supported,
+    Experimental,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DoctorReport {
     pub clickhouse_healthy: bool,
     pub clickhouse_version: Option<String>,
+    pub clickhouse_version_compatibility: ClickHouseVersionCompatibility,
+    pub clickhouse_version_line: Option<String>,
     pub database: String,
     pub database_exists: bool,
     pub applied_migrations: Vec<String>,
@@ -322,6 +336,8 @@ impl ClickHouseClient {
         let mut report = DoctorReport {
             clickhouse_healthy: false,
             clickhouse_version: None,
+            clickhouse_version_compatibility: ClickHouseVersionCompatibility::Unknown,
+            clickhouse_version_line: None,
             database: self.cfg.database.clone(),
             database_exists: false,
             applied_migrations: Vec::new(),
@@ -341,7 +357,12 @@ impl ClickHouseClient {
         }
 
         match self.version().await {
-            Ok(version) => report.clickhouse_version = Some(version),
+            Ok(version) => {
+                let (compatibility, line) = classify_clickhouse_version(Some(&version));
+                report.clickhouse_version = Some(version);
+                report.clickhouse_version_compatibility = compatibility;
+                report.clickhouse_version_line = line;
+            }
             Err(err) => report.errors.push(format!("version query failed: {err}")),
         }
 
@@ -940,6 +961,17 @@ fn doctor_findings_from_report(report: &DoctorReport) -> Vec<DoctorFinding> {
             remediation: "Run `moraine db migrate` to create the database and bundled schema."
                 .to_string(),
         },
+        DoctorFinding {
+            severity: match report.clickhouse_version_compatibility {
+                ClickHouseVersionCompatibility::Supported => DoctorSeverity::Ok,
+                ClickHouseVersionCompatibility::Experimental => DoctorSeverity::Warning,
+                ClickHouseVersionCompatibility::Unsupported => DoctorSeverity::Error,
+                ClickHouseVersionCompatibility::Unknown => DoctorSeverity::Warning,
+            },
+            code: "clickhouse.version_compatibility".to_string(),
+            summary: clickhouse_version_compatibility_summary(report),
+            remediation: clickhouse_version_compatibility_remediation(report).to_string(),
+        },
         if report.pending_migrations.is_empty() {
             DoctorFinding {
                 severity: DoctorSeverity::Ok,
@@ -997,6 +1029,83 @@ fn doctor_findings_from_report(report: &DoctorReport) -> Vec<DoctorFinding> {
     }
 
     findings
+}
+
+fn classify_clickhouse_version(
+    version: Option<&str>,
+) -> (ClickHouseVersionCompatibility, Option<String>) {
+    let Some(version) = version else {
+        return (ClickHouseVersionCompatibility::Unknown, None);
+    };
+    let Some(line) = clickhouse_version_line(version) else {
+        return (ClickHouseVersionCompatibility::Unknown, None);
+    };
+
+    let compatibility = if line == SUPPORTED_CLICKHOUSE_VERSION_LINE {
+        ClickHouseVersionCompatibility::Supported
+    } else if line == EXPERIMENTAL_CLICKHOUSE_VERSION_LINE {
+        ClickHouseVersionCompatibility::Experimental
+    } else {
+        ClickHouseVersionCompatibility::Unsupported
+    };
+
+    (compatibility, Some(line))
+}
+
+fn clickhouse_version_line(version: &str) -> Option<String> {
+    let trimmed = version.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    let major = parts
+        .next()?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let minor = parts
+        .next()?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if major.is_empty() || minor.is_empty() {
+        return None;
+    }
+    Some(format!("{major}.{minor}"))
+}
+
+fn clickhouse_version_compatibility_summary(report: &DoctorReport) -> String {
+    match (
+        report.clickhouse_version_compatibility,
+        report.clickhouse_version.as_deref(),
+        report.clickhouse_version_line.as_deref(),
+    ) {
+        (ClickHouseVersionCompatibility::Supported, Some(version), Some(line)) => {
+            format!("ClickHouse {version} is on the supported {line} line.")
+        }
+        (ClickHouseVersionCompatibility::Experimental, Some(version), Some(line)) => {
+            format!("ClickHouse {version} is on the experimental {line} line.")
+        }
+        (ClickHouseVersionCompatibility::Unsupported, Some(version), Some(line)) => {
+            format!("ClickHouse {version} is on unsupported line {line}.")
+        }
+        (ClickHouseVersionCompatibility::Unknown, Some(version), None) => {
+            format!("ClickHouse {version} could not be mapped to a known compatibility line.")
+        }
+        _ => "ClickHouse version compatibility is unknown.".to_string(),
+    }
+}
+
+fn clickhouse_version_compatibility_remediation(report: &DoctorReport) -> &'static str {
+    match report.clickhouse_version_compatibility {
+        ClickHouseVersionCompatibility::Supported => "No action needed.",
+        ClickHouseVersionCompatibility::Experimental => {
+            "Use the experimental line only for deliberate validation; the default supported line remains 25.12."
+        }
+        ClickHouseVersionCompatibility::Unsupported => {
+            "Downgrade to the supported 25.12 line or validate and explicitly adopt the experimental 26.3 line before relying on this runtime."
+        }
+        ClickHouseVersionCompatibility::Unknown => {
+            "Verify `SELECT version()` output and compare it against the supported 25.12 line and experimental 26.3 line."
+        }
+    }
 }
 
 fn evaluate_expected_schema_objects(rows: &[SchemaObjectRow]) -> DoctorFinding {
@@ -1121,6 +1230,8 @@ mod tests {
         DoctorReport {
             clickhouse_healthy: true,
             clickhouse_version: Some("25.1".to_string()),
+            clickhouse_version_compatibility: ClickHouseVersionCompatibility::Unsupported,
+            clickhouse_version_line: Some("25.1".to_string()),
             database: "moraine".to_string(),
             database_exists: true,
             applied_migrations: vec!["001".to_string()],
@@ -1261,6 +1372,42 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_version_compatibility_serializes_lowercase() {
+        let value = serde_json::to_string(&ClickHouseVersionCompatibility::Experimental)
+            .expect("serialize compatibility");
+        assert_eq!(value, "\"experimental\"");
+    }
+
+    #[test]
+    fn classify_clickhouse_version_tracks_supported_lines() {
+        assert_eq!(
+            classify_clickhouse_version(Some("25.12.5.44")),
+            (
+                ClickHouseVersionCompatibility::Supported,
+                Some("25.12".to_string())
+            )
+        );
+        assert_eq!(
+            classify_clickhouse_version(Some("v26.3.1.2-stable")),
+            (
+                ClickHouseVersionCompatibility::Experimental,
+                Some("26.3".to_string())
+            )
+        );
+        assert_eq!(
+            classify_clickhouse_version(Some("25.8.9.1")),
+            (
+                ClickHouseVersionCompatibility::Unsupported,
+                Some("25.8".to_string())
+            )
+        );
+        assert_eq!(
+            classify_clickhouse_version(Some("not-a-version")),
+            (ClickHouseVersionCompatibility::Unknown, None)
+        );
+    }
+
+    #[test]
     fn doctor_findings_from_report_include_pending_migrations_and_errors() {
         let mut report = test_doctor_report();
         report.pending_migrations = vec!["013".to_string()];
@@ -1274,10 +1421,22 @@ mod tests {
                 && finding.summary.contains("013")
         }));
         assert!(findings.iter().any(|finding| {
+            finding.code == "clickhouse.version_compatibility"
+                && finding.severity == DoctorSeverity::Error
+                && finding.summary.contains("unsupported line 25.1")
+        }));
+        assert!(findings.iter().any(|finding| {
             finding.code == "doctor.query_errors"
                 && finding.severity == DoctorSeverity::Warning
                 && finding.summary.contains("version query failed")
         }));
+    }
+
+    #[test]
+    fn doctor_report_serialization_includes_version_compatibility_fields() {
+        let value = serde_json::to_value(test_doctor_report()).expect("serialize report");
+        assert_eq!(value["clickhouse_version_compatibility"], "unsupported");
+        assert_eq!(value["clickhouse_version_line"], "25.1");
     }
 
     #[test]

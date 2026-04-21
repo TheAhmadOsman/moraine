@@ -131,20 +131,33 @@ It auto-installs managed ClickHouse when missing and `runtime.clickhouse_auto_in
 
 ```bash
 cd ~/src/moraine
+bin/moraine up
+bin/moraine up --no-backup-check
 bin/moraine db migrate
+bin/moraine db migrate --no-backup-check
 bin/moraine db doctor
 bin/moraine db doctor --deep
 bin/moraine db doctor --output json
 ```
 
+`bin/moraine up` and `bin/moraine db migrate` now add a conservative backup preflight before they apply pending migrations to an existing database. First boot with no database and no-op migration checks do not require a backup. When the gate applies, it looks under `~/.moraine/backups/` for a backup of the current database that still passes the same manifest/checksum checks as `moraine backup verify` and is no older than 24 hours. This threshold is intentionally heuristic, not authoritative. If you are operating without a fresh backup on purpose, pass `--no-backup-check`.
+
 `db doctor` checks:
 
 - ClickHouse health/version.
+- ClickHouse version compatibility classification: `supported`, `experimental`, `unsupported`, or `unknown`.
 - Database existence.
 - Applied vs pending migrations.
 - Required table presence.
 - With `--deep`, derived object health and corpus integrity findings such as orphan
   rows, missing `raw_events` backing rows, session time drift, and search index drift.
+
+Current compatibility policy is explicit and small on purpose:
+
+- `25.12.x` is the supported line.
+- `26.3.x` is the experimental next-candidate line.
+- Other parsed lines are reported as unsupported.
+- Unparseable or unavailable versions are reported as unknown.
 
 ## Service entrypoints
 
@@ -182,6 +195,8 @@ bin/moraine down
 Status includes process state, DB health/schema checks, and latest ingest heartbeat metrics.
 `bin/moraine logs clickhouse` reads ClickHouse's internal rotating log at
 `~/.moraine/clickhouse/log/clickhouse-server.log`.
+
+The status database section also includes the current ClickHouse compatibility label and line so operators can see at a glance whether the runtime is on the supported pin, the named experimental line, or an unsupported/unknown version.
 
 All subcommands support output control:
 

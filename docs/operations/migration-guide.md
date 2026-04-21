@@ -40,19 +40,34 @@ bin/moraine status
 For DB checks:
 
 ```bash
+bin/moraine backup create
+bin/moraine up
 bin/moraine db migrate
+bin/moraine reindex --search-only --execute
 bin/moraine db doctor
 bin/moraine db doctor --deep
 ```
+
+Three maintenance paths now have a conservative backup gate:
+
+- `bin/moraine up`, when it would auto-apply pending migrations to an existing database
+- `bin/moraine db migrate`
+- `bin/moraine reindex --search-only --execute`
+
+By default they look for a backup of the active ClickHouse database under `~/.moraine/backups/` that still passes the same verification logic as `moraine backup verify` and is no older than 24 hours. First boot with no database and no-op migration checks do not require a backup. That 24-hour freshness window is a documented heuristic, not proof that the backup is sufficient for every operator workflow. Pass `--no-backup-check` only when you are deliberately accepting that risk.
 
 The ClickHouse doctor core now distinguishes between compatibility fields and
 deeper integrity findings:
 
 - Existing top-level status remains: reachability, database existence, applied vs
-  pending migrations, missing tables, and raw error strings.
+  pending migrations, missing tables, raw error strings, and additive ClickHouse
+  version compatibility fields.
 - `bin/moraine db doctor --deep` exposes deep integrity checks as structured findings with:
   `severity` (`ok` / `warning` / `error`), `code`, `summary`, and
   `remediation`.
+- Compatibility is intentionally explicit rather than inferred: `25.12.x` is
+  `supported`, `26.3.x` is `experimental`, other parsed lines are
+  `unsupported`, and missing or unparseable version strings are `unknown`.
 - Current deep checks are aimed at schema/corpus integrity from the ClickHouse
   layer: expected views/materialized views, orphan `event_links`, orphan
   `tool_io`, normalized events missing `raw_events`, inconsistent session time

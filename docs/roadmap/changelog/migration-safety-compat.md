@@ -1,0 +1,5 @@
+# Migration Safety And ClickHouse Compatibility
+
+- Added a conservative backup gate for `moraine up` auto-migrations, `moraine db migrate`, and `moraine reindex --search-only --execute`. The migration gate only applies when an existing database has pending migrations, so first boot and no-op migration checks stay usable. When the gate applies, it requires a backup under the runtime backup root that still passes Moraine's existing manifest/checksum verification logic and is no older than 24 hours. Operators can bypass the heuristic with `--no-backup-check` when they are intentionally accepting the risk.
+- Extended ClickHouse doctor and status reporting with additive machine-readable compatibility fields plus human CLI labels. The runtime now classifies the live ClickHouse version as `supported` for the pinned `25.12` line, `experimental` for the named `26.3` next-candidate line, `unsupported` for other parsed lines, and `unknown` when the version cannot be parsed or fetched.
+- Added focused tests for the new clap flags, backup-gate behavior, unsupported-version health handling, and ClickHouse compatibility classification/report serialization.
