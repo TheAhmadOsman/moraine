@@ -43,3 +43,19 @@ For DB checks:
 bin/moraine db migrate
 bin/moraine db doctor
 ```
+
+The ClickHouse doctor core now distinguishes between compatibility fields and
+deeper integrity findings:
+
+- Existing top-level status remains: reachability, database existence, applied vs
+  pending migrations, missing tables, and raw error strings.
+- Deep integrity checks are exposed as structured findings with:
+  `severity` (`ok` / `warning` / `error`), `code`, `summary`, and
+  `remediation`.
+- Current deep checks are aimed at schema/corpus integrity from the ClickHouse
+  layer: expected views/materialized views, orphan `event_links`, orphan
+  `tool_io`, normalized events missing `raw_events`, inconsistent session time
+  ranges, and search freshness drift relative to `events`.
+
+This keeps older consumers compatible while giving JSON-oriented surfaces a
+stable machine-readable way to explain what is wrong and how to fix it.

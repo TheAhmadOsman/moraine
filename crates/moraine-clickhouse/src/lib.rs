@@ -40,6 +40,46 @@ pub struct DoctorReport {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorSeverity {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DoctorFinding {
+    pub severity: DoctorSeverity,
+    pub code: String,
+    pub summary: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DoctorDeepReport {
+    #[serde(flatten)]
+    pub report: DoctorReport,
+    pub findings: Vec<DoctorFinding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedSchemaObject {
+    name: &'static str,
+    engine: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchemaObjectRow {
+    name: String,
+    engine: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    total: u64,
+}
+
 impl ClickHouseClient {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
         let timeout = Duration::from_secs_f64(cfg.timeout_seconds.max(1.0));
@@ -402,6 +442,159 @@ impl ClickHouseClient {
         Ok(report)
     }
 
+    pub async fn doctor_deep_report(&self) -> Result<DoctorDeepReport> {
+        let report = self.doctor_report().await?;
+        let mut findings = doctor_findings_from_report(&report);
+
+        if !report.clickhouse_healthy || !report.database_exists {
+            return Ok(DoctorDeepReport { report, findings });
+        }
+
+        match self.doctor_schema_objects().await {
+            Ok(rows) => findings.push(evaluate_expected_schema_objects(&rows)),
+            Err(err) => findings.push(DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                code: "schema.derived_objects".to_string(),
+                summary: format!("Failed to inspect expected views and materialized views: {err}"),
+                remediation:
+                    "Run `moraine db migrate` and verify ClickHouse system metadata is readable."
+                        .to_string(),
+            }),
+        }
+
+        let has_tables = |required: &[&str]| {
+            required
+                .iter()
+                .all(|name| !report.missing_tables.iter().any(|missing| missing == name))
+        };
+
+        if has_tables(&["event_links", "events"]) {
+            findings.push(
+                self.doctor_count_finding(
+                    "integrity.event_links_orphans",
+                    &format!(
+                        "SELECT toUInt64(count()) AS total FROM {}.event_links FINAL WHERE event_uid NOT IN (SELECT event_uid FROM {}.events FINAL)",
+                        escape_identifier(&self.cfg.database),
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    "No orphan event_links rows found.",
+                    "orphan event_links rows",
+                    "Re-run normalization or repair the broken `events` rows before trusting link traversal."
+                        .to_string(),
+                    DoctorSeverity::Error,
+                )
+                .await,
+            );
+        } else {
+            findings.push(skipped_check_finding(
+                "integrity.event_links_orphans",
+                &missing_prerequisites(&report, &["event_links", "events"]),
+                "orphan event_links rows",
+            ));
+        }
+
+        if has_tables(&["tool_io", "events"]) {
+            findings.push(
+                self.doctor_count_finding(
+                    "integrity.tool_io_orphans",
+                    &format!(
+                        "SELECT toUInt64(count()) AS total FROM {}.tool_io FINAL WHERE event_uid NOT IN (SELECT event_uid FROM {}.events FINAL)",
+                        escape_identifier(&self.cfg.database),
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    "No orphan tool_io rows found.",
+                    "orphan tool_io rows",
+                    "Re-run normalization or repair the broken `events` rows before using tool I/O provenance."
+                        .to_string(),
+                    DoctorSeverity::Error,
+                )
+                .await,
+            );
+        } else {
+            findings.push(skipped_check_finding(
+                "integrity.tool_io_orphans",
+                &missing_prerequisites(&report, &["tool_io", "events"]),
+                "orphan tool_io rows",
+            ));
+        }
+
+        if has_tables(&["events", "raw_events"]) {
+            findings.push(
+                self.doctor_count_finding(
+                    "integrity.events_missing_raw_events",
+                    &format!(
+                        "SELECT toUInt64(count()) AS total FROM {}.events FINAL WHERE event_uid NOT IN (SELECT event_uid FROM {}.raw_events)",
+                        escape_identifier(&self.cfg.database),
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    "Every normalized event still has a backing raw_events row.",
+                    "events without raw_events backing rows",
+                    "Re-import or restore the missing raw rows before relying on replay, audits, or provenance checks."
+                        .to_string(),
+                    DoctorSeverity::Error,
+                )
+                .await,
+            );
+        } else {
+            findings.push(skipped_check_finding(
+                "integrity.events_missing_raw_events",
+                &missing_prerequisites(&report, &["events", "raw_events"]),
+                "events missing raw_events backing rows",
+            ));
+        }
+
+        if has_tables(&["events"]) {
+            findings.push(
+                self.doctor_count_finding(
+                    "integrity.session_time_ranges",
+                    &format!(
+                        "SELECT toUInt64(count()) AS total FROM (SELECT session_id, min(session_date) AS min_session_date, max(session_date) AS max_session_date, toDate(min(event_ts)) AS first_event_date, toDate(max(event_ts)) AS last_event_date FROM {}.events FINAL GROUP BY session_id HAVING min_session_date != max_session_date OR min_session_date > last_event_date OR max_session_date < first_event_date)",
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    "Session time ranges are internally consistent.",
+                    "sessions with impossible time ranges",
+                    "Rebuild the affected sessions so `session_date` and event timestamps come from the same normalized source."
+                        .to_string(),
+                    DoctorSeverity::Warning,
+                )
+                .await,
+            );
+        } else {
+            findings.push(skipped_check_finding(
+                "integrity.session_time_ranges",
+                &missing_prerequisites(&report, &["events"]),
+                "impossible session time ranges",
+            ));
+        }
+
+        if has_tables(&["events", "search_documents"]) {
+            findings.push(
+                self.doctor_count_finding(
+                    "search.index_freshness",
+                    &format!(
+                        "SELECT toUInt64(count()) AS total FROM {}.events FINAL WHERE lengthUTF8(replaceRegexpAll(text_content, '\\s+', '')) > 0 AND event_uid NOT IN (SELECT event_uid FROM {}.search_documents FINAL)",
+                        escape_identifier(&self.cfg.database),
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    "Search documents are in sync with text-bearing events.",
+                    "text-bearing events missing search_documents rows",
+                    "Run `moraine db migrate` and rebuild search documents if the materialized views were dropped or stalled."
+                        .to_string(),
+                    DoctorSeverity::Warning,
+                )
+                .await,
+            );
+        } else {
+            findings.push(skipped_check_finding(
+                "search.index_freshness",
+                &missing_prerequisites(&report, &["events", "search_documents"]),
+                "search freshness drift",
+            ));
+        }
+
+        Ok(DoctorDeepReport { report, findings })
+    }
+
     async fn ensure_migration_ledger(&self) -> Result<()> {
         self.request_text(
             &format!(
@@ -438,6 +631,56 @@ impl ClickHouseClient {
             .query_json_data(&query, Some(&self.cfg.database))
             .await?;
         Ok(rows.into_iter().map(|row| row.version).collect())
+    }
+
+    async fn doctor_schema_objects(&self) -> Result<Vec<SchemaObjectRow>> {
+        let names = expected_schema_objects()
+            .iter()
+            .map(|item| escape_literal(item.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT name, engine FROM system.tables WHERE database = {} AND name IN ({})",
+            escape_literal(&self.cfg.database),
+            names
+        );
+
+        self.query_json_data(&query, Some("system")).await
+    }
+
+    async fn doctor_count_finding(
+        &self,
+        code: &str,
+        query: &str,
+        ok_summary: &str,
+        issue_noun: &str,
+        remediation: String,
+        issue_severity: DoctorSeverity,
+    ) -> DoctorFinding {
+        match self
+            .query_json_data::<CountRow>(query, Some(&self.cfg.database))
+            .await
+        {
+            Ok(rows) => {
+                let count = rows.first().map(|row| row.total).unwrap_or(0);
+                count_finding(
+                    code,
+                    count,
+                    ok_summary,
+                    issue_noun,
+                    remediation,
+                    issue_severity,
+                )
+            }
+            Err(err) => DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                code: code.to_string(),
+                summary: format!("Failed to evaluate {code}: {err}"),
+                remediation:
+                    "Verify the referenced tables are readable, then rerun `moraine db doctor`."
+                        .to_string(),
+            },
+        }
     }
 }
 
@@ -624,6 +867,231 @@ fn has_explicit_json_each_row_format(query: &str) -> bool {
     compact.contains(" format jsoneachrow")
 }
 
+fn expected_schema_objects() -> &'static [ExpectedSchemaObject] {
+    &[
+        ExpectedSchemaObject {
+            name: "v_all_events",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "v_conversation_trace",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "v_turn_summary",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "v_session_summary",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "search_term_stats",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "search_corpus_stats",
+            engine: "View",
+        },
+        ExpectedSchemaObject {
+            name: "mv_search_documents_from_events",
+            engine: "MaterializedView",
+        },
+        ExpectedSchemaObject {
+            name: "mv_search_postings",
+            engine: "MaterializedView",
+        },
+        ExpectedSchemaObject {
+            name: "mv_search_conversation_terms",
+            engine: "MaterializedView",
+        },
+    ]
+}
+
+fn doctor_findings_from_report(report: &DoctorReport) -> Vec<DoctorFinding> {
+    let mut findings = vec![
+        DoctorFinding {
+            severity: if report.clickhouse_healthy {
+                DoctorSeverity::Ok
+            } else {
+                DoctorSeverity::Error
+            },
+            code: "clickhouse.reachable".to_string(),
+            summary: if report.clickhouse_healthy {
+                "ClickHouse responded to the health check.".to_string()
+            } else {
+                "ClickHouse did not respond to the health check.".to_string()
+            },
+            remediation: "Start ClickHouse and verify the configured HTTP endpoint is reachable."
+                .to_string(),
+        },
+        DoctorFinding {
+            severity: if report.database_exists {
+                DoctorSeverity::Ok
+            } else {
+                DoctorSeverity::Error
+            },
+            code: "clickhouse.database_exists".to_string(),
+            summary: if report.database_exists {
+                format!("Database `{}` exists.", report.database)
+            } else {
+                format!("Database `{}` does not exist.", report.database)
+            },
+            remediation: "Run `moraine db migrate` to create the database and bundled schema."
+                .to_string(),
+        },
+        if report.pending_migrations.is_empty() {
+            DoctorFinding {
+                severity: DoctorSeverity::Ok,
+                code: "schema.pending_migrations".to_string(),
+                summary: "All bundled migrations are applied.".to_string(),
+                remediation: "No action needed.".to_string(),
+            }
+        } else {
+            DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                code: "schema.pending_migrations".to_string(),
+                summary: format!(
+                    "{} pending migration(s): {}.",
+                    report.pending_migrations.len(),
+                    report.pending_migrations.join(", ")
+                ),
+                remediation: "Run `moraine db migrate` before relying on deeper integrity checks."
+                    .to_string(),
+            }
+        },
+        if report.missing_tables.is_empty() {
+            DoctorFinding {
+                severity: DoctorSeverity::Ok,
+                code: "schema.required_tables".to_string(),
+                summary: "All required base and search tables are present.".to_string(),
+                remediation: "No action needed.".to_string(),
+            }
+        } else {
+            DoctorFinding {
+                severity: DoctorSeverity::Error,
+                code: "schema.required_tables".to_string(),
+                summary: format!(
+                    "Missing required table(s): {}.",
+                    report.missing_tables.join(", ")
+                ),
+                remediation:
+                    "Run `moraine db migrate` and restore any missing table data before continuing."
+                        .to_string(),
+            }
+        },
+    ];
+
+    if !report.errors.is_empty() {
+        findings.push(DoctorFinding {
+            severity: DoctorSeverity::Warning,
+            code: "doctor.query_errors".to_string(),
+            summary: format!(
+                "Doctor encountered {} query/runtime error(s): {}.",
+                report.errors.len(),
+                report.errors.join(" | ")
+            ),
+            remediation: "Address the ClickHouse errors above, then rerun `moraine db doctor`."
+                .to_string(),
+        });
+    }
+
+    findings
+}
+
+fn evaluate_expected_schema_objects(rows: &[SchemaObjectRow]) -> DoctorFinding {
+    let mut missing = Vec::new();
+    let mut wrong_engine = Vec::new();
+
+    for expected in expected_schema_objects() {
+        match rows.iter().find(|row| row.name == expected.name) {
+            Some(row) if row.engine == expected.engine => {}
+            Some(row) => wrong_engine.push(format!(
+                "{} has engine {} (expected {})",
+                expected.name, row.engine, expected.engine
+            )),
+            None => missing.push(expected.name),
+        }
+    }
+
+    if missing.is_empty() && wrong_engine.is_empty() {
+        DoctorFinding {
+            severity: DoctorSeverity::Ok,
+            code: "schema.derived_objects".to_string(),
+            summary:
+                "All expected views and materialized views are present with sane engine classes."
+                    .to_string(),
+            remediation: "No action needed.".to_string(),
+        }
+    } else {
+        let mut issues = Vec::new();
+        if !missing.is_empty() {
+            issues.push(format!("missing: {}", missing.join(", ")));
+        }
+        if !wrong_engine.is_empty() {
+            issues.push(format!("wrong engine: {}", wrong_engine.join(", ")));
+        }
+
+        DoctorFinding {
+            severity: DoctorSeverity::Error,
+            code: "schema.derived_objects".to_string(),
+            summary: format!(
+                "Expected views/materialized views are missing or malformed: {}.",
+                issues.join("; ")
+            ),
+            remediation:
+                "Run `moraine db migrate` to recreate derived objects, then rebuild search artifacts if drift remains."
+                    .to_string(),
+        }
+    }
+}
+
+fn count_finding(
+    code: &str,
+    count: u64,
+    ok_summary: &str,
+    issue_noun: &str,
+    remediation: String,
+    issue_severity: DoctorSeverity,
+) -> DoctorFinding {
+    if count == 0 {
+        DoctorFinding {
+            severity: DoctorSeverity::Ok,
+            code: code.to_string(),
+            summary: ok_summary.to_string(),
+            remediation: "No action needed.".to_string(),
+        }
+    } else {
+        DoctorFinding {
+            severity: issue_severity,
+            code: code.to_string(),
+            summary: format!("Found {count} {issue_noun}."),
+            remediation,
+        }
+    }
+}
+
+fn missing_prerequisites<'a>(report: &'a DoctorReport, required: &[&'a str]) -> Vec<&'a str> {
+    required
+        .iter()
+        .copied()
+        .filter(|name| report.missing_tables.iter().any(|missing| missing == name))
+        .collect()
+}
+
+fn skipped_check_finding(code: &str, missing_tables: &[&str], description: &str) -> DoctorFinding {
+    DoctorFinding {
+        severity: DoctorSeverity::Warning,
+        code: code.to_string(),
+        summary: format!(
+            "Skipped check for {description} because required table(s) are missing: {}.",
+            missing_tables.join(", ")
+        ),
+        remediation: "Run `moraine db migrate` and restore the missing tables before rerunning the deep doctor."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +1114,19 @@ mod tests {
             timeout_seconds: 5.0,
             async_insert: true,
             wait_for_async_insert: true,
+        }
+    }
+
+    fn test_doctor_report() -> DoctorReport {
+        DoctorReport {
+            clickhouse_healthy: true,
+            clickhouse_version: Some("25.1".to_string()),
+            database: "moraine".to_string(),
+            database_exists: true,
+            applied_migrations: vec!["001".to_string()],
+            pending_migrations: Vec::new(),
+            missing_tables: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -771,6 +1252,90 @@ mod tests {
         ));
         assert!(!has_explicit_json_each_row_format("SELECT 1"));
         assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
+    }
+
+    #[test]
+    fn doctor_severity_serializes_lowercase() {
+        let value = serde_json::to_string(&DoctorSeverity::Warning).expect("serialize severity");
+        assert_eq!(value, "\"warning\"");
+    }
+
+    #[test]
+    fn doctor_findings_from_report_include_pending_migrations_and_errors() {
+        let mut report = test_doctor_report();
+        report.pending_migrations = vec!["013".to_string()];
+        report.errors = vec!["version query failed".to_string()];
+
+        let findings = doctor_findings_from_report(&report);
+
+        assert!(findings.iter().any(|finding| {
+            finding.code == "schema.pending_migrations"
+                && finding.severity == DoctorSeverity::Warning
+                && finding.summary.contains("013")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.code == "doctor.query_errors"
+                && finding.severity == DoctorSeverity::Warning
+                && finding.summary.contains("version query failed")
+        }));
+    }
+
+    #[test]
+    fn expected_schema_objects_finding_detects_missing_and_wrong_engine() {
+        let finding = evaluate_expected_schema_objects(&[
+            SchemaObjectRow {
+                name: "v_all_events".to_string(),
+                engine: "View".to_string(),
+            },
+            SchemaObjectRow {
+                name: "mv_search_documents_from_events".to_string(),
+                engine: "View".to_string(),
+            },
+        ]);
+
+        assert_eq!(finding.code, "schema.derived_objects");
+        assert_eq!(finding.severity, DoctorSeverity::Error);
+        assert!(finding
+            .summary
+            .contains("mv_search_documents_from_events has engine View"));
+        assert!(finding.summary.contains("v_conversation_trace"));
+    }
+
+    #[test]
+    fn count_finding_reports_issue_counts() {
+        let finding = count_finding(
+            "integrity.event_links_orphans",
+            3,
+            "No orphan event_links rows found.",
+            "orphan event_links rows",
+            "repair".to_string(),
+            DoctorSeverity::Error,
+        );
+
+        assert_eq!(finding.severity, DoctorSeverity::Error);
+        assert_eq!(finding.summary, "Found 3 orphan event_links rows.");
+        assert_eq!(finding.remediation, "repair");
+    }
+
+    #[test]
+    fn skipped_check_finding_lists_missing_tables() {
+        let finding = skipped_check_finding(
+            "search.index_freshness",
+            &["events", "search_documents"],
+            "search freshness drift",
+        );
+
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.summary.contains("events, search_documents"));
+    }
+
+    #[test]
+    fn missing_prerequisites_returns_only_missing_required_tables() {
+        let mut report = test_doctor_report();
+        report.missing_tables = vec!["events".to_string(), "tool_io".to_string()];
+
+        let missing = missing_prerequisites(&report, &["events", "raw_events", "tool_io"]);
+        assert_eq!(missing, vec!["events", "tool_io"]);
     }
 
     fn is_migration_filename(name: &str) -> bool {
