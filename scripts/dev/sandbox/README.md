@@ -34,7 +34,7 @@ scripts/dev/sandbox/moraine-sandbox logs <id> -f
 # List running sandboxes.
 scripts/dev/sandbox/moraine-sandbox list
 
-# Tear down (container, named volume, /tmp config dir).
+# Tear down (container, named volume, generated config dir).
 scripts/dev/sandbox/moraine-sandbox down <id>
 scripts/dev/sandbox/moraine-sandbox down --all
 ```
@@ -43,8 +43,10 @@ Agents: always call `down` before reporting your task complete.
 
 ## Where state lives
 
-- Host config dir: `/tmp/moraine-sandbox-<id>/` — generated `moraine.toml`
-  and (when no host mounts are used) empty fixture directories.
+- Host config dir: `${MORAINE_SANDBOX_CONFIG_ROOT:-/tmp}/moraine-sandbox-<id>/`
+  — generated `moraine.toml` and (when no host mounts are used) empty fixture
+  directories. Set `MORAINE_SANDBOX_CONFIG_ROOT` to a Docker-shared directory
+  if your host does not expose `/tmp` to Docker bind mounts.
 - Named Docker volume: `moraine-sandbox-<id>_state` — ClickHouse data,
   ingest state, logs. Removed on `down`.
 - Docker compose project: `moraine-sandbox-<id>`.

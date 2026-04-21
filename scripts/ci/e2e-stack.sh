@@ -328,7 +328,7 @@ EOF
   ensure_monitor_frontend "$repo_root"
 
   echo "[e2e] starting stack"
-  "$moraine_bin" up --config "$config_path"
+  "$moraine_bin" up --no-backup-check --config "$config_path"
 
   echo "[e2e] waiting for monitor health"
   wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120

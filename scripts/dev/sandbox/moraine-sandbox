@@ -110,6 +110,7 @@ project_name_for() {
 
 config_dir_for() {
     local root="${MORAINE_SANDBOX_CONFIG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/moraine-sandbox}"
+    root="${root%/}"
     printf '%s/%s%s' "$root" "$PROJECT_PREFIX" "$1"
 }
 
@@ -730,6 +731,7 @@ cmd_down() {
         # /tmp location is the historical default, retained for cleanup only.
         shopt -s nullglob
         local config_root="${MORAINE_SANDBOX_CONFIG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/moraine-sandbox}"
+        config_root="${config_root%/}"
         local leftover=("${config_root}"/${PROJECT_PREFIX}* /tmp/${PROJECT_PREFIX}*)
         shopt -u nullglob
         if [[ "${#leftover[@]}" -gt 0 ]]; then

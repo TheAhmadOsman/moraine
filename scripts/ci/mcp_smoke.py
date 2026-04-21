@@ -50,6 +50,8 @@ SAFETY_COUNTER_FIELDS = {
     "total_filters",
 }
 
+INPUT_SCHEMA_COMPOSITION_KEYWORDS = {"oneOf", "anyOf", "allOf", "not"}
+
 
 def collect_stderr(
     proc: subprocess.Popen[str], wait_seconds: float = 0.2, max_bytes: int = 8192
@@ -187,6 +189,18 @@ def require_text_content(result: JsonObject, label: str) -> str:
     return item["text"]
 
 
+def assert_no_input_schema_composition(value: Any, label: str) -> None:
+    if isinstance(value, dict):
+        for keyword in INPUT_SCHEMA_COMPOSITION_KEYWORDS:
+            if keyword in value:
+                raise AssertionError(f"{label} must not use {keyword}")
+        for key, nested in value.items():
+            assert_no_input_schema_composition(nested, f"{label}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            assert_no_input_schema_composition(nested, f"{label}[{index}]")
+
+
 def assert_initialize(result: JsonObject) -> None:
     if not isinstance(result.get("protocolVersion"), str) or not result["protocolVersion"]:
         raise AssertionError("initialize response missing protocolVersion")
@@ -221,6 +235,9 @@ def assert_tools_contract(tools_result: JsonObject) -> dict[str, JsonObject]:
             raise AssertionError(f"{tool_name}.inputSchema.type must be object")
         if input_schema.get("additionalProperties") is not False:
             raise AssertionError(f"{tool_name}.inputSchema must deny additional properties")
+        if "enum" in input_schema:
+            raise AssertionError(f"{tool_name}.inputSchema must not use top-level enum")
+        assert_no_input_schema_composition(input_schema, f"{tool_name}.inputSchema")
         if output_schema.get("type") != "object":
             raise AssertionError(f"{tool_name}.outputSchema.type must be object")
 
@@ -238,11 +255,17 @@ def assert_tools_contract(tools_result: JsonObject) -> dict[str, JsonObject]:
                 raise AssertionError(f"{tool_name}.inputSchema missing required field {field}")
 
         if tool_name == "open":
-            one_of = require_array(input_schema.get("oneOf"), "open.inputSchema.oneOf")
-            if len(one_of) != 2:
-                raise AssertionError(f"open.inputSchema.oneOf must have two branches: {one_of}")
             if "event_uid" not in properties or "session_id" not in properties:
                 raise AssertionError("open.inputSchema must expose event_uid and session_id")
+            include_payload = require_object(
+                properties.get("include_payload"), "open.include_payload"
+            )
+            if include_payload.get("type") != "array":
+                raise AssertionError("open.include_payload must advertise the array form")
+        if tool_name in {"search", "get_session_events"}:
+            event_kind = require_object(properties.get("event_kind"), f"{tool_name}.event_kind")
+            if event_kind.get("type") != "array":
+                raise AssertionError(f"{tool_name}.event_kind must advertise the array form")
 
         if tool_name in TOOLS_WITH_LIMIT:
             limit_schema = require_object(properties.get("limit"), f"{tool_name}.limit")

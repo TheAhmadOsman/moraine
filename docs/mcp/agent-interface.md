@@ -55,11 +55,12 @@ Example `initialize` result excerpt:
 - `inputSchema` with `type = "object"`.
 - `additionalProperties = false`.
 - Required fields for tools that need them.
+- Provider-safe input schemas: no input schema uses `oneOf`, `anyOf`, `allOf`, or `not`, and no input schema has a top-level `enum`.
 - A tool-specific `outputSchema` describing full-mode `structuredContent`.
 - `safety_mode` on every retrieval tool.
 - `verbosity` on every tool, defaulting to `prose`.
 
-Argument structs also use strict deserialization, so unknown fields fail before execution. This makes schema mistakes visible to hosts instead of being silently ignored. [src: crates/moraine-mcp-core/src/lib.rs]
+Argument structs also use strict deserialization, so unknown fields fail before execution. Cross-field rules that are awkward for provider tool validators, such as `open` requiring exactly one of `event_uid` or `session_id`, are enforced at runtime and returned as normal MCP tool-result errors. This keeps `tools/list` compatible with hosts that translate MCP tools into strict model function schemas while still making schema mistakes visible instead of silently ignoring them. [src: crates/moraine-mcp-core/src/lib.rs]
 
 The output schemas describe the structured payload returned when `verbosity = "full"`. Default prose responses still use the normal MCP `content` array and include no `structuredContent`. Agents that need stable machine-readable fields should request `full`; agents that want compact model-readable output should use default `prose`.
 
@@ -243,7 +244,7 @@ These prompts are intentionally text-first and conservative. They recommend `saf
 
 ### `search`
 
-`search` performs BM25 lexical search over event-level documents. Required input is `query`. Optional filters include `session_id`, `event_kind`, `include_tool_events`, `exclude_codex_mcp`, `include_payload_json`, `min_score`, `min_should_match`, and `limit`.
+`search` performs BM25 lexical search over event-level documents. Required input is `query`. Optional filters include `session_id`, `event_kind`, `include_tool_events`, `exclude_codex_mcp`, `include_payload_json`, `min_score`, `min_should_match`, and `limit`. `event_kind` is advertised as an array for host compatibility; a single string remains accepted for backward compatibility with older callers.
 
 Returned full payload includes:
 
@@ -298,7 +299,7 @@ Full payload includes:
 
 ### `get_session_events`
 
-`get_session_events` returns an ordered, paginated event timeline for one session. It accepts `direction = "forward" | "reverse"`, optional event kind filter, cursor, limit, verbosity, and safety mode.
+`get_session_events` returns an ordered, paginated event timeline for one session. It accepts `direction = "forward" | "reverse"`, optional event kind filter, cursor, limit, verbosity, and safety mode. `event_kind` is advertised as an array for host compatibility; a single string remains accepted for backward compatibility with older callers.
 
 Full payload includes:
 
@@ -313,11 +314,11 @@ Use this when a host needs chronological navigation rather than an `open` contex
 
 ### `open`
 
-`open` accepts exactly one of `event_uid` or `session_id`.
+`open` accepts exactly one of `event_uid` or `session_id`. The published input schema intentionally does not encode that XOR with JSON Schema composition keywords; the runtime validates missing, empty, or duplicate selectors and returns an MCP tool-result error.
 
 When called with `event_uid`, it resolves one event and returns surrounding context controlled by `before`, `after`, and `include_system_events`. Missing events return `found=false` with an empty event list.
 
-When called with `session_id`, it returns a paged transcript view. `scope` controls whether the page includes `all`, `messages`, `events`, or `turns`; `include_payload` controls whether event text or payload JSON is included; `cursor` and `limit` paginate by turns.
+When called with `session_id`, it returns a paged transcript view. `scope` controls whether the page includes `all`, `messages`, `events`, or `turns`; `include_payload` controls whether event text or payload JSON is included; `cursor` and `limit` paginate by turns. `include_payload` is advertised as an array for host compatibility; a single string remains accepted for backward compatibility with older callers.
 
 Full payload includes:
 

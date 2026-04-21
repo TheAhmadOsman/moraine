@@ -213,7 +213,10 @@ container inherits `20G` from its env unless overridden.
 `moraine-sandbox up` writes
 `${XDG_CACHE_HOME:-$HOME/.cache}/moraine-sandbox/moraine-sandbox-<id>/moraine.toml`
 by default.
-It is regenerated on every `up` and never edited by hand. Keys:
+It is regenerated on every `up` and never edited by hand. Set
+`MORAINE_SANDBOX_CONFIG_ROOT` to override the base config root; use the same
+environment value for `status` and `down` so the wrapper reports and removes
+the right config path. Keys:
 
 - `[clickhouse] url = "http://clickhouse:8123"`, `database = "moraine"` —
   compose-DNS address of the sibling ClickHouse service.

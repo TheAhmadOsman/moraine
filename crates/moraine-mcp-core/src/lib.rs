@@ -1830,16 +1830,6 @@ fn tools_list_result_for_max_results(max_results: u16) -> Value {
                         "safety_mode": safety_mode_input_schema(),
                         "verbosity": verbosity_input_schema()
                     },
-                    "oneOf": [
-                        {
-                            "required": ["event_uid"],
-                            "not": { "required": ["session_id"] }
-                        },
-                        {
-                            "required": ["session_id"],
-                            "not": { "required": ["event_uid"] }
-                        }
-                    ],
                     "additionalProperties": false
                 },
                 "outputSchema": with_safety_metadata(open_output_schema())
@@ -2066,39 +2056,23 @@ fn mode_input_schema() -> Value {
 
 fn event_kind_input_schema() -> Value {
     json!({
-        "description": "Filter to specific event kind(s).",
-        "oneOf": [
-            {
-                "type": "string",
-                "enum": ["message", "reasoning", "tool_call", "tool_result"]
-            },
-            {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["message", "reasoning", "tool_call", "tool_result"]
-                }
-            }
-        ]
+        "type": "array",
+        "description": "Filter to specific event kind(s). Prefer an array; a single string is still accepted for backward compatibility.",
+        "items": {
+            "type": "string",
+            "enum": ["message", "reasoning", "tool_call", "tool_result"]
+        }
     })
 }
 
 fn open_payload_input_schema() -> Value {
     json!({
-        "description": "Optional event payload fields to include in session transcript pages.",
-        "oneOf": [
-            {
-                "type": "string",
-                "enum": ["text", "payload_json"]
-            },
-            {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["text", "payload_json"]
-                }
-            }
-        ]
+        "type": "array",
+        "description": "Optional event payload fields to include in session transcript pages. Prefer an array; a single string is still accepted for backward compatibility.",
+        "items": {
+            "type": "string",
+            "enum": ["text", "payload_json"]
+        }
     })
 }
 
@@ -3420,6 +3394,29 @@ mod tests {
             .unwrap_or_else(|| panic!("missing tool schema for {name}"))
     }
 
+    fn assert_no_input_schema_composition(value: &Value, path: &str) {
+        match value {
+            Value::Object(map) => {
+                for keyword in ["oneOf", "anyOf", "allOf", "not"] {
+                    assert!(
+                        !map.contains_key(keyword),
+                        "input schema should not use {keyword} at {path}"
+                    );
+                }
+
+                for (key, nested) in map {
+                    assert_no_input_schema_composition(nested, &format!("{path}/{key}"));
+                }
+            }
+            Value::Array(items) => {
+                for (idx, nested) in items.iter().enumerate() {
+                    assert_no_input_schema_composition(nested, &format!("{path}/{idx}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn rpc_request(state: &AppState, method: &str, params: Value) -> Value {
         let runtime = test_runtime();
         runtime
@@ -3466,6 +3463,42 @@ mod tests {
         let text = "one two three four five";
         let compact = compact_text_line(text, 10);
         assert!(compact.ends_with("..."));
+    }
+
+    #[test]
+    fn tools_list_declares_provider_safe_input_schemas() {
+        let payload = tools_list_result_for_max_results(25);
+        let tools = payload["tools"].as_array().expect("tools array");
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let input_schema = tool.get("inputSchema").expect("input schema");
+
+            assert_eq!(
+                input_schema.get("type").and_then(Value::as_str),
+                Some("object"),
+                "{name}.inputSchema root should be an object"
+            );
+            assert!(
+                input_schema.get("enum").is_none(),
+                "{name}.inputSchema root should not use enum"
+            );
+            assert_no_input_schema_composition(input_schema, &format!("{name}.inputSchema"));
+        }
+
+        let search = tool_by_name(&payload, "search");
+        assert_eq!(
+            search
+                .pointer("/inputSchema/properties/event_kind/type")
+                .and_then(Value::as_str),
+            Some("array")
+        );
+        let open = tool_by_name(&payload, "open");
+        assert_eq!(
+            open.pointer("/inputSchema/properties/include_payload/type")
+                .and_then(Value::as_str),
+            Some("array")
+        );
     }
 
     #[test]
@@ -3710,6 +3743,16 @@ mod tests {
         }))
         .expect("search args");
 
+        let search_event_kind: SearchArgs = serde_json::from_value(json!({
+            "query": "error",
+            "event_kind": "message"
+        }))
+        .expect("search args with singular event_kind");
+        assert!(matches!(
+            search_event_kind.event_kind,
+            Some(SearchEventKindsArg::One(SearchEventKind::Message))
+        ));
+
         let _: OpenArgs = serde_json::from_value(json!({
             "event_uid": "evt-1",
             "before": 1,
@@ -3719,6 +3762,16 @@ mod tests {
             "verbosity": "prose"
         }))
         .expect("open args");
+
+        let open_payload: OpenArgs = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "include_payload": "text"
+        }))
+        .expect("open args with singular include_payload");
+        assert!(matches!(
+            open_payload.include_payload,
+            Some(OpenPayloadArg::One(OpenPayloadField::Text))
+        ));
 
         let _: SearchConversationsArgs = serde_json::from_value(json!({
             "query": "deploy",
@@ -4717,6 +4770,55 @@ mod tests {
             .as_str()
             .expect("open error text")
             .contains("exactly one of event_uid or session_id"));
+
+        let open_selector_errors = [
+            (json!({}), "one of event_uid or session_id"),
+            (
+                json!({ "event_uid": " " }),
+                "one of event_uid or session_id",
+            ),
+            (
+                json!({ "session_id": "" }),
+                "one of event_uid or session_id",
+            ),
+        ];
+        for (arguments, expected_text) in open_selector_errors {
+            let response = rpc_request(
+                &state,
+                "tools/call",
+                json!({
+                    "name": "open",
+                    "arguments": arguments
+                }),
+            );
+            let result = rpc_result(&response, "tools/call");
+            assert_eq!(result["isError"], json!(true));
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .expect("open selector error text")
+                .contains(expected_text));
+        }
+
+        let open_wrong_type = rpc_request(
+            &state,
+            "tools/call",
+            json!({
+                "name": "open",
+                "arguments": {
+                    "event_uid": true
+                }
+            }),
+        );
+        let open_wrong_type_result = rpc_result(&open_wrong_type, "tools/call");
+        assert_eq!(open_wrong_type_result["isError"], json!(true));
+        let open_wrong_type_text = open_wrong_type_result["content"][0]["text"]
+            .as_str()
+            .expect("open wrong type error text");
+        assert!(
+            open_wrong_type_text.contains("event_uid")
+                || open_wrong_type_text.contains("invalid type"),
+            "open wrong-type validation should stay visible to hosts"
+        );
 
         let unknown_tool = rpc_request(
             &state,
