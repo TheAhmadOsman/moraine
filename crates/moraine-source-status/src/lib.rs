@@ -3,8 +3,8 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_config::IngestSource;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::time::UNIX_EPOCH;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,16 +167,36 @@ struct LegacySourceRuntimeRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceFileRow {
     pub path: String,
+    pub on_disk: bool,
     pub size_bytes: u64,
     pub modified_at: Option<String>,
+    pub modified_age_seconds: Option<u64>,
     pub checkpoint_offset: Option<u64>,
     pub checkpoint_line_no: Option<u64>,
     pub checkpoint_status: Option<String>,
     pub checkpoint_updated_at: Option<String>,
+    pub checkpoint_age_seconds: Option<u64>,
     pub raw_event_count: u64,
+    pub latest_raw_event_at: Option<String>,
+    pub latest_raw_event_age_seconds: Option<u64>,
     pub latest_error_at: Option<String>,
+    pub latest_error_age_seconds: Option<u64>,
     pub latest_error_kind: Option<String>,
     pub latest_error_text: Option<String>,
+    pub stale_reason: Option<String>,
+    pub sqlite_wal_present: Option<bool>,
+    pub sqlite_shm_present: Option<bool>,
+    pub issues: Vec<SourceFileIssue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFileIssue {
+    MissingOnDisk,
+    Stale,
+    Erroring,
+    SqliteWalPresent,
+    SqliteShmPresent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,18 +217,22 @@ struct FileCheckpointRow {
     last_line_no: u64,
     status: String,
     updated_at: String,
+    updated_age_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
-struct FileRawCountRow {
+struct FileRawStatsRow {
     source_file: String,
     count: u64,
+    latest_raw_event_at: String,
+    latest_raw_event_age_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct FileLatestErrorRow {
     source_file: String,
     latest_error_at: String,
+    latest_error_age_seconds: u64,
     error_kind: String,
     error_text: String,
 }
@@ -744,6 +768,13 @@ fn file_modified_at(path: &std::path::Path) -> Option<String> {
     Some(format!("{secs}"))
 }
 
+fn file_modified_age_seconds(path: &std::path::Path, now_unix_seconds: u64) -> Option<u64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    now_unix_seconds.checked_sub(duration.as_secs())
+}
+
 fn file_size_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
 }
@@ -756,25 +787,30 @@ async fn query_file_checkpoint_stats(
     let query = format!(
         "SELECT \
             source_file, \
-            last_offset, \
-            last_line_no, \
-            status, \
-            toString(max(updated_at)) AS updated_at \
+            toUInt64(argMax(last_offset, updated_at)) AS last_offset, \
+            toUInt64(argMax(last_line_no, updated_at)) AS last_line_no, \
+            argMax(status, updated_at) AS status, \
+            toString(max(updated_at)) AS updated_at, \
+            toUInt64(greatest(dateDiff('second', max(updated_at), now()), 0)) AS updated_age_seconds \
          FROM {db}.ingest_checkpoints FINAL \
          WHERE source_name = '{}' \
-         GROUP BY source_file, last_offset, last_line_no, status",
+         GROUP BY source_file",
         escape_literal(source_name)
     );
     ch.query_rows(&query, None).await
 }
 
-async fn query_file_raw_counts(
+async fn query_file_raw_stats(
     ch: &ClickHouseClient,
     db: &str,
     source_name: &str,
-) -> Result<Vec<FileRawCountRow>> {
+) -> Result<Vec<FileRawStatsRow>> {
     let query = format!(
-        "SELECT source_file, toUInt64(count()) AS count \
+        "SELECT \
+            source_file, \
+            toUInt64(count()) AS count, \
+            toString(max(ingested_at)) AS latest_raw_event_at, \
+            toUInt64(greatest(dateDiff('second', max(ingested_at), now()), 0)) AS latest_raw_event_age_seconds \
          FROM {db}.raw_events \
          WHERE source_name = '{}' \
          GROUP BY source_file",
@@ -792,6 +828,7 @@ async fn query_file_latest_errors(
         "SELECT \
             source_file, \
             toString(max(ingested_at)) AS latest_error_at, \
+            toUInt64(greatest(dateDiff('second', max(ingested_at), now()), 0)) AS latest_error_age_seconds, \
             argMax(error_kind, ingested_at) AS error_kind, \
             argMax(error_text, ingested_at) AS error_text \
          FROM {db}.ingest_errors \
@@ -804,6 +841,157 @@ async fn query_file_latest_errors(
 
 fn escape_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn latest_observed_progress_unix(
+    now_unix_seconds: u64,
+    checkpoint: Option<&FileCheckpointRow>,
+    raw_stats: Option<&FileRawStatsRow>,
+    latest_error: Option<&FileLatestErrorRow>,
+) -> Option<u64> {
+    [
+        checkpoint.and_then(|row| now_unix_seconds.checked_sub(row.updated_age_seconds)),
+        raw_stats.and_then(|row| now_unix_seconds.checked_sub(row.latest_raw_event_age_seconds)),
+        latest_error.and_then(|row| now_unix_seconds.checked_sub(row.latest_error_age_seconds)),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+fn stale_threshold_seconds(cfg: &AppConfig) -> u64 {
+    cfg.ingest
+        .reconcile_interval_seconds
+        .max(cfg.ingest.heartbeat_interval_seconds * 2.0)
+        .ceil()
+        .max(30.0) as u64
+}
+
+fn sqlite_sidecar_flags(source: &IngestSource, path: &str) -> (Option<bool>, Option<bool>) {
+    if source.format != "opencode_sqlite" || !path.ends_with(".db") {
+        return (None, None);
+    }
+
+    let wal = std::path::PathBuf::from(format!("{path}-wal")).exists();
+    let shm = std::path::PathBuf::from(format!("{path}-shm")).exists();
+    (Some(wal), Some(shm))
+}
+
+fn stale_reason(
+    modified_age_seconds: Option<u64>,
+    observed_progress_unix: Option<u64>,
+    now_unix_seconds: u64,
+    stale_threshold_seconds: u64,
+) -> Option<String> {
+    let modified_age_seconds = modified_age_seconds?;
+    let modified_unix = now_unix_seconds.checked_sub(modified_age_seconds)?;
+
+    match observed_progress_unix {
+        Some(progress_unix) if modified_unix > progress_unix.saturating_add(stale_threshold_seconds) => {
+            Some(format!(
+                "disk writes are newer than the latest observed ingest progress by at least {}s",
+                modified_unix.saturating_sub(progress_unix)
+            ))
+        }
+        None if modified_age_seconds >= stale_threshold_seconds => Some(format!(
+            "file matches the source glob but has no checkpoint, raw rows, or ingest errors after {}s",
+            modified_age_seconds
+        )),
+        _ => None,
+    }
+}
+
+fn build_source_file_row(
+    cfg: &AppConfig,
+    source: &IngestSource,
+    path_str: &str,
+    on_disk: bool,
+    checkpoint: Option<&FileCheckpointRow>,
+    raw_stats: Option<&FileRawStatsRow>,
+    latest_error: Option<&FileLatestErrorRow>,
+    now_unix_seconds: u64,
+) -> SourceFileRow {
+    let path = std::path::Path::new(path_str);
+    let size_bytes = if on_disk { file_size_bytes(path) } else { 0 };
+    let modified_at = if on_disk {
+        file_modified_at(path)
+    } else {
+        None
+    };
+    let modified_age_seconds = if on_disk {
+        file_modified_age_seconds(path, now_unix_seconds)
+    } else {
+        None
+    };
+    let observed_progress_unix =
+        latest_observed_progress_unix(now_unix_seconds, checkpoint, raw_stats, latest_error);
+    let stale_reason = stale_reason(
+        modified_age_seconds,
+        observed_progress_unix,
+        now_unix_seconds,
+        stale_threshold_seconds(cfg),
+    );
+    let (sqlite_wal_present, sqlite_shm_present) = sqlite_sidecar_flags(source, path_str);
+
+    let mut issues = Vec::new();
+    if !on_disk {
+        issues.push(SourceFileIssue::MissingOnDisk);
+    }
+    if stale_reason.is_some() {
+        issues.push(SourceFileIssue::Stale);
+    }
+    if latest_error.is_some() {
+        issues.push(SourceFileIssue::Erroring);
+    }
+    if sqlite_wal_present == Some(true) {
+        issues.push(SourceFileIssue::SqliteWalPresent);
+    }
+    if sqlite_shm_present == Some(true) {
+        issues.push(SourceFileIssue::SqliteShmPresent);
+    }
+
+    SourceFileRow {
+        path: path_str.to_string(),
+        on_disk,
+        size_bytes,
+        modified_at,
+        modified_age_seconds,
+        checkpoint_offset: checkpoint.map(|row| row.last_offset),
+        checkpoint_line_no: checkpoint.map(|row| row.last_line_no),
+        checkpoint_status: checkpoint
+            .map(|row| row.status.clone())
+            .filter(|value| !value.is_empty()),
+        checkpoint_updated_at: checkpoint
+            .map(|row| row.updated_at.clone())
+            .filter(|value| !value.is_empty()),
+        checkpoint_age_seconds: checkpoint.map(|row| row.updated_age_seconds),
+        raw_event_count: raw_stats.map(|row| row.count).unwrap_or(0),
+        latest_raw_event_at: raw_stats
+            .map(|row| row.latest_raw_event_at.clone())
+            .filter(|value| !value.is_empty()),
+        latest_raw_event_age_seconds: raw_stats.map(|row| row.latest_raw_event_age_seconds),
+        latest_error_at: latest_error
+            .map(|row| row.latest_error_at.clone())
+            .filter(|value| !value.is_empty()),
+        latest_error_age_seconds: latest_error.map(|row| row.latest_error_age_seconds),
+        latest_error_kind: latest_error
+            .map(|row| row.error_kind.clone())
+            .filter(|value| !value.is_empty()),
+        latest_error_text: latest_error
+            .map(|row| row.error_text.clone())
+            .filter(|value| !value.is_empty()),
+        stale_reason,
+        sqlite_wal_present,
+        sqlite_shm_present,
+        issues,
+    }
 }
 
 /// Build a per-file diagnostic snapshot for a single source.
@@ -822,7 +1010,9 @@ pub async fn build_source_files_snapshot(
         .ok_or_else(|| anyhow!("source '{}' not found in config", source_name))?;
 
     let (disk_paths, fs_error) = glob_matches(&source.glob);
+    let disk_path_set: BTreeSet<String> = disk_paths.iter().cloned().collect();
     let glob_match_count = disk_paths.len();
+    let now_unix_seconds = now_unix_seconds();
 
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
@@ -836,7 +1026,7 @@ pub async fn build_source_files_snapshot(
             Vec::new()
         }
     };
-    let raw_count_rows = match query_file_raw_counts(&ch, &db, source_name).await {
+    let raw_stat_rows = match query_file_raw_stats(&ch, &db, source_name).await {
         Ok(rows) => rows,
         Err(err) => {
             if query_error.is_none() {
@@ -859,77 +1049,32 @@ pub async fn build_source_files_snapshot(
         .into_iter()
         .map(|row| (row.source_file.clone(), row))
         .collect();
-    let raw_counts: BTreeMap<String, u64> = raw_count_rows
+    let raw_stats: BTreeMap<String, FileRawStatsRow> = raw_stat_rows
         .into_iter()
-        .map(|row| (row.source_file, row.count))
+        .map(|row| (row.source_file.clone(), row))
         .collect();
     let latest_errors: BTreeMap<String, FileLatestErrorRow> = latest_error_rows
         .into_iter()
         .map(|row| (row.source_file.clone(), row))
         .collect();
 
+    let mut paths = disk_path_set.clone();
+    paths.extend(checkpoints.keys().cloned());
+    paths.extend(raw_stats.keys().cloned());
+    paths.extend(latest_errors.keys().cloned());
+
     let mut files = Vec::new();
-    for path_str in &disk_paths {
-        let path = std::path::Path::new(path_str);
-        let size_bytes = file_size_bytes(path);
-        let modified_at = file_modified_at(path);
-
-        let checkpoint = checkpoints.get(path_str);
-        let raw_event_count = raw_counts.get(path_str).copied().unwrap_or(0);
-        let latest_error = latest_errors.get(path_str);
-
-        files.push(SourceFileRow {
-            path: path_str.clone(),
-            size_bytes,
-            modified_at,
-            checkpoint_offset: checkpoint.map(|r| r.last_offset),
-            checkpoint_line_no: checkpoint.map(|r| r.last_line_no),
-            checkpoint_status: checkpoint
-                .map(|r| r.status.clone())
-                .filter(|s| !s.is_empty()),
-            checkpoint_updated_at: checkpoint
-                .map(|r| r.updated_at.clone())
-                .filter(|s| !s.is_empty()),
-            raw_event_count,
-            latest_error_at: latest_error
-                .map(|r| r.latest_error_at.clone())
-                .filter(|s| !s.is_empty()),
-            latest_error_kind: latest_error
-                .map(|r| r.error_kind.clone())
-                .filter(|s| !s.is_empty()),
-            latest_error_text: latest_error
-                .map(|r| r.error_text.clone())
-                .filter(|s| !s.is_empty()),
-        });
-    }
-
-    // Also include files that have ClickHouse state but are no longer on disk
-    for (path_str, checkpoint) in &checkpoints {
-        if disk_paths.contains(path_str) {
-            continue;
-        }
-        let raw_event_count = raw_counts.get(path_str).copied().unwrap_or(0);
-        let latest_error = latest_errors.get(path_str);
-
-        files.push(SourceFileRow {
-            path: path_str.clone(),
-            size_bytes: 0,
-            modified_at: None,
-            checkpoint_offset: Some(checkpoint.last_offset),
-            checkpoint_line_no: Some(checkpoint.last_line_no),
-            checkpoint_status: Some(checkpoint.status.clone()).filter(|s| !s.is_empty()),
-            checkpoint_updated_at: Some(checkpoint.updated_at.clone()).filter(|s| !s.is_empty()),
-            raw_event_count,
-            latest_error_at: latest_error
-                .map(|r| r.latest_error_at.clone())
-                .filter(|s| !s.is_empty()),
-            latest_error_kind: latest_error
-                .map(|r| r.error_kind.clone())
-                .filter(|s| !s.is_empty()),
-            latest_error_text: latest_error
-                .map(|r| r.error_text.clone())
-                .filter(|s| !s.is_empty()),
-        });
+    for path_str in paths {
+        files.push(build_source_file_row(
+            cfg,
+            source,
+            &path_str,
+            disk_path_set.contains(&path_str),
+            checkpoints.get(&path_str),
+            raw_stats.get(&path_str),
+            latest_errors.get(&path_str),
+            now_unix_seconds,
+        ));
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1079,6 +1224,98 @@ mod tests {
     #[test]
     fn escape_literal_escapes_quotes() {
         assert_eq!(escape_literal("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn build_source_file_row_marks_missing_erroring_and_sqlite_sidecars() {
+        let mut cfg = moraine_config::AppConfig::default();
+        cfg.ingest.reconcile_interval_seconds = 30.0;
+        cfg.ingest.heartbeat_interval_seconds = 5.0;
+
+        let root = std::env::temp_dir().join(format!(
+            "moraine-source-file-row-{}-{}",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let db_path = root.join("opencode.db");
+        std::fs::write(&db_path, b"sqlite").expect("write db");
+        std::fs::write(root.join("opencode.db-wal"), b"wal").expect("write wal");
+        std::fs::write(root.join("opencode.db-shm"), b"shm").expect("write shm");
+
+        let source = IngestSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            enabled: true,
+            glob: db_path.to_string_lossy().to_string(),
+            watch_root: root.to_string_lossy().to_string(),
+            format: "opencode_sqlite".to_string(),
+        };
+        let latest_error = FileLatestErrorRow {
+            source_file: db_path.to_string_lossy().to_string(),
+            latest_error_at: "2026-04-20 10:20:00".to_string(),
+            latest_error_age_seconds: 3,
+            error_kind: "schema_drift".to_string(),
+            error_text: "missing field".to_string(),
+        };
+
+        let row = build_source_file_row(
+            &cfg,
+            &source,
+            &db_path.to_string_lossy(),
+            true,
+            None,
+            None,
+            Some(&latest_error),
+            now_unix_seconds(),
+        );
+
+        assert!(row.on_disk);
+        assert_eq!(row.sqlite_wal_present, Some(true));
+        assert_eq!(row.sqlite_shm_present, Some(true));
+        assert!(row.issues.contains(&SourceFileIssue::Erroring));
+        assert!(row.issues.contains(&SourceFileIssue::SqliteWalPresent));
+        assert!(row.issues.contains(&SourceFileIssue::SqliteShmPresent));
+
+        let missing_row = build_source_file_row(
+            &cfg,
+            &source,
+            "/tmp/missing-opencode.db",
+            false,
+            Some(&FileCheckpointRow {
+                source_file: "/tmp/missing-opencode.db".to_string(),
+                last_offset: 42,
+                last_line_no: 7,
+                status: "ok".to_string(),
+                updated_at: "2026-04-20 10:19:00".to_string(),
+                updated_age_seconds: 10,
+            }),
+            Some(&FileRawStatsRow {
+                source_file: "/tmp/missing-opencode.db".to_string(),
+                count: 12,
+                latest_raw_event_at: "2026-04-20 10:19:10".to_string(),
+                latest_raw_event_age_seconds: 8,
+            }),
+            None,
+            now_unix_seconds(),
+        );
+
+        assert!(!missing_row.on_disk);
+        assert!(missing_row.issues.contains(&SourceFileIssue::MissingOnDisk));
+        assert_eq!(missing_row.raw_event_count, 12);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_reason_marks_disk_ahead_of_ingest_progress() {
+        let reason = stale_reason(Some(5), Some(10), 1_000, 30);
+
+        assert!(reason.is_some());
+        assert!(reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disk writes are newer"));
     }
 
     #[test]

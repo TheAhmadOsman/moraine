@@ -143,17 +143,34 @@ export interface SourceDetailResponse {
 
 export interface SourceFileRow {
   path: string;
+  on_disk: boolean;
   size_bytes: number;
   modified_at: string | null;
+  modified_age_seconds: number | null;
   checkpoint_offset: number | null;
   checkpoint_line_no: number | null;
   checkpoint_status: string | null;
   checkpoint_updated_at: string | null;
+  checkpoint_age_seconds: number | null;
   raw_event_count: number;
+  latest_raw_event_at: string | null;
+  latest_raw_event_age_seconds: number | null;
   latest_error_at: string | null;
+  latest_error_age_seconds: number | null;
   latest_error_kind: string | null;
   latest_error_text: string | null;
+  stale_reason: string | null;
+  sqlite_wal_present: boolean | null;
+  sqlite_shm_present: boolean | null;
+  issues: SourceFileIssue[];
 }
+
+export type SourceFileIssue =
+  | 'missing_on_disk'
+  | 'stale'
+  | 'erroring'
+  | 'sqlite_wal_present'
+  | 'sqlite_shm_present';
 
 export interface SourceFilesResponse {
   ok: boolean;

@@ -3,6 +3,7 @@
   import type {
     SourceDetailResponse,
     SourceErrorsResponse,
+    SourceFileIssue,
     SourceFilesResponse,
     SourceHealthStatus,
     SourceLagIndicator,
@@ -123,6 +124,41 @@
     if (kind === 'file_state') return 'File state';
     if (kind === 'ingest_heartbeat') return 'Heartbeat';
     return 'Watcher';
+  }
+
+  function formatTimestampWithAge(timestamp: string | null | undefined, ageSeconds: number | null | undefined): string {
+    if (!timestamp) return '—';
+    if (ageSeconds == null) return timestamp;
+    return `${timestamp} (${formatSeconds(ageSeconds)} ago)`;
+  }
+
+  function fileIssueLabel(issue: SourceFileIssue): string {
+    if (issue === 'missing_on_disk') return 'missing';
+    if (issue === 'stale') return 'stale';
+    if (issue === 'erroring') return 'erroring';
+    if (issue === 'sqlite_wal_present') return 'wal';
+    return 'shm';
+  }
+
+  function fileIssueTone(issue: SourceFileIssue): 'warn' | 'bad' | 'subtle' {
+    if (issue === 'missing_on_disk' || issue === 'erroring') return 'bad';
+    if (issue === 'stale') return 'warn';
+    return 'subtle';
+  }
+
+  function fileRowTone(issues: SourceFileIssue[]): 'bad' | 'warn' | 'subtle' {
+    if (issues.includes('missing_on_disk') || issues.includes('erroring')) return 'bad';
+    if (issues.includes('stale')) return 'warn';
+    return 'subtle';
+  }
+
+  function diskPresenceLabel(onDisk: boolean): string {
+    return onDisk ? 'present' : 'missing';
+  }
+
+  function sqliteSummary(wal: boolean | null, shm: boolean | null): string {
+    if (wal == null && shm == null) return '—';
+    return `WAL ${wal ? 'yes' : 'no'} | SHM ${shm ? 'yes' : 'no'}`;
   }
 
   function close() {
@@ -323,26 +359,77 @@
             <table class="sd-table">
               <thead>
                 <tr>
+                  <th>State</th>
                   <th>Path</th>
-                  <th>Size</th>
-                  <th>Modified</th>
+                  <th>Disk</th>
                   <th>Raw</th>
                   <th>Checkpoint</th>
-                  <th>Status</th>
+                  <th>Latest Error</th>
+                  <th>SQLite</th>
                 </tr>
               </thead>
               <tbody>
                 {#each filesData.files as file}
-                  <tr>
-                    <td class="sd-path" title={file.path}>{file.path}</td>
-                    <td class="mono">{formatBytes(file.size_bytes)}</td>
-                    <td class="mono">{file.modified_at ?? '—'}</td>
-                    <td class="mono">{file.raw_event_count}</td>
-                    <td class="mono">{file.checkpoint_offset ?? '—'}</td>
+                  <tr class:sd-row-bad={fileRowTone(file.issues) === 'bad'} class:sd-row-warn={fileRowTone(file.issues) === 'warn'}>
                     <td>
-                      <span class="sd-status" class:sd-status-warn={file.checkpoint_status === 'error'}>
-                        {file.checkpoint_status ?? '—'}
-                      </span>
+                      <div class="sd-cell-stack sd-cell-state">
+                        {#if file.issues.length === 0}
+                          <span class="sd-status sd-status-good">ok</span>
+                        {:else}
+                          {#each file.issues as issue}
+                            <span
+                              class="sd-status"
+                              class:sd-status-warn={fileIssueTone(issue) === 'warn'}
+                              class:sd-status-bad={fileIssueTone(issue) === 'bad'}
+                            >
+                              {fileIssueLabel(issue)}
+                            </span>
+                          {/each}
+                        {/if}
+                        {#if file.stale_reason}
+                          <span class="sd-cell-note">{file.stale_reason}</span>
+                        {/if}
+                      </div>
+                    </td>
+                    <td class="sd-path" title={file.path}>{file.path}</td>
+                    <td>
+                      <div class="sd-cell-stack mono">
+                        <span>{diskPresenceLabel(file.on_disk)}</span>
+                        <span>Size: {file.on_disk ? formatBytes(file.size_bytes) : '—'}</span>
+                        <span>{formatTimestampWithAge(file.modified_at, file.modified_age_seconds)}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="sd-cell-stack mono">
+                        <span>{formatCount(file.raw_event_count)} rows</span>
+                        <span>{formatTimestampWithAge(file.latest_raw_event_at, file.latest_raw_event_age_seconds)}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="sd-cell-stack mono">
+                        <span>Offset: {file.checkpoint_offset ?? '—'} | Line: {file.checkpoint_line_no ?? '—'}</span>
+                        <span>{formatTimestampWithAge(file.checkpoint_updated_at, file.checkpoint_age_seconds)}</span>
+                        <span>
+                          <span class="sd-status" class:sd-status-warn={file.checkpoint_status === 'error'}>
+                            {file.checkpoint_status ?? '—'}
+                          </span>
+                        </span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="sd-cell-stack mono">
+                        <span>{formatTimestampWithAge(file.latest_error_at, file.latest_error_age_seconds)}</span>
+                        <span>{file.latest_error_kind ?? '—'}</span>
+                        <span class="sd-cell-note">{file.latest_error_text ?? '—'}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="sd-cell-stack mono">
+                        <span>{sqliteSummary(file.sqlite_wal_present, file.sqlite_shm_present)}</span>
+                        {#if file.sqlite_wal_present != null || file.sqlite_shm_present != null}
+                          <span class="sd-cell-note">heuristic for base `.db` paths only</span>
+                        {/if}
+                      </div>
                     </td>
                   </tr>
                 {/each}
@@ -530,10 +617,19 @@
     text-align: left;
     border-bottom: 1px solid var(--line);
     white-space: nowrap;
+    vertical-align: top;
   }
 
   .sd-table tbody tr:nth-child(even) {
     background: var(--row-stripe);
+  }
+
+  .sd-row-warn {
+    background: rgba(180, 83, 9, 0.04);
+  }
+
+  .sd-row-bad {
+    background: rgba(190, 18, 60, 0.05);
   }
 
   .sd-path {
@@ -542,6 +638,23 @@
     text-overflow: ellipsis;
     font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.75rem;
+  }
+
+  .sd-cell-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 10rem;
+  }
+
+  .sd-cell-state {
+    min-width: 11rem;
+  }
+
+  .sd-cell-note {
+    color: var(--subtle);
+    white-space: normal;
+    word-break: break-word;
   }
 
   .sd-status {

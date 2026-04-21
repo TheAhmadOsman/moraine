@@ -57,6 +57,7 @@ The monitor backend exposes:
 ```http
 GET /api/sources
 GET /api/sources/:source
+GET /api/sources/:source/files
 ```
 
 Successful responses use HTTP 200 even when one of the ClickHouse table queries fails after the config was loaded. In that partial state, configured sources are still returned and `query_error` describes the first query failure that occurred. This is deliberate: a dashboard that can show configured sources plus an explicit partial-query warning is more useful than a blanket 503 with no inventory. [src: crates/moraine-monitor-core/src/lib.rs, crates/moraine-source-status/src/lib.rs]
@@ -136,7 +137,19 @@ The strip is not a file browser and does not replace the session explorer. Its j
 - A source has ingest errors.
 - ClickHouse source-health queries are degraded.
 
-Selecting a source opens the detail panel. The drilldown now keeps a compact source summary visible above the files/errors tabs so operators can still see status, harness, format, watch root, glob, counts, latest checkpoint/error metadata, heartbeat age, watcher backend/error/reset state, append-to-visible lag, and the configured reconcile cadence while they inspect per-file state or recent ingest failures. The summary is loaded from `GET /api/sources/:source`; the existing `GET /api/sources/:source/files` and `GET /api/sources/:source/errors` endpoints remain focused on file and error detail. Partial failures stay localized to the affected query surface and are shown as `query_error` or `runtime_query_error` warnings in the panel instead of collapsing the whole view.
+Selecting a source opens the detail panel. The drilldown now keeps a compact source summary visible above the files/errors tabs so operators can still see status, harness, format, watch root, glob, counts, latest checkpoint/error metadata, heartbeat age, watcher backend/error/reset state, append-to-visible lag, and the configured reconcile cadence while they inspect per-file state or recent ingest failures. The summary is loaded from `GET /api/sources/:source`; the `GET /api/sources/:source/files` endpoint now adds actionable per-file runtime detail instead of only shallow checkpoint counts.
+
+Each file row is additive and can now include:
+
+- `on_disk` plus `modified_at` and `modified_age_seconds`, so a file that still has checkpoints/raw rows but no longer exists on disk is obvious.
+- `checkpoint_updated_at` and `checkpoint_age_seconds`, so operators can tell when a file last advanced its checkpoint.
+- `latest_raw_event_at` and `latest_raw_event_age_seconds`, so operators can see when the file last produced raw rows.
+- `latest_error_at`, `latest_error_age_seconds`, `latest_error_kind`, and `latest_error_text`, so recent parse/schema failures stay attached to the exact file that produced them.
+- `issues`, a small additive classification list that can flag `missing_on_disk`, `stale`, `erroring`, `sqlite_wal_present`, and `sqlite_shm_present`.
+- `stale_reason`, which explains the heuristic when a file appears behind its on-disk writes.
+- `sqlite_wal_present` and `sqlite_shm_present` for `opencode_sqlite` sources only. These fields are intentionally heuristic: they report whether sibling `*.db-wal` and `*.db-shm` files are currently visible next to a base `.db` path, not whether every SQLite-based source format necessarily uses sidecars.
+
+Partial failures stay localized to the affected query surface and are shown as `query_error` or `runtime_query_error` warnings in the panel instead of collapsing the whole view.
 
 The warning chips in the detail panel are intentionally typed:
 
@@ -173,16 +186,18 @@ When a source is `unknown`:
 When a source is `warning`:
 
 1. Inspect `latest_error_kind` and `latest_error_text`.
-2. Query `ingest_errors` by `source_name` for examples.
-3. Compare raw source records against the relevant normalizer path in `crates/moraine-ingest-core/src/normalize.rs` or dispatcher path in `crates/moraine-ingest-core/src/dispatch.rs`.
-4. Treat repeated new errors after an upstream tool upgrade as likely schema drift.
+2. Open the source drilldown and sort mentally by the file-state badges: `missing`, `stale`, and `erroring` are the quickest path to the offending file.
+3. Query `ingest_errors` by `source_name` for examples.
+4. Compare raw source records against the relevant normalizer path in `crates/moraine-ingest-core/src/normalize.rs` or dispatcher path in `crates/moraine-ingest-core/src/dispatch.rs`.
+5. Treat repeated new errors after an upstream tool upgrade as likely schema drift.
 
 When a source is `error`:
 
 1. Verify the source format matches the data: `jsonl`, `session_json`, or `opencode_sqlite`.
 2. For OpenCode, confirm the configured path points at the base `.db`, not `.db-wal` or `.db-shm`.
-3. For Hermes live sessions, use `format = "session_json"` because those files are rewritten snapshots, not append-only JSONL.
-4. For Kimi, prefer the default `wire.jsonl` source unless intentionally indexing `context.jsonl`.
+3. In the drilldown, check whether the file is missing on disk, whether raw rows ever landed, and whether WAL/SHM siblings are still present.
+4. For Hermes live sessions, use `format = "session_json"` because those files are rewritten snapshots, not append-only JSONL.
+5. For Kimi, prefer the default `wire.jsonl` source unless intentionally indexing `context.jsonl`.
 
 When `query_error` is present:
 
