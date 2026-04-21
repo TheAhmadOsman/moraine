@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
+use moraine_config::IngestSource;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::UNIX_EPOCH;
@@ -48,6 +49,12 @@ pub struct SourceStatusRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceStatusSnapshot {
     pub sources: Vec<SourceStatusRow>,
+    pub query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDetailSnapshot {
+    pub source: SourceStatusRow,
     pub query_error: Option<String>,
 }
 
@@ -204,6 +211,104 @@ async fn query_source_error_stats(
     ch.query_rows(&query, None).await
 }
 
+struct SourceStatusQueryState {
+    checkpoints: BTreeMap<String, SourceCheckpointStatsRow>,
+    raw_counts: BTreeMap<String, u64>,
+    errors: BTreeMap<String, SourceErrorStatsRow>,
+    query_error: Option<String>,
+}
+
+fn option_if_non_empty(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn build_source_status_row(
+    source: &IngestSource,
+    checkpoint: Option<&SourceCheckpointStatsRow>,
+    raw_event_count: u64,
+    error: Option<&SourceErrorStatsRow>,
+    query_error: Option<&str>,
+) -> SourceStatusRow {
+    let checkpoint_count = checkpoint
+        .map(|row| row.checkpoint_count)
+        .unwrap_or_default();
+    let ingest_error_count = error.map(|row| row.ingest_error_count).unwrap_or(0);
+    let status = source_health_status(
+        source.enabled,
+        checkpoint_count,
+        raw_event_count,
+        ingest_error_count,
+        query_error,
+    );
+
+    SourceStatusRow {
+        name: source.name.clone(),
+        harness: source.harness.clone(),
+        format: source.format.clone(),
+        enabled: source.enabled,
+        glob: source.glob.clone(),
+        watch_root: source.watch_root.clone(),
+        status,
+        checkpoint_count,
+        latest_checkpoint_at: checkpoint
+            .and_then(|row| option_if_non_empty(&row.latest_checkpoint_at)),
+        raw_event_count,
+        ingest_error_count,
+        latest_error_at: error.and_then(|row| option_if_non_empty(&row.latest_error_at)),
+        latest_error_kind: error.and_then(|row| option_if_non_empty(&row.latest_error_kind)),
+        latest_error_text: error.and_then(|row| option_if_non_empty(&row.latest_error_text)),
+    }
+}
+
+async fn query_source_status_state(ch: &ClickHouseClient, db: &str) -> SourceStatusQueryState {
+    let mut query_error = None::<String>;
+    let checkpoint_rows = match query_source_checkpoint_stats(ch, db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            query_error = Some(format!("checkpoint query failed: {err}"));
+            Vec::new()
+        }
+    };
+    let raw_count_rows = match query_source_raw_counts(ch, db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            if query_error.is_none() {
+                query_error = Some(format!("raw event count query failed: {err}"));
+            }
+            Vec::new()
+        }
+    };
+    let error_rows = match query_source_error_stats(ch, db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            if query_error.is_none() {
+                query_error = Some(format!("ingest error query failed: {err}"));
+            }
+            Vec::new()
+        }
+    };
+
+    SourceStatusQueryState {
+        checkpoints: checkpoint_rows
+            .into_iter()
+            .map(|row| (row.source_name.clone(), row))
+            .collect(),
+        raw_counts: raw_count_rows
+            .into_iter()
+            .map(|row| (row.source_name, row.count))
+            .collect(),
+        errors: error_rows
+            .into_iter()
+            .map(|row| (row.source_name.clone(), row))
+            .collect(),
+        query_error,
+    }
+}
+
 pub fn source_health_status(
     enabled: bool,
     checkpoint_count: u64,
@@ -236,46 +341,7 @@ pub async fn build_source_status_snapshot(
 ) -> Result<SourceStatusSnapshot> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
-
-    let mut query_error = None::<String>;
-    let checkpoint_rows = match query_source_checkpoint_stats(&ch, &db).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            query_error = Some(format!("checkpoint query failed: {err}"));
-            Vec::new()
-        }
-    };
-    let raw_count_rows = match query_source_raw_counts(&ch, &db).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            if query_error.is_none() {
-                query_error = Some(format!("raw event count query failed: {err}"));
-            }
-            Vec::new()
-        }
-    };
-    let error_rows = match query_source_error_stats(&ch, &db).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            if query_error.is_none() {
-                query_error = Some(format!("ingest error query failed: {err}"));
-            }
-            Vec::new()
-        }
-    };
-
-    let checkpoints = checkpoint_rows
-        .into_iter()
-        .map(|row| (row.source_name.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let raw_counts = raw_count_rows
-        .into_iter()
-        .map(|row| (row.source_name, row.count))
-        .collect::<BTreeMap<_, _>>();
-    let errors = error_rows
-        .into_iter()
-        .map(|row| (row.source_name.clone(), row))
-        .collect::<BTreeMap<_, _>>();
+    let state = query_source_status_state(&ch, &db).await;
 
     let mut sources = Vec::new();
     for source in &cfg.ingest.sources {
@@ -283,51 +349,52 @@ pub async fn build_source_status_snapshot(
             continue;
         }
 
-        let checkpoint = checkpoints.get(&source.name);
-        let raw_event_count = raw_counts.get(&source.name).copied().unwrap_or(0);
-        let error = errors.get(&source.name);
-        let ingest_error_count = error.map(|row| row.ingest_error_count).unwrap_or(0);
-        let status = source_health_status(
-            source.enabled,
-            checkpoint
-                .map(|row| row.checkpoint_count)
-                .unwrap_or_default(),
-            raw_event_count,
-            ingest_error_count,
-            query_error.as_deref(),
-        );
+        let checkpoint = state.checkpoints.get(&source.name);
+        let raw_event_count = state.raw_counts.get(&source.name).copied().unwrap_or(0);
+        let error = state.errors.get(&source.name);
 
-        sources.push(SourceStatusRow {
-            name: source.name.clone(),
-            harness: source.harness.clone(),
-            format: source.format.clone(),
-            enabled: source.enabled,
-            glob: source.glob.clone(),
-            watch_root: source.watch_root.clone(),
-            status,
-            checkpoint_count: checkpoint
-                .map(|row| row.checkpoint_count)
-                .unwrap_or_default(),
-            latest_checkpoint_at: checkpoint
-                .map(|row| row.latest_checkpoint_at.clone())
-                .filter(|value| !value.is_empty()),
+        sources.push(build_source_status_row(
+            source,
+            checkpoint,
             raw_event_count,
-            ingest_error_count,
-            latest_error_at: error
-                .map(|row| row.latest_error_at.clone())
-                .filter(|value| !value.is_empty()),
-            latest_error_kind: error
-                .map(|row| row.latest_error_kind.clone())
-                .filter(|value| !value.is_empty()),
-            latest_error_text: error
-                .map(|row| row.latest_error_text.clone())
-                .filter(|value| !value.is_empty()),
-        });
+            error,
+            state.query_error.as_deref(),
+        ));
     }
 
     Ok(SourceStatusSnapshot {
         sources,
-        query_error,
+        query_error: state.query_error,
+    })
+}
+
+pub async fn build_source_detail_snapshot(
+    cfg: &AppConfig,
+    source_name: &str,
+) -> Result<SourceDetailSnapshot> {
+    let source = cfg
+        .ingest
+        .sources
+        .iter()
+        .find(|s| s.name == source_name)
+        .ok_or_else(|| anyhow!("source '{}' not found in config", source_name))?;
+
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let db = quote_identifier(&cfg.clickhouse.database);
+    let state = query_source_status_state(&ch, &db).await;
+    let checkpoint = state.checkpoints.get(source_name);
+    let raw_event_count = state.raw_counts.get(source_name).copied().unwrap_or(0);
+    let error = state.errors.get(source_name);
+
+    Ok(SourceDetailSnapshot {
+        source: build_source_status_row(
+            source,
+            checkpoint,
+            raw_event_count,
+            error,
+            state.query_error.as_deref(),
+        ),
+        query_error: state.query_error,
     })
 }
 
@@ -651,6 +718,7 @@ pub async fn build_source_errors_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_config::IngestSource;
 
     #[test]
     fn source_health_status_matches_cli_semantics() {
@@ -708,5 +776,80 @@ mod tests {
     #[test]
     fn escape_literal_escapes_quotes() {
         assert_eq!(escape_literal("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn build_source_status_row_keeps_shared_metadata() {
+        let source = IngestSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            enabled: true,
+            glob: "/tmp/opencode.db".to_string(),
+            watch_root: "/tmp".to_string(),
+            format: "opencode_sqlite".to_string(),
+        };
+        let checkpoint = SourceCheckpointStatsRow {
+            source_name: source.name.clone(),
+            checkpoint_count: 3,
+            latest_checkpoint_at: "2026-04-20 10:15:00".to_string(),
+        };
+        let error = SourceErrorStatsRow {
+            source_name: source.name.clone(),
+            ingest_error_count: 2,
+            latest_error_at: "2026-04-20 10:20:00".to_string(),
+            latest_error_kind: "schema_drift".to_string(),
+            latest_error_text: "missing field".to_string(),
+        };
+
+        let row = build_source_status_row(&source, Some(&checkpoint), 42, Some(&error), None);
+
+        assert_eq!(row.status, SourceHealthStatus::Warning);
+        assert_eq!(row.harness, "opencode");
+        assert_eq!(row.format, "opencode_sqlite");
+        assert_eq!(row.watch_root, "/tmp");
+        assert_eq!(row.glob, "/tmp/opencode.db");
+        assert_eq!(row.checkpoint_count, 3);
+        assert_eq!(
+            row.latest_checkpoint_at.as_deref(),
+            Some("2026-04-20 10:15:00")
+        );
+        assert_eq!(row.raw_event_count, 42);
+        assert_eq!(row.ingest_error_count, 2);
+        assert_eq!(row.latest_error_at.as_deref(), Some("2026-04-20 10:20:00"));
+        assert_eq!(row.latest_error_kind.as_deref(), Some("schema_drift"));
+        assert_eq!(row.latest_error_text.as_deref(), Some("missing field"));
+    }
+
+    #[test]
+    fn build_source_status_row_filters_empty_latest_metadata() {
+        let source = IngestSource {
+            name: "idle".to_string(),
+            harness: "codex".to_string(),
+            enabled: true,
+            glob: "*.jsonl".to_string(),
+            watch_root: "/logs".to_string(),
+            format: "jsonl".to_string(),
+        };
+        let checkpoint = SourceCheckpointStatsRow {
+            source_name: source.name.clone(),
+            checkpoint_count: 0,
+            latest_checkpoint_at: String::new(),
+        };
+        let error = SourceErrorStatsRow {
+            source_name: source.name.clone(),
+            ingest_error_count: 0,
+            latest_error_at: String::new(),
+            latest_error_kind: String::new(),
+            latest_error_text: String::new(),
+        };
+
+        let row =
+            build_source_status_row(&source, Some(&checkpoint), 0, Some(&error), Some("partial"));
+
+        assert_eq!(row.status, SourceHealthStatus::Unknown);
+        assert!(row.latest_checkpoint_at.is_none());
+        assert!(row.latest_error_at.is_none());
+        assert!(row.latest_error_kind.is_none());
+        assert!(row.latest_error_text.is_none());
     }
 }

@@ -1,33 +1,62 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { fetchSourceFiles, fetchSourceErrors } from '../api/client';
-  import type { SourceFilesResponse, SourceErrorsResponse, SourceHealthStatus } from '../types/api';
+  import { fetchSourceDetail, fetchSourceErrors, fetchSourceFiles } from '../api/client';
+  import type {
+    SourceDetailResponse,
+    SourceErrorsResponse,
+    SourceFilesResponse,
+    SourceHealthStatus,
+  } from '../types/api';
 
   export let sourceName: string | null = null;
 
+  let summaryData: SourceDetailResponse | null = null;
+  let summaryError: string | null = null;
   let filesData: SourceFilesResponse | null = null;
   let filesError: string | null = null;
   let errorsData: SourceErrorsResponse | null = null;
   let errorsError: string | null = null;
   let activeTab: 'files' | 'errors' = 'files';
   let loading = false;
+  let loadId = 0;
 
   async function load(source: string) {
+    const currentLoadId = ++loadId;
     loading = true;
+    summaryData = null;
+    filesData = null;
+    errorsData = null;
+    summaryError = null;
     filesError = null;
     errorsError = null;
 
-    try {
-      filesData = await fetchSourceFiles(source);
-    } catch (err) {
-      filesError = err instanceof Error ? err.message : String(err);
+    const [summaryResult, filesResult, errorsResult] = await Promise.allSettled([
+      fetchSourceDetail(source),
+      fetchSourceFiles(source),
+      fetchSourceErrors(source, 50),
+    ]);
+
+    if (currentLoadId !== loadId) {
+      return;
+    }
+
+    if (summaryResult.status === 'fulfilled') {
+      summaryData = summaryResult.value;
+    } else {
+      summaryError = summaryResult.reason instanceof Error ? summaryResult.reason.message : String(summaryResult.reason);
+      summaryData = null;
+    }
+
+    if (filesResult.status === 'fulfilled') {
+      filesData = filesResult.value;
+    } else {
+      filesError = filesResult.reason instanceof Error ? filesResult.reason.message : String(filesResult.reason);
       filesData = null;
     }
 
-    try {
-      errorsData = await fetchSourceErrors(source, 50);
-    } catch (err) {
-      errorsError = err instanceof Error ? err.message : String(err);
+    if (errorsResult.status === 'fulfilled') {
+      errorsData = errorsResult.value;
+    } else {
+      errorsError = errorsResult.reason instanceof Error ? errorsResult.reason.message : String(errorsResult.reason);
       errorsData = null;
     }
 
@@ -53,10 +82,20 @@
     return `${parseFloat((n / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
   }
 
+  function formatCount(n: number): string {
+    return n.toLocaleString();
+  }
+
   function close() {
+    loadId += 1;
+    loading = false;
     sourceName = null;
+    summaryData = null;
+    summaryError = null;
     filesData = null;
+    filesError = null;
     errorsData = null;
+    errorsError = null;
   }
 </script>
 
@@ -87,6 +126,78 @@
         Errors ({errorsData?.errors.length ?? 0})
       </button>
     </div>
+
+    {#if summaryError}
+      <div class="sd-warn" role="status">Summary: {summaryError}</div>
+    {:else if summaryData}
+      {#if summaryData.query_error}
+        <div class="sd-warn" role="status">Summary query: {summaryData.query_error}</div>
+      {/if}
+      <div class="sd-summary">
+        <div class="sd-summary-main">
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Status</div>
+            <div class="sd-summary-value">
+              <span
+                class="sd-status"
+                class:sd-status-good={statusTone(summaryData.source.status) === 'good'}
+                class:sd-status-warn={statusTone(summaryData.source.status) === 'warn'}
+                class:sd-status-bad={statusTone(summaryData.source.status) === 'bad'}
+              >
+                {summaryData.source.status}
+              </span>
+            </div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Harness</div>
+            <div class="sd-summary-value mono">{summaryData.source.harness}</div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Format</div>
+            <div class="sd-summary-value mono">{summaryData.source.format}</div>
+          </div>
+          <div class="sd-summary-item sd-summary-wide">
+            <div class="sd-summary-label">Watch Root</div>
+            <div class="sd-summary-value mono sd-summary-path" title={summaryData.source.watch_root}>
+              {summaryData.source.watch_root}
+            </div>
+          </div>
+          <div class="sd-summary-item sd-summary-wide">
+            <div class="sd-summary-label">Glob</div>
+            <div class="sd-summary-value mono sd-summary-path" title={summaryData.source.glob}>
+              {summaryData.source.glob}
+            </div>
+          </div>
+        </div>
+
+        <div class="sd-summary-side">
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Counts</div>
+            <div class="sd-summary-stack mono">
+              <span>Raw: {formatCount(summaryData.source.raw_event_count)}</span>
+              <span>Checkpoints: {formatCount(summaryData.source.checkpoint_count)}</span>
+              <span>Errors: {formatCount(summaryData.source.ingest_error_count)}</span>
+            </div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Latest Checkpoint</div>
+            <div class="sd-summary-value mono">{summaryData.source.latest_checkpoint_at ?? '—'}</div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Latest Error</div>
+            {#if summaryData.source.latest_error_at || summaryData.source.latest_error_kind || summaryData.source.latest_error_text}
+              <div class="sd-summary-stack">
+                <span class="mono">{summaryData.source.latest_error_at ?? '—'}</span>
+                <span class="mono">{summaryData.source.latest_error_kind ?? '—'}</span>
+                <span class="sd-summary-error-text">{summaryData.source.latest_error_text ?? '—'}</span>
+              </div>
+            {:else}
+              <div class="sd-summary-value">—</div>
+            {/if}
+          </div>
+        </div>
+      </div>
+    {/if}
 
     {#if loading}
       <div class="mv-empty">Loading…</div>
@@ -167,6 +278,61 @@
 {/if}
 
 <style>
+  .sd-summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(16rem, 1fr);
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .sd-summary-main,
+  .sd-summary-side {
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .sd-summary-main {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .sd-summary-item {
+    min-width: 0;
+    padding: 0.625rem 0.75rem;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--panel-alt);
+  }
+
+  .sd-summary-wide {
+    grid-column: 1 / -1;
+  }
+
+  .sd-summary-label {
+    margin-bottom: 0.375rem;
+    color: var(--subtle);
+    font-size: 0.6875rem;
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .sd-summary-value,
+  .sd-summary-stack {
+    font-size: 0.8125rem;
+    color: var(--text);
+  }
+
+  .sd-summary-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .sd-summary-path,
+  .sd-summary-error-text {
+    overflow-wrap: anywhere;
+  }
+
   .sd-tabs {
     display: flex;
     gap: 0.25rem;
@@ -269,6 +435,16 @@
     color: var(--bad);
   }
 
+  .sd-status-good {
+    background: rgba(22, 163, 74, 0.12);
+    color: var(--good);
+  }
+
+  .sd-status-bad {
+    background: rgba(190, 18, 60, 0.1);
+    color: var(--bad);
+  }
+
   .sd-errors {
     display: flex;
     flex-direction: column;
@@ -343,5 +519,15 @@
     text-align: center;
     color: var(--subtle);
     font-size: 0.875rem;
+  }
+
+  @media (max-width: 900px) {
+    .sd-summary {
+      grid-template-columns: 1fr;
+    }
+
+    .sd-summary-main {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

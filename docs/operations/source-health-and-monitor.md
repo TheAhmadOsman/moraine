@@ -56,6 +56,7 @@ The monitor backend exposes:
 
 ```http
 GET /api/sources
+GET /api/sources/:source
 ```
 
 Successful responses use HTTP 200 even when one of the ClickHouse table queries fails after the config was loaded. In that partial state, configured sources are still returned and `query_error` describes the first query failure that occurred. This is deliberate: a dashboard that can show configured sources plus an explicit partial-query warning is more useful than a blanket 503 with no inventory. [src: crates/moraine-monitor-core/src/lib.rs, crates/moraine-source-status/src/lib.rs]
@@ -72,6 +73,33 @@ Top-level response shape:
 
 The endpoint can still return a non-200 response for failures before partial querying is possible, such as invalid ClickHouse client construction from config.
 
+`GET /api/sources/:source` returns the shared source summary for one configured source using the same status classifier and partial-query behavior as `GET /api/sources`:
+
+```json
+{
+  "ok": true,
+  "source": {
+    "name": "opencode",
+    "harness": "opencode",
+    "format": "opencode_sqlite",
+    "enabled": true,
+    "glob": "~/.local/share/opencode/opencode.db",
+    "watch_root": "~/.local/share/opencode",
+    "status": "warning",
+    "checkpoint_count": 1,
+    "latest_checkpoint_at": "2026-04-20 10:15:00",
+    "raw_event_count": 128,
+    "ingest_error_count": 2,
+    "latest_error_at": "2026-04-20 10:18:00",
+    "latest_error_kind": "schema_drift",
+    "latest_error_text": "missing field"
+  },
+  "query_error": null
+}
+```
+
+If one of the ClickHouse reads fails, the monitor still returns the configured source plus the first `query_error` it saw instead of failing the entire drilldown.
+
 ## Monitor UI
 
 The Svelte monitor fetches `/api/sources` on the fast polling cadence alongside health and status. The `SourcesStrip` is intentionally compact: it shows one chip per configured source with the shared health status label and a query-warning chip when `query_error` is present. [src: web/monitor/src/App.svelte, web/monitor/src/lib/api/client.ts, web/monitor/src/lib/components/SourcesStrip.svelte, web/monitor/src/lib/types/api.ts]
@@ -82,6 +110,8 @@ The strip is not a file browser and does not replace the session explorer. Its j
 - A source has no checkpoints or raw rows yet.
 - A source has ingest errors.
 - ClickHouse source-health queries are degraded.
+
+Selecting a source opens the detail panel. The drilldown now keeps a compact source summary visible above the files/errors tabs so operators can still see status, harness, format, watch root, glob, counts, and latest checkpoint/error metadata while they inspect per-file state or recent ingest failures. The summary is loaded from `GET /api/sources/:source`; the existing `GET /api/sources/:source/files` and `GET /api/sources/:source/errors` endpoints remain focused on file and error detail. Partial failures stay localized to the affected query surface and are shown as `query_error` warnings in the panel instead of collapsing the whole view.
 
 ## Status Semantics
 

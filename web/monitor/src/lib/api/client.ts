@@ -1,4 +1,13 @@
-import type { AnalyticsRangeKey, AnalyticsResponse, HealthResponse, SourcesResponse, SourceFilesResponse, SourceErrorsResponse, StatusResponse } from '../types/api';
+import type {
+  AnalyticsRangeKey,
+  AnalyticsResponse,
+  HealthResponse,
+  SourceDetailResponse,
+  SourceErrorsResponse,
+  SourceFilesResponse,
+  SourcesResponse,
+  StatusResponse,
+} from '../types/api';
 
 interface ErrorPayload {
   error?: string;
@@ -44,6 +53,10 @@ export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsRespo
 
 export function fetchSources(): Promise<SourcesResponse> {
   return requestJson<SourcesResponse>('/api/sources');
+}
+
+export function fetchSourceDetail(source: string): Promise<SourceDetailResponse> {
+  return requestJson<SourceDetailResponse>(`/api/sources/${encodeURIComponent(source)}`);
 }
 
 export function fetchSourceFiles(source: string): Promise<SourceFilesResponse> {

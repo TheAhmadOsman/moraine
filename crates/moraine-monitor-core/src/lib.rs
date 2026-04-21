@@ -20,7 +20,8 @@ use tokio::time::Instant;
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_source_status::{
-    build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
+    build_source_detail_snapshot, build_source_errors_snapshot, build_source_files_snapshot,
+    build_source_status_snapshot,
 };
 
 #[derive(Clone)]
@@ -73,6 +74,7 @@ pub async fn run_server(
         .route("/api/tables/:table", get(api_table_rows))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sources", get(api_sources))
+        .route("/api/sources/:source", get(api_source_detail))
         .route("/api/sources/:source/files", get(api_source_files))
         .route("/api/sources/:source/errors", get(api_source_errors))
         .fallback(get(static_fallback))
@@ -715,9 +717,31 @@ async fn api_sources(State(state): State<AppState>) -> Response {
     }
 }
 
+fn source_detail_payload(snapshot: moraine_source_status::SourceDetailSnapshot) -> Value {
+    json!({
+        "ok": true,
+        "source": snapshot.source,
+        "query_error": snapshot.query_error,
+    })
+}
+
 #[derive(Deserialize)]
 struct SourceErrorsQuery {
     limit: Option<u32>,
+}
+
+async fn api_source_detail(Path(source): Path<String>, State(state): State<AppState>) -> Response {
+    match build_source_detail_snapshot(&state.cfg, &source).await {
+        Ok(snapshot) => json_response(source_detail_payload(snapshot), StatusCode::OK),
+        Err(error) => {
+            let status = if error.to_string().contains("not found in config") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(json!({"ok": false, "error": error.to_string()}), status)
+        }
+    }
 }
 
 async fn api_source_files(Path(source): Path<String>, State(state): State<AppState>) -> Response {
@@ -1578,6 +1602,7 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use moraine_source_status::{SourceDetailSnapshot, SourceHealthStatus, SourceStatusRow};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1658,6 +1683,43 @@ mod tests {
         assert_eq!(payload["version"], json!("24.8"));
         assert_eq!(payload["ping_ms"], json!(8.25));
         assert_eq!(payload["error"], json!("ping failed"));
+    }
+
+    #[test]
+    fn source_detail_payload_serializes_summary_and_partial_error() {
+        let payload = source_detail_payload(SourceDetailSnapshot {
+            source: SourceStatusRow {
+                name: "opencode".to_string(),
+                harness: "opencode".to_string(),
+                format: "opencode_sqlite".to_string(),
+                enabled: true,
+                glob: "/tmp/opencode.db".to_string(),
+                watch_root: "/tmp".to_string(),
+                status: SourceHealthStatus::Warning,
+                checkpoint_count: 3,
+                latest_checkpoint_at: Some("2026-04-20 10:15:00".to_string()),
+                raw_event_count: 42,
+                ingest_error_count: 1,
+                latest_error_at: Some("2026-04-20 10:20:00".to_string()),
+                latest_error_kind: Some("schema_drift".to_string()),
+                latest_error_text: Some("missing field".to_string()),
+            },
+            query_error: Some("checkpoint query failed: timeout".to_string()),
+        });
+
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(payload["source"]["name"], json!("opencode"));
+        assert_eq!(payload["source"]["status"], json!("warning"));
+        assert_eq!(payload["source"]["watch_root"], json!("/tmp"));
+        assert_eq!(payload["source"]["checkpoint_count"], json!(3));
+        assert_eq!(
+            payload["source"]["latest_error_kind"],
+            json!("schema_drift")
+        );
+        assert_eq!(
+            payload["query_error"],
+            json!("checkpoint query failed: timeout")
+        );
     }
 
     #[test]

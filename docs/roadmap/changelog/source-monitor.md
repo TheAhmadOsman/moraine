@@ -17,9 +17,11 @@ Implements the first vertical slice of source-health diagnostics across API, CLI
 
 - **`crates/moraine-monitor-core`**
   - New HTTP endpoints:
+    - `GET /api/sources/:source`
     - `GET /api/sources/:source/files`
     - `GET /api/sources/:source/errors?limit=N`
   - Returns 404 when source is not in config, 503 on ClickHouse failure.
+  - Source detail responses now keep the shared source summary and partial-query warning localized to the selected source.
 
 - **`apps/moraine`**
   - New CLI subcommands:
@@ -31,16 +33,17 @@ Implements the first vertical slice of source-health diagnostics across API, CLI
 ### Frontend
 
 - **`web/monitor/src/lib/types/api.ts`**
-  - Added `SourceFileRow`, `SourceFilesResponse`, `SourceErrorRow`, `SourceErrorsResponse`.
+  - Added `SourceDetailResponse`, `SourceFileRow`, `SourceFilesResponse`, `SourceErrorRow`, `SourceErrorsResponse`.
 
 - **`web/monitor/src/lib/api/client.ts`**
-  - Added `fetchSourceFiles(source)` and `fetchSourceErrors(source, limit)`.
+  - Added `fetchSourceDetail(source)`, `fetchSourceFiles(source)`, and `fetchSourceErrors(source, limit)`.
 
 - **`web/monitor/src/lib/components/SourceDetail.svelte`** (new)
-  - Detail panel with **Files** and **Errors** tabs.
+  - Detail panel with a compact source summary plus **Files** and **Errors** tabs.
+  - Summary shows shared status, harness, format, watch root, glob, counts, and latest checkpoint/error metadata.
   - Files tab: sticky-header table with path, size, modified time, raw events, checkpoint offset, status.
   - Errors tab: error cards with time, kind, file, text, and optional raw fragment.
-  - Close button dismisses the panel; loading and empty states handled.
+  - Close button now invalidates in-flight loads so stale drilldown results do not repopulate a dismissed panel.
 
 - **`web/monitor/src/lib/components/SourcesStrip.svelte`**
   - Source chips are now clickable buttons (disabled for error/none states).

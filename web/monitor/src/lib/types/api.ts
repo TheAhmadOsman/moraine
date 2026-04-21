@@ -103,6 +103,12 @@ export interface SourcesResponse {
   query_error?: string;
 }
 
+export interface SourceDetailResponse {
+  ok: boolean;
+  source: SourceHealth;
+  query_error?: string;
+}
+
 export interface SourceFileRow {
   path: string;
   size_bytes: number;
