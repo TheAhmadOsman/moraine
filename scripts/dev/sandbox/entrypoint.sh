@@ -167,8 +167,11 @@ log "registered clickhouse sentinel pid ${ch_sentinel_pid} (real CH is in siblin
 # ---------------------------------------------------------------------------
 
 log "bringing up moraine stack against ${CH_URL}"
-log "running: moraine up --config $MORAINE_CONFIG_PATH"
-if ! "$MORAINE_BIN" up --config "$MORAINE_CONFIG_PATH"; then
+# The sandbox ClickHouse database is disposable and created by the sibling
+# compose container before migrations run. Bypass the host backup gate here so
+# first boot can initialize an empty, isolated database.
+log "running: moraine up --config $MORAINE_CONFIG_PATH --no-backup-check"
+if ! "$MORAINE_BIN" up --config "$MORAINE_CONFIG_PATH" --no-backup-check; then
     warn "'moraine up' failed"
     dump_logs
     exit 1

@@ -109,7 +109,8 @@ project_name_for() {
 }
 
 config_dir_for() {
-    printf '/tmp/%s%s' "$PROJECT_PREFIX" "$1"
+    local root="${MORAINE_SANDBOX_CONFIG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/moraine-sandbox}"
+    printf '%s/%s%s' "$root" "$PROJECT_PREFIX" "$1"
 }
 
 check_docker() {
@@ -725,9 +726,11 @@ cmd_down() {
                 down_one "$id"
             done
         fi
-        # Sweep any stray /tmp/moraine-sandbox-* dirs (e.g. from failed ups).
+        # Sweep any stray generated config dirs (e.g. from failed ups). The
+        # /tmp location is the historical default, retained for cleanup only.
         shopt -s nullglob
-        local leftover=(/tmp/${PROJECT_PREFIX}*)
+        local config_root="${MORAINE_SANDBOX_CONFIG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/moraine-sandbox}"
+        local leftover=("${config_root}"/${PROJECT_PREFIX}* /tmp/${PROJECT_PREFIX}*)
         shopt -u nullglob
         if [[ "${#leftover[@]}" -gt 0 ]]; then
             for d in "${leftover[@]}"; do
@@ -833,7 +836,7 @@ USAGE:
 COMMANDS:
     up [--id <id>] [--mount-host-sessions] [--rebuild] [--quiet|-q]
          Bring up a new sandbox. Picks random host ports and generates
-         a moraine.toml under /tmp/moraine-sandbox-<id>/. The first boot
+         a moraine.toml under the sandbox config root. The first boot
          compiles the workspace inside the container (takes a few minutes
          cold, seconds warm). --rebuild forces a fresh cargo build even
          when the binaries volume already has prior output. --quiet emits
@@ -852,7 +855,7 @@ COMMANDS:
                        the bootstrap cargo build output.
 
     down <id>          Stop + remove the container, named volumes, and
-                       the /tmp/moraine-sandbox-<id>/ config dir.
+                       the generated sandbox config dir.
     down --all         Do the same for every sandbox owned by this user.
 
     list               List sandboxes with their status and monitor URL.
@@ -876,6 +879,9 @@ ENVIRONMENT:
                                 session_*.json rewritten in place — the
                                 sandbox ingests them via the session_json
                                 format path.
+    MORAINE_SANDBOX_CONFIG_ROOT override host directory used for generated
+                                sandbox config. Defaults to
+                                ${XDG_CACHE_HOME:-$HOME/.cache}/moraine-sandbox.
 EOF
 }
 

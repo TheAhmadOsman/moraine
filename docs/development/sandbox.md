@@ -74,7 +74,7 @@ and removed on `down`.
 | `$SANDBOX_REPO_ROOT` (active worktree) | `/repo` | ro | cargo reads from here; target dir is elsewhere |
 | `$SCCACHE_DIR` (host, default `~/.cache/sccache`) | `/home/moraine/.cache/sccache` | rw | shared with host and all other sandboxes |
 | `web/monitor/dist` | `/opt/moraine/web` | ro | built on the host (bun); currently not in-container |
-| Generated config dir (`/tmp/moraine-sandbox-<id>/`) | `/sandbox` | ro | `moraine.toml` + fixture dirs |
+| Generated config dir (`${XDG_CACHE_HOME:-$HOME/.cache}/moraine-sandbox/moraine-sandbox-<id>/` by default) | `/sandbox` | ro | `moraine.toml` + fixture dirs |
 | `scripts/dev/sandbox/entrypoint.sh` | `/usr/local/bin/entrypoint.sh` | ro | so edits to the entrypoint don't require an image rebuild |
 
 `--mount-host-sessions` layers on `compose.sessions.yaml` to also
@@ -83,6 +83,11 @@ bind-mount `~/.codex/sessions`, `~/.claude/projects`, and
 config at `/host/hermes/sessions/session_*.json` with
 `format = "session_json"` so the sandbox exercises the
 rewrite-in-place live-session path against real host data.
+
+The generated config root defaults to a user cache directory instead of
+`/tmp`. This matters on macOS/Colima because the Docker daemon runs inside a
+VM that does not necessarily see macOS `/tmp` bind mounts, even though it can
+mount paths under the user home directory.
 
 ## Boot flow
 
@@ -93,7 +98,7 @@ moraine-sandbox up
 2. generate sandbox id (sb-xxxxxx) unless --id
 3. ensure monitor frontend is built (bun build on host)
 4. pick random host ports (monitor :8080, CH :8123 / :9000)
-5. write /tmp/moraine-sandbox-<id>/moraine.toml
+5. write `moraine.toml` under the sandbox config root
 6. export env, `docker compose up -d`
         ▼
 7. inside moraine container, entrypoint.sh:
@@ -103,11 +108,16 @@ moraine-sandbox up
         cd /repo && cargo build --workspace --locked
         install the four binaries into /opt/moraine/bin
       (else: reuse the volume's prior output)
-   d. moraine up --config /sandbox/moraine.toml
+   d. moraine up --config /sandbox/moraine.toml --no-backup-check
    e. tail logs (keeps PID 1 alive)
         ▼
 8. host CLI waits on docker health (up to 900s); prints summary
 ```
+
+The backup gate is bypassed only inside the sandbox. The sandbox database is a
+new disposable ClickHouse volume that exists before migrations because the
+sibling ClickHouse container creates it during startup. Host installs should
+still create and verify backups before migrations or destructive operations.
 
 The cargo build step is what makes the first boot slow. Subsequent
 boots of the same sandbox id skip the build entirely; fresh sandboxes
@@ -166,10 +176,10 @@ for id disambiguation.
 
 ### `down <id>` / `down --all`
 
-`docker compose down -v --remove-orphans` for the project, plus
-`rm -rf /tmp/moraine-sandbox-<id>/`. `--all` iterates over every
-sandbox owned by the current Docker context and sweeps any stray
-`/tmp/moraine-sandbox-*` dirs left by failed ups.
+`docker compose down -v --remove-orphans` for the project, plus removal of the
+generated config directory. `--all` iterates over every sandbox owned by the
+current Docker context and sweeps stray generated config dirs left by failed
+ups, including the historical `/tmp/moraine-sandbox-*` location.
 
 **Agents must `down` before reporting task complete.** Leftover
 sandboxes leak ClickHouse data (not small) and can exhaust ports
@@ -200,7 +210,9 @@ container inherits `20G` from its env unless overridden.
 
 ## Config generation
 
-`moraine-sandbox up` writes `/tmp/moraine-sandbox-<id>/moraine.toml`.
+`moraine-sandbox up` writes
+`${XDG_CACHE_HOME:-$HOME/.cache}/moraine-sandbox/moraine-sandbox-<id>/moraine.toml`
+by default.
 It is regenerated on every `up` and never edited by hand. Keys:
 
 - `[clickhouse] url = "http://clickhouse:8123"`, `database = "moraine"` —
@@ -252,12 +264,13 @@ sandboxes at once without negotiating.
 
 ## Lifecycle / cleanup
 
-- Everything lives in two places on the host: `/tmp/moraine-sandbox-<id>/`
-  (generated config) and the project's named volumes.
+- Everything lives in two places on the host: the generated config directory
+  under `${XDG_CACHE_HOME:-$HOME/.cache}/moraine-sandbox/` by default and the
+  project's named volumes.
 - `moraine-sandbox down <id>` runs `docker compose down -v` for the
   project and `rm -rf` on the config dir.
 - `moraine-sandbox down --all` does the same for every sandbox and
-  sweeps stray `/tmp/moraine-sandbox-*` dirs left by failed ups.
+  sweeps stray generated config dirs left by failed ups.
 - Agents **must** call `down` before reporting their task complete.
 
 ## Multi-sandbox
