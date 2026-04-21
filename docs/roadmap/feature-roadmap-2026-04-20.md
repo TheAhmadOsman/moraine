@@ -1,7 +1,8 @@
 # Moraine Feature Roadmap - April 20, 2026
 
 This roadmap is a product and engineering backlog for Moraine as it exists on
-April 20, 2026. It assumes Moraine remains local-first: local agent traces are
+April 20, 2026, after `8377a8b feat(cli): add verified backup and restore
+planning`. It assumes Moraine remains local-first: local agent traces are
 ingested into local ClickHouse, normalized into deterministic event/session
 tables, searched through BM25 and conversation APIs, exposed through MCP, and
 operated through CLI plus monitor UI.
@@ -25,23 +26,25 @@ This roadmap is based on the current repository docs and schema, especially:
 - [MCP agent interface](../mcp/agent-interface.md)
 - [Search indexing and retrieval](../search/indexing-and-retrieval.md)
 - [Monitor and source health](../operations/source-health-and-monitor.md)
+- [Backup and restore](../operations/backup-and-restore.md)
 - [Privacy and redaction](../operations/privacy-and-redaction.md)
 - [Design tradeoffs](../architecture/design-tradeoffs.md)
 
-External references checked for current best practices:
+External references checked for current best practices as of April 20, 2026:
 
 - [MCP 2025-11-25 server feature overview](https://modelcontextprotocol.io/specification/2025-11-25/server/index)
 - [MCP 2025-11-25 tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 - [MCP 2025-11-25 pagination](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/pagination)
 - [MCP 2025-11-25 authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - [MCP security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices)
+- [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/)
 - [SQLite write-ahead logging](https://www.sqlite.org/wal.html)
 - [ClickHouse TTL](https://clickhouse.com/docs/guides/developer/ttl)
 - [ClickHouse data skipping indexes](https://clickhouse.com/docs/optimize/skipping-indexes)
 - [ClickHouse incremental materialized views](https://clickhouse.com/docs/materialized-view/incremental-materialized-view)
 - [ClickHouse projections as secondary indexes, 2026](https://clickhouse.com/blog/projections-secondary-indices)
 - [ClickHouse 26.3 release notes, 2026](https://clickhouse.com/blog/clickhouse-release-26-03)
-- [OpenTelemetry documentation](https://opentelemetry.io/docs/)
+- [OpenTelemetry semantic conventions 1.40.0](https://opentelemetry.io/docs/specs/semconv/)
 - [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/)
 - [OWASP LLM01 Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
 - [SLSA v1.2](https://slsa.dev/spec/v1.2/)
@@ -87,24 +90,46 @@ Moraine should become a dependable local memory system for agentic work:
 - Shared CLI and monitor source-health semantics.
 - MCP tools with strict schemas, pagination, safety metadata, and prose/full
   response modes.
-- Ingest-time privacy redaction with explicit non-retroactive behavior.
+- Ingest-time privacy redaction with explicit non-retroactive behavior and
+  reversible AES-256-GCM `encrypt_raw` support.
+- Verified backup manifests with real `JSONEachRow` table exports, checksums,
+  source inventory, migration metadata, and dry-run restore planning.
 - Sandbox-based QA path for ingest, monitor, MCP, and schema changes.
 - OpenCode WAL sibling mapping and schema drift visibility.
+
+## Current Implementation Snapshot
+
+The roadmap intentionally includes both landed foundations and remaining work.
+As of `8377a8b`, these foundations are already in `main`:
+
+| Area | Landed foundation | Remaining roadmap work |
+|---|---|---|
+| R01 backup/restore | `backup create/list/verify` exports real ClickHouse `JSONEachRow` files and verifies checksums; `restore` produces a dry-run plan. | Live restore execution, staging database restore, post-restore integrity checks, and sandbox e2e proof. |
+| R08 OpenCode hardening | WAL sibling watcher mapping, strict watermark paging, schema drift errors with `PRAGMA user_version`, and fixtures. | Broader OpenCode schema compatibility matrix and user-facing drift remediation. |
+| R09 privacy encryption | AES-256-GCM envelopes, env/file key loading, privacy metadata columns, and fail-closed missing-key behavior. | Key rotation, decrypt/export admin workflow, key backup checks, and re-encryption policy. |
+| R11/R12 MCP safety | Strict input schemas, output schemas, `safety_mode`, safety metadata, prose preamble, and regression tests. | Broader client conformance fixtures, MCP resources/prompts, and hostile-memory corpus tests. |
+| C02/C03 imports/config | Import-profile preview/status, config source discovery, validation, and interactive wizard foundations. | Live sync execution, mirror manifests, scheduling, and conflict/error surfacing. |
+| C04 source health | Shared CLI/monitor source status, `/api/sources`, `/api/sources/:source/files`, and `/api/sources/:source/errors`. | Rich source drilldown UI, file timelines, WAL visibility, and remediation actions. |
+| C11 archives | Portable archive preview/import/verify contract. | Live portable export/import and compatibility validation across versions. |
 
 ## Highest-Leverage Sequence
 
 This is the recommended order if we want the fastest path to a richer product
 without building on shaky operations:
 
-1. P0 backup/restore, reindex, and doctor commands.
-2. P0 source diagnostics, OpenCode hardening, and source drift reports.
-3. P0 privacy encryption/key management and redaction migration workflow.
-4. P0 MCP safety/conformance regression suite.
+1. Finish the P0 operational safety loop: live restore, clean reindex, deep
+   doctor, migration gates, and backup-before-destructive-work enforcement.
+2. Add the P0 ingest durability loop: disk-backed retry spool, spool privacy
+   policy, checkpoint audit, and source drift reports.
+3. Finish the P0 privacy loop: policy audit, key rotation, re-encryption,
+   decrypt/export admin path, and monitor visibility.
+4. Expand P0 MCP safety into a client conformance corpus and hostile-memory
+   regression suite.
 5. P1 monitor session explorer and source drilldown.
 6. P1 retrieval evaluation, field weighting, phrase/proximity search, and query
    feedback loop.
-7. P1 MCP resources/prompts and saved retrieval workflows.
-8. P1 remote import profiles and sync automation.
+7. P1 remote import sync automation and source-adapter boundaries.
+8. P1 MCP resources/prompts and saved retrieval workflows.
 9. P2 summaries, curated memory, graph/entity layer, alerts, and OTel export.
 10. P3 hosted/team/multi-node modes after local mode is operationally mature.
 
@@ -165,18 +190,24 @@ without building on shaky operations:
 Priority: P0  
 Effort: L
 
-Implement `moraine backup create`, `moraine backup list`, `moraine backup verify`,
-and `moraine restore --dry-run`. A backup should include ClickHouse data, schema
-version, migration checksums, resolved config, source inventory, binary/runtime
-version, and a manifest with row counts and checksums.
+Status: foundation landed in `8377a8b`, not complete.
 
-First slice:
+Moraine now has real `moraine backup create`, `moraine backup list`,
+`moraine backup verify`, and `moraine restore --dry-run` commands. The shipped
+backup includes ClickHouse table exports, migration metadata, source inventory,
+and per-table row counts plus checksums. The remaining work is to turn restore
+planning into a safe, tested restore execution path.
 
-- Add a local backup directory under `~/.moraine/backups/`.
-- Support cold backups when the stack is stopped and online backups when the
-  ClickHouse version/config supports it.
-- Write a JSON manifest and a human-readable summary.
-- Add `verify` that can compare row counts, schema version, and table existence.
+Next slices:
+
+- Keep `~/.moraine/backups/` as the default local backup directory.
+- Add restore execution into a staging database and validate counts before any
+  in-place swap or destructive reset.
+- Add backup age/freshness checks to reindex, migration, and privacy-reprocess
+  workflows.
+- Add explicit compatibility checks for manifest version, Moraine version,
+  ClickHouse pin, and required migrations.
+- Add sandbox e2e restore coverage.
 
 Edge cases:
 
@@ -187,11 +218,16 @@ Edge cases:
 - Backup is from an older schema or older ClickHouse pin.
 - Restore target already has data.
 - Privacy key material exists and must not be accidentally omitted or exposed.
+- Partial backup directories exist because export failed before `manifest.json`
+  was written.
+- Derived tables are missing because the source installation predates a search
+  or telemetry feature.
 
 Acceptance criteria:
 
 - Backup and restore are documented and sandbox-tested.
-- Restore can produce a clean database with matching table counts.
+- Restore can produce a clean database with matching table counts and doctor
+  output.
 - `restore --dry-run` refuses incompatible or incomplete backups before changes.
 
 ### R02 - Clean Reindex and Search Rebuild Orchestration
@@ -407,16 +443,22 @@ Acceptance criteria:
 Priority: P0  
 Effort: XL
 
-`encrypt_raw` is currently a marker/hash placeholder. Replace it with real
-envelope encryption and explicit key lifecycle documentation.
+Status: foundation landed in `11a0ca7`, not complete.
 
-First slice:
+`encrypt_raw` now performs real AES-256-GCM envelope encryption with key IDs,
+env/file key loading, fail-closed missing-key behavior, and stored privacy
+metadata. The remaining work is operational key management and safe historical
+policy migration.
 
-- Introduce key providers: local file key, OS keychain where available, and
-  environment variable for CI.
-- Encrypt configured fields before ClickHouse insert.
-- Store key ID and encryption policy version on affected rows.
-- Add decrypt path only to explicit admin/export tools, not default MCP output.
+Next slices:
+
+- Add key providers beyond env/file, including OS-backed secret storage where
+  practical.
+- Add explicit decrypt/export tooling for admin and offline recovery flows, not
+  default MCP responses.
+- Add key rotation, re-encryption planning, and key-backup verification.
+- Add monitor/CLI visibility for encrypted row counts and missing-key failures.
+- Add redaction policy audit and reprocess workflow under R10.
 
 Edge cases:
 
@@ -426,6 +468,9 @@ Edge cases:
 - Search index cannot search encrypted text unless a separate redacted/search
   representation is stored.
 - Error tables and spools may contain sensitive fragments.
+- Operators may configure `encrypt_raw` for fields that still need searchable
+  redacted projections.
+- Multiple machines may share a corpus but not the same local secret store.
 
 Acceptance criteria:
 
@@ -467,16 +512,21 @@ Acceptance criteria:
 Priority: P0  
 Effort: M
 
-MCP is the agent-facing contract. Add a suite that treats the server as a
-protocol product, not just Rust functions.
+Status: strong foundation landed in `36cb2a6`, still worth extending.
 
-First slice:
+MCP is the agent-facing contract. The current codebase already snapshots strict
+schemas, output schemas, and safety metadata behavior. The next step is to make
+client compatibility and hostile-memory behavior even harder to regress.
 
-- Snapshot `initialize`, `tools/list`, and all tool output schemas.
-- Validate `additionalProperties: false` for input schemas.
-- Validate output schemas against real tool responses.
-- Test `safety_mode`, `response_format`, pagination, invalid cursors, and limit
-  boundaries.
+Next slices:
+
+- Keep snapshot coverage for `initialize`, `tools/list`, and all tool output
+  schemas.
+- Add host/client compatibility fixtures for common MCP consumers.
+- Add transcript fixtures with prompt-injection text, bad cursors, mixed
+  verbosity, and malformed tool arguments.
+- Validate prose/full parity where the same semantic information should survive
+  formatting changes.
 - Keep protocol version changes isolated from feature changes.
 
 Edge cases:
@@ -490,25 +540,30 @@ Acceptance criteria:
 
 - Any MCP schema drift is visible in tests.
 - Existing tool arguments still deserialize.
+- Known host-specific quirks are documented with reproduction fixtures.
 
 ### R12 - Untrusted-Memory Retrieval Controls
 
 Priority: P0  
 Effort: M
 
+Status: foundation landed in `36cb2a6`, not complete.
+
 Retrieved memory can include malicious or stale instructions from prior agent
-sessions. Harden the retrieval layer around OWASP GenAI risks such as prompt
-injection, sensitive information disclosure, excessive agency, and unbounded
-consumption.
+sessions. Moraine now carries explicit untrusted-memory framing, safety
+metadata, redaction/filter counters, and strict mode. The next slices should
+stress this behavior against more realistic hostile corpora and client displays.
 
-First slice:
+Next slices:
 
-- Keep explicit "retrieved content is untrusted memory" safety preambles.
-- Add redaction/filter counters to all retrieval tools.
-- Add per-tool maximum output budgets and truncation metadata.
-- Add optional strict mode that suppresses payload JSON, system/noise events,
-  and long tool outputs unless explicitly requested.
-- Add regression fixtures with prompt-injection content embedded in old traces.
+- Preserve explicit "retrieved content is untrusted memory" safety preambles.
+- Keep redaction/filter counters and truncation metadata on every retrieval
+  tool.
+- Add regression fixtures with prompt-injection content embedded in old traces,
+  web-search pages, tool outputs, and imported remote mirrors.
+- Add monitor/debug tooling to inspect why a response was redacted or filtered.
+- Add policy hooks so future P09 rules can narrow output without reworking all
+  handlers.
 
 Edge cases:
 
@@ -1481,18 +1536,19 @@ Use this checklist when designing any feature above.
 
 ## Suggested PR Breakdown
 
-The roadmap is intentionally too large for one branch. A practical first wave:
+The roadmap is intentionally too large for one branch. The practical next wave,
+after the already-landed backup/privacy/MCP foundations, is:
 
-1. `feat(cli): add backup manifest and verify command`
-2. `feat(cli): add doctor schema and source integrity checks`
-3. `feat(ingest): add reindex and search rebuild orchestration`
-4. `feat(source): expose file and error drilldown APIs`
-5. `feat(monitor): add source drilldown UI`
-6. `feat(mcp): add conformance snapshot tests`
-7. `feat(search): add relevance telemetry and evaluation fixtures`
-8. `feat(search): add field-weighted lexical ranking`
-9. `feat(imports): add remote import profiles`
-10. `feat(privacy): add policy version audit`
+1. `feat(cli): add doctor deep integrity and migration safety gates`
+2. `feat(cli): add reindex and search rebuild orchestration`
+3. `feat(cli): execute restore into staging database`
+4. `feat(ingest): add disk-backed retry spool`
+5. `feat(source): enrich source drilldown with lag and WAL detail`
+6. `feat(monitor): add source drilldown UI`
+7. `feat(imports): execute remote sync with manifests`
+8. `feat(search): add relevance telemetry and evaluation fixtures`
+9. `feat(search): add field-weighted lexical ranking`
+10. `feat(privacy): add policy version audit and reprocess planning`
 
 Do not start with hosted/team/cloud mode. Those features multiply the cost of
 auth, privacy, backups, and policy enforcement. They should build on a local
