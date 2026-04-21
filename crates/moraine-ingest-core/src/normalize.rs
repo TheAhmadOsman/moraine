@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEXT_LIMIT: usize = 200_000;
-const RAW_JSON_LIMIT: usize = TEXT_LIMIT;
 const PREVIEW_LIMIT: usize = 320;
 const UNPARSEABLE_EVENT_TS: &str = "1970-01-01 00:00:00.000";
 
@@ -189,7 +188,7 @@ fn extract_message_text(content: &Value) -> String {
                 }
             }
             Value::Object(map) => {
-                for key in ["text", "message", "output", "thinking", "think", "summary"] {
+                for key in ["text", "message", "output", "thinking", "summary"] {
                     if let Some(Value::String(s)) = map.get(key) {
                         if !s.trim().is_empty() {
                             out.push(s.clone());
@@ -483,7 +482,6 @@ fn base_event_obj(
     payload_json: &str,
 ) -> Map<String, Value> {
     let text_content = truncate_chars(text_content, TEXT_LIMIT);
-    let payload_json = truncate_chars(payload_json, TEXT_LIMIT);
     let event_kind = canonicalize_event_kind(event_kind);
     let payload_type = canonicalize_payload_type(payload_type);
     let mut obj = Map::<String, Value>::new();
@@ -793,40 +791,28 @@ fn kimi_session_id(source_file: &str, session_hint: &str) -> String {
     infer_session_id_from_file(source_file)
 }
 
-fn synthetic_kimi_timestamp(source_line_no: u64) -> (String, String, bool) {
-    let base = DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch");
-    let dt = base + Duration::microseconds(source_line_no as i64);
-    (format_record_ts(&dt), format_event_ts(&dt), false)
-}
-
-fn parse_kimi_timestamp(record: &Value, source_line_no: u64) -> (String, String, bool) {
-    if let Some(ts_val) = record.get("timestamp") {
-        let formatted = match ts_val {
-            Value::Number(n) => format_unix_seconds_decimal(&n.to_string())
-                .or_else(|| n.as_f64().and_then(format_unix_seconds_ts)),
-            Value::String(s) => format_unix_seconds_decimal(s).or_else(|| {
-                s.parse::<f64>()
-                    .ok()
-                    .and_then(format_unix_seconds_ts)
-                    .or_else(|| parse_record_ts(s).map(|dt| format_record_ts(&dt)))
-            }),
-            _ => None,
-        };
-
-        if let Some(record_ts) = formatted {
-            if let Some(dt) = parse_record_ts(&record_ts) {
-                return (record_ts, format_event_ts(&dt), false);
-            }
+/// Kimi wire records carry `timestamp` as a unix-seconds float
+/// (e.g. `1775953944.549974`). Convert to the RFC3339 string the shared
+/// `parse_event_ts` path expects; return "" when the field is absent so
+/// the caller can decide how to handle it (the leading `metadata` header
+/// line is skipped upstream, so no real event reaches this function
+/// without a timestamp in practice).
+///
+/// Parses the decimal string form first to preserve sub-microsecond
+/// precision — `as_f64()` would round `1775953944.549974` down by a tick.
+fn kimi_wire_record_ts(record: &Value) -> String {
+    let (decimal, fallback) = match record.get("timestamp") {
+        Some(Value::Number(n)) => (n.to_string(), n.as_f64()),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim().to_string();
+            let f = trimmed.parse::<f64>().ok();
+            (trimmed, f)
         }
-
-        let raw_ts = to_str(Some(ts_val));
-        if !raw_ts.trim().is_empty() {
-            let (event_ts, event_ts_parse_failed) = parse_event_ts(&raw_ts);
-            return (raw_ts, event_ts, event_ts_parse_failed);
-        }
-    }
-
-    synthetic_kimi_timestamp(source_line_no)
+        _ => return String::new(),
+    };
+    format_unix_seconds_decimal(&decimal)
+        .or_else(|| fallback.and_then(format_unix_seconds_ts))
+        .unwrap_or_default()
 }
 
 fn hermes_status(record: &Value) -> String {
@@ -2544,191 +2530,6 @@ fn kimi_cli_event_uid(ctx: &RecordContext<'_>, record_fingerprint: &str, suffix:
     )
 }
 
-fn normalize_kimi_cli_context_record(
-    record: &Value,
-    ctx: &RecordContext<'_>,
-    _base_uid: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let mut events = Vec::<Value>::new();
-    let links = Vec::<Value>::new();
-    let mut tools = Vec::<Value>::new();
-
-    let role = to_str(record.get("role"));
-    let content = record.get("content").unwrap_or(&Value::Null);
-    let record_json = compact_json(record);
-
-    match role.as_str() {
-        "_system_prompt" => {
-            let text = to_str(record.get("content"));
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:system_prompt");
-            events.push(Value::Object(base_event_obj(
-                ctx,
-                &uid,
-                "system",
-                "system",
-                "system",
-                &text,
-                &record_json,
-            )));
-        }
-        "_usage" => {
-            let token_count = to_u32(record.get("token_count"));
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:usage");
-            let mut row = base_event_obj(
-                ctx,
-                &uid,
-                "event_msg",
-                "token_count",
-                "system",
-                "",
-                &record_json,
-            );
-            row.insert("input_tokens".to_string(), json!(token_count));
-            row.insert("token_usage_json".to_string(), json!(record_json.clone()));
-            events.push(Value::Object(row));
-        }
-        "_checkpoint" => {
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:checkpoint");
-            let mut row = base_event_obj(
-                ctx,
-                &uid,
-                "progress",
-                "progress",
-                "system",
-                "",
-                &record_json,
-            );
-            row.insert("item_id".to_string(), json!(to_str(record.get("id"))));
-            row.insert("op_kind".to_string(), json!("checkpoint"));
-            events.push(Value::Object(row));
-        }
-        "user" => {
-            let text = extract_message_text(content);
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:user");
-            let mut row = base_event_obj(
-                ctx,
-                &uid,
-                "message",
-                "user_message",
-                "user",
-                &text,
-                &record_json,
-            );
-            row.insert(
-                "content_types".to_string(),
-                json!(extract_content_types(content)),
-            );
-            events.push(Value::Object(row));
-        }
-        "assistant" => {
-            if let Value::Array(parts) = content {
-                for (idx, part) in parts.iter().enumerate() {
-                    let part_type = to_str(part.get("type"));
-                    let part_text = extract_message_text(part);
-                    let part_json = compact_json(part);
-                    let suffix = format!("context:assistant:{idx}:{part_type}");
-                    let part_uid = kimi_cli_event_uid(ctx, &part_json, &suffix);
-
-                    let row = match part_type.as_str() {
-                        "think" => {
-                            let mut r = base_event_obj(
-                                ctx,
-                                &part_uid,
-                                "reasoning",
-                                "thinking",
-                                "assistant",
-                                &part_text,
-                                &part_json,
-                            );
-                            r.insert("has_reasoning".to_string(), json!(1u8));
-                            r.insert("content_types".to_string(), json!(["thinking"]));
-                            r
-                        }
-                        _ => {
-                            let mut r = base_event_obj(
-                                ctx,
-                                &part_uid,
-                                "message",
-                                "agent_message",
-                                "assistant",
-                                &part_text,
-                                &part_json,
-                            );
-                            if !part_type.is_empty() {
-                                r.insert("content_types".to_string(), json!([part_type]));
-                            }
-                            r
-                        }
-                    };
-                    events.push(Value::Object(row));
-                }
-            } else {
-                let text = extract_message_text(content);
-                let uid = kimi_cli_event_uid(ctx, &record_json, "context:assistant");
-                let mut row = base_event_obj(
-                    ctx,
-                    &uid,
-                    "message",
-                    "agent_message",
-                    "assistant",
-                    &text,
-                    &record_json,
-                );
-                row.insert(
-                    "content_types".to_string(),
-                    json!(extract_content_types(content)),
-                );
-                events.push(Value::Object(row));
-            }
-        }
-        "tool" => {
-            let tool_call_id = to_str(record.get("tool_call_id"));
-            let text = extract_message_text(content);
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:tool");
-            let mut row = base_event_obj(
-                ctx,
-                &uid,
-                "tool_result",
-                "tool_result",
-                "tool",
-                &text,
-                &record_json,
-            );
-            row.insert("content_types".to_string(), json!(["tool_result"]));
-            row.insert("tool_call_id".to_string(), json!(tool_call_id.clone()));
-            events.push(Value::Object(row));
-
-            tools.push(build_tool_row(
-                ctx,
-                &uid,
-                &tool_call_id,
-                "",
-                "",
-                "response",
-                0,
-                "",
-                &compact_json(content),
-                &text,
-            ));
-        }
-        _ => {
-            let text = extract_message_text(content);
-            let uid = kimi_cli_event_uid(ctx, &record_json, "context:unknown");
-            events.push(Value::Object(base_event_obj(
-                ctx,
-                &uid,
-                "unknown",
-                "unknown",
-                "system",
-                &text,
-                &record_json,
-            )));
-        }
-    }
-
-    (events, links, tools)
-}
-
 fn normalize_kimi_cli_wire_event(
     record: &Value,
     ctx: &RecordContext<'_>,
@@ -2738,25 +2539,6 @@ fn normalize_kimi_cli_wire_event(
     let mut events = Vec::<Value>::new();
     let links = Vec::<Value>::new();
     let mut tools = Vec::<Value>::new();
-
-    if record.get("type").and_then(Value::as_str) == Some("metadata") {
-        let record_json = compact_json(record);
-        let uid = kimi_cli_event_uid(ctx, &record_json, "wire:metadata");
-        let mut row = base_event_obj(
-            ctx,
-            &uid,
-            "session_meta",
-            "session_meta",
-            "system",
-            "",
-            &record_json,
-        );
-        if let Some(pv) = record.get("protocol_version").and_then(Value::as_str) {
-            row.insert("item_id".to_string(), json!(pv));
-        }
-        events.push(Value::Object(row));
-        return (events, links, tools);
-    }
 
     let message = record.get("message").unwrap_or(record);
     let msg_type = {
@@ -2768,7 +2550,7 @@ fn normalize_kimi_cli_wire_event(
         }
     };
     let payload = message.get("payload").unwrap_or(record);
-    let payload_json = compact_json(&payload);
+    let payload_json = compact_json(payload);
 
     let mut push_progress = |suffix: &str, kind: &str, text: String, payload_type: &str| {
         let uid = kimi_cli_event_uid(ctx, &payload_json, suffix);
@@ -3049,19 +2831,6 @@ fn normalize_kimi_cli_wire_event(
     (events, links, tools)
 }
 
-fn normalize_kimi_cli_event(
-    record: &Value,
-    ctx: &RecordContext<'_>,
-    top_type: &str,
-    base_uid: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    if record.get("role").is_some() {
-        normalize_kimi_cli_context_record(record, ctx, base_uid)
-    } else {
-        normalize_kimi_cli_wire_event(record, ctx, top_type, base_uid)
-    }
-}
-
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
@@ -3077,6 +2846,18 @@ pub fn normalize_record(
     let harness = Harness::parse(harness)?;
     let harness_name = harness.as_str();
 
+    // The Kimi wire file's leading `{"type":"metadata","protocol_version":...}`
+    // header is a per-file format marker — not a session event — and it's
+    // the only wire record without a timestamp. Skip it entirely so we
+    // don't need synthetic-timestamp machinery just to accommodate one
+    // header line.
+    if harness == Harness::KimiCli
+        && record.get("message").is_none()
+        && record.get("type").and_then(Value::as_str) == Some("metadata")
+    {
+        return Ok(NormalizedRecord::default());
+    }
+
     // For most harnesses `inference_provider` is a static property of the
     // harness. Hermes is different: the vendor is encoded inside the record's
     // `model` field as `vendor/model`, so we parse it here and use the parsed
@@ -3088,13 +2869,12 @@ pub fn normalize_record(
         (harness.inference_provider().to_string(), String::new())
     };
 
-    let (record_ts, event_ts, event_ts_parse_failed) = if harness == Harness::KimiCli {
-        parse_kimi_timestamp(record, source_line_no)
+    let record_ts = if harness == Harness::KimiCli {
+        kimi_wire_record_ts(record)
     } else {
-        let record_ts = to_str(record.get("timestamp"));
-        let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
-        (record_ts, event_ts, event_ts_parse_failed)
+        to_str(record.get("timestamp"))
     };
+    let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = if harness == Harness::Hermes {
         let explicit = to_str(record.get("type"));
         if explicit.is_empty() {
@@ -3107,12 +2887,7 @@ pub fn normalize_record(
         if !message_type.is_empty() {
             message_type
         } else {
-            let explicit = to_str(record.get("type"));
-            if !explicit.is_empty() {
-                explicit
-            } else {
-                to_str(record.get("role"))
-            }
+            to_str(record.get("type"))
         }
     } else {
         to_str(record.get("type"))
@@ -3144,7 +2919,6 @@ pub fn normalize_record(
     let session_date = infer_session_date_from_file(source_file, &record_ts);
 
     let raw_json = compact_json(record);
-    let stored_raw_json = truncate_chars(&raw_json, RAW_JSON_LIMIT);
     let base_uid = event_uid(
         source_file,
         source_generation,
@@ -3174,7 +2948,7 @@ pub fn normalize_record(
         "record_ts": record_ts,
         "top_type": top_type,
         "session_id": session_id,
-        "raw_json": stored_raw_json,
+        "raw_json": raw_json,
         "raw_json_hash": raw_hash(&raw_json),
         "event_uid": base_uid,
     });
@@ -3224,7 +2998,7 @@ pub fn normalize_record(
             _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
-        Harness::KimiCli => normalize_kimi_cli_event(record, &ctx, &top_type, &base_uid),
+        Harness::KimiCli => normalize_kimi_cli_wire_event(record, &ctx, &top_type, &base_uid),
     };
 
     // For Hermes, resolve_model_hint's fallback should be the already-split
@@ -3744,53 +3518,6 @@ mod tests {
                 .unwrap(),
             "openai"
         );
-    }
-
-    #[test]
-    fn oversized_raw_and_payload_json_are_capped_for_clickhouse_rows() {
-        let text = "x".repeat(super::RAW_JSON_LIMIT + 1024);
-        let record = json!({
-            "timestamp": "2026-02-14T02:28:00.000Z",
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": text }]
-        });
-        let full_raw_json = super::compact_json(&record);
-
-        let out = normalize_record(
-            &record,
-            "codex",
-            "codex",
-            "/Users/eric/.codex/sessions/2026/02/14/session-019c59f9-6389-77a1-a0cb-304eecf935b6.jsonl",
-            10,
-            1,
-            1,
-            1024,
-            "",
-            "",
-        )
-        .expect("large codex message should normalize");
-
-        let raw_json = out
-            .raw_row
-            .get("raw_json")
-            .and_then(Value::as_str)
-            .expect("raw_json should be stored as a string");
-        assert!(raw_json.len() <= super::RAW_JSON_LIMIT);
-        assert_ne!(raw_json, full_raw_json);
-        assert_eq!(
-            out.raw_row
-                .get("raw_json_hash")
-                .and_then(Value::as_u64)
-                .expect("raw_json_hash should be numeric"),
-            super::raw_hash(&full_raw_json)
-        );
-
-        let payload_json = out.event_rows[0]
-            .get("payload_json")
-            .and_then(Value::as_str)
-            .expect("payload_json should be stored as a string");
-        assert!(payload_json.len() <= super::TEXT_LIMIT);
     }
 
     #[test]

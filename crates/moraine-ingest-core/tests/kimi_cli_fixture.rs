@@ -46,19 +46,13 @@ fn normalize_lines(name: &str) -> Vec<moraine_ingest_core::model::NormalizedReco
 fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
     let rows = normalize_lines("wire.jsonl");
     assert!(rows.iter().all(|row| row.error_rows.is_empty()));
-    assert_eq!(
-        rows[0].raw_row.get("record_ts").and_then(Value::as_str),
-        Some("1970-01-01T00:00:00.000001Z")
-    );
-    let metadata = &rows[0].event_rows[0];
-    assert_eq!(
-        metadata.get("event_kind").and_then(Value::as_str),
-        Some("session_meta")
-    );
-    assert_eq!(
-        metadata.get("record_ts").and_then(Value::as_str),
-        Some("1970-01-01T00:00:00.000001Z")
-    );
+
+    // The leading `{"type":"metadata",...}` header is a per-file protocol
+    // marker, not a session event — normalize_record returns an empty
+    // NormalizedRecord for it so no raw/event rows are emitted.
+    assert!(rows[0].raw_row.is_null());
+    assert!(rows[0].event_rows.is_empty());
+
     assert_eq!(
         rows[1].raw_row.get("harness").and_then(Value::as_str),
         Some("kimi-cli")
@@ -121,36 +115,17 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
 }
 
 #[test]
-fn kimi_context_fixture_uses_synthetic_timestamps_without_errors() {
-    let rows = normalize_lines("context.jsonl");
-    assert!(rows.iter().all(|row| row.error_rows.is_empty()));
-
-    let user = &rows[1].event_rows[0];
-    assert_eq!(user.get("actor_kind").and_then(Value::as_str), Some("user"));
-    assert_eq!(
-        user.get("record_ts").and_then(Value::as_str),
-        Some("1970-01-01T00:00:00.000002Z")
-    );
-
-    let usage = &rows[4].event_rows[0];
-    assert_eq!(
-        usage.get("payload_type").and_then(Value::as_str),
-        Some("token_count")
-    );
-    assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(42));
-}
-
-#[test]
 fn kimi_events_do_not_reuse_raw_record_uid() {
     let rows = normalize_lines("wire.jsonl");
     let mut event_uids = HashSet::new();
 
     for row in &rows {
-        let raw_uid = row
-            .raw_row
-            .get("event_uid")
-            .and_then(Value::as_str)
-            .expect("raw uid");
+        // Skipped records (e.g. the metadata header) have no raw_row; ignore
+        // them here — they also have no event_rows to check.
+        let Some(raw_uid) = row.raw_row.get("event_uid").and_then(Value::as_str) else {
+            assert!(row.event_rows.is_empty());
+            continue;
+        };
         for event in &row.event_rows {
             let event_uid = event
                 .get("event_uid")

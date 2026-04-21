@@ -56,14 +56,7 @@ fn compute_append_to_visible_stats(
 ) -> Option<(u32, u32)> {
     let mut latencies_ms: Vec<u64> = raw_rows
         .iter()
-        .filter_map(|row| {
-            let record_ts = row.get("record_ts").and_then(Value::as_str)?;
-            if is_synthetic_kimi_record_ts(row, record_ts) {
-                None
-            } else {
-                Some(record_ts)
-            }
-        })
+        .filter_map(|row| row.get("record_ts").and_then(Value::as_str))
         .filter_map(|record_ts| DateTime::parse_from_rfc3339(record_ts).ok())
         .map(|record_ts| {
             visible_at
@@ -81,11 +74,6 @@ fn compute_append_to_visible_stats(
     let p50 = append_to_visible_percentile(&latencies_ms, 0.50);
     let p95 = append_to_visible_percentile(&latencies_ms, 0.95);
     Some((saturating_u64_to_u32(p50), saturating_u64_to_u32(p95)))
-}
-
-fn is_synthetic_kimi_record_ts(row: &Value, record_ts: &str) -> bool {
-    row.get("harness").and_then(Value::as_str) == Some("kimi-cli")
-        && record_ts.starts_with("1970-01-01T")
 }
 
 pub(crate) fn spawn_sink_task(
@@ -717,34 +705,6 @@ mod tests {
 
         let stats = compute_append_to_visible_stats(&raw_rows, visible_at);
         assert!(stats.is_none());
-    }
-
-    #[test]
-    fn compute_append_to_visible_stats_skips_synthetic_kimi_timestamps() {
-        let visible_at = DateTime::parse_from_rfc3339("2026-02-17T00:00:10.000Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
-
-        let synthetic_only = vec![json!({
-            "harness": "kimi-cli",
-            "record_ts": "1970-01-01T00:00:00.000001Z",
-        })];
-        assert!(compute_append_to_visible_stats(&synthetic_only, visible_at).is_none());
-
-        let raw_rows = vec![
-            json!({
-                "harness": "kimi-cli",
-                "record_ts": "1970-01-01T00:00:01.000001Z",
-            }),
-            json!({
-                "harness": "kimi-cli",
-                "record_ts": "2026-02-17T00:00:08.000Z",
-            }),
-        ];
-        let (p50, p95) = compute_append_to_visible_stats(&raw_rows, visible_at)
-            .expect("real Kimi timestamp should be counted");
-        assert_eq!(p50, 2_000);
-        assert_eq!(p95, 2_000);
     }
 
     #[test]
