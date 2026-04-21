@@ -318,6 +318,32 @@ Backups include a manifest, source inventory, migration metadata, table row coun
 
 Detailed operational guidance is in `backup-and-restore.md`.
 
+## Search Rebuild
+
+Use `reindex` for the first supported rebuild slice: regenerating the derived search tables from canonical `events` using the current ClickHouse projection SQL.
+
+Preview the rebuild impact:
+
+```bash
+moraine reindex --search-only
+moraine reindex --search-only --dry-run
+```
+
+Execute the rebuild:
+
+```bash
+moraine reindex --search-only --execute
+```
+
+This slice is intentionally narrow:
+
+- It rebuilds `search_documents`, `search_postings`, and `search_conversation_terms` only.
+- It does not replay sources, rewrite `raw_events`, or rebuild canonical `events`.
+- It requires the current schema; if migrations are pending, run `moraine db migrate` first.
+- `search_term_stats` and `search_corpus_stats` are views, so they reflect rebuilt rows automatically.
+
+For broader reindex or privacy-remediation workflows, keep taking a backup first. This command is safe against canonical tables, but it is not a substitute for backup discipline before larger corpus changes.
+
 ## Portable Archives
 
 Preview and verify portable JSONL archive contracts. Live ClickHouse export/import is intentionally not wired in this slice.

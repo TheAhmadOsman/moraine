@@ -29,6 +29,10 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 
 const CLICKHOUSE_TEMPLATE: &str = include_str!("../../../config/clickhouse.xml");
 const USERS_TEMPLATE: &str = include_str!("../../../config/users.xml");
+const SEARCH_INDEX_SQL: &str = include_str!("../../../sql/004_search_index.sql");
+const SEARCH_CONVERSATION_TERMS_SQL: &str =
+    include_str!("../../../sql/010_search_conversation_terms.sql");
+const PRIVACY_METADATA_SQL: &str = include_str!("../../../sql/013_privacy_metadata.sql");
 const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const BACKUP_TABLES_DIR: &str = "tables";
 const BACKUP_MANIFEST_VERSION: u32 = 1;
@@ -93,6 +97,7 @@ enum CliCommand {
     Archive(ArchiveArgs),
     Backup(BackupArgs),
     Restore(RestoreArgs),
+    Reindex(ReindexArgs),
     Run(RunArgs),
 }
 
@@ -318,6 +323,16 @@ struct RestoreArgs {
     execute: bool,
     #[arg(long, value_name = "DB")]
     target_database: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ReindexArgs {
+    #[arg(long, default_value_t = false)]
+    search_only: bool,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
 }
 
 #[derive(Debug, Args)]
@@ -695,6 +710,24 @@ struct ConfigDetectSnapshot {
 struct ConfigValidateSnapshot {
     ok: bool,
     issues: Vec<moraine_config::SourceValidationIssue>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReindexPreviewCounts {
+    events: u64,
+    search_documents: u64,
+    search_postings: u64,
+    search_conversation_terms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReindexSnapshot {
+    mode: String,
+    target: String,
+    database: String,
+    current: ReindexPreviewCounts,
+    projected: ReindexPreviewCounts,
+    notes: Vec<String>,
 }
 
 struct CliOutput {
@@ -3263,6 +3296,198 @@ struct AppliedMigrationRow {
     version: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    rows: u64,
+}
+
+fn extract_sql_body_after(sql: &str, marker: &str) -> Result<String> {
+    let start = sql
+        .find(marker)
+        .ok_or_else(|| anyhow!("missing SQL marker `{marker}`"))?;
+    let body = &sql[start + marker.len()..];
+    Ok(body.trim().trim_end_matches(';').trim().to_string())
+}
+
+fn search_documents_select_sql() -> Result<String> {
+    extract_sql_body_after(
+        PRIVACY_METADATA_SQL,
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_documents_from_events\nTO moraine.search_documents\nAS\n",
+    )
+    .map(|sql| sql.replace("moraine.", ""))
+}
+
+fn search_postings_select_sql() -> Result<String> {
+    extract_sql_body_after(
+        SEARCH_INDEX_SQL,
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_postings\nTO moraine.search_postings\nAS\n",
+    )
+    .map(|sql| sql.replace("moraine.", ""))
+}
+
+fn search_conversation_terms_select_sql() -> Result<String> {
+    let insert_sql = extract_sql_body_after(
+        SEARCH_CONVERSATION_TERMS_SQL,
+        "INSERT INTO moraine.search_conversation_terms\n",
+    )?;
+    let select_start = insert_sql
+        .find("SELECT\n")
+        .ok_or_else(|| anyhow!("search conversation terms SQL missing SELECT body"))?;
+    Ok(insert_sql[select_start..].replace("moraine.", ""))
+}
+
+async fn query_count(ch: &ClickHouseClient, database: &str, query: &str) -> Result<u64> {
+    let rows: Vec<CountRow> = ch
+        .query_json_data(query, Some(database))
+        .await
+        .with_context(|| format!("failed count query: {query}"))?;
+    Ok(rows.first().map(|row| row.rows).unwrap_or(0))
+}
+
+async fn current_search_counts(
+    ch: &ClickHouseClient,
+    database: &str,
+) -> Result<ReindexPreviewCounts> {
+    Ok(ReindexPreviewCounts {
+        events: query_count(ch, database, "SELECT toUInt64(count()) AS rows FROM events").await?,
+        search_documents: query_count(
+            ch,
+            database,
+            "SELECT toUInt64(count()) AS rows FROM search_documents",
+        )
+        .await?,
+        search_postings: query_count(
+            ch,
+            database,
+            "SELECT toUInt64(count()) AS rows FROM search_postings",
+        )
+        .await?,
+        search_conversation_terms: query_count(
+            ch,
+            database,
+            "SELECT toUInt64(count()) AS rows FROM search_conversation_terms",
+        )
+        .await?,
+    })
+}
+
+async fn projected_search_counts(
+    ch: &ClickHouseClient,
+    database: &str,
+    documents_select: &str,
+    postings_select: &str,
+    conversation_terms_select: &str,
+) -> Result<ReindexPreviewCounts> {
+    Ok(ReindexPreviewCounts {
+        events: query_count(ch, database, "SELECT toUInt64(count()) AS rows FROM events").await?,
+        search_documents: query_count(
+            ch,
+            database,
+            &format!("SELECT toUInt64(count()) AS rows FROM ({documents_select})"),
+        )
+        .await?,
+        search_postings: query_count(
+            ch,
+            database,
+            &format!("SELECT toUInt64(count()) AS rows FROM ({postings_select})"),
+        )
+        .await?,
+        search_conversation_terms: query_count(
+            ch,
+            database,
+            &format!("SELECT toUInt64(count()) AS rows FROM ({conversation_terms_select})"),
+        )
+        .await?,
+    })
+}
+
+async fn ensure_reindex_ready(ch: &ClickHouseClient) -> Result<()> {
+    ch.ping().await.context("ClickHouse ping failed")?;
+    let pending = ch.pending_migration_versions().await?;
+    if !pending.is_empty() {
+        bail!(
+            "search rebuild requires the current schema; run `moraine db migrate` first (pending: {})",
+            pending.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnapshot> {
+    if !args.search_only {
+        bail!(
+            "only `moraine reindex --search-only` is implemented in this slice; full corpus replay is not available"
+        );
+    }
+
+    let dry_run = preview_mode(args.dry_run, args.execute);
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    ensure_reindex_ready(&ch).await?;
+
+    let documents_select = search_documents_select_sql()?;
+    let postings_select = search_postings_select_sql()?;
+    let conversation_terms_select = search_conversation_terms_select_sql()?;
+    let database = cfg.clickhouse.database.clone();
+
+    let current = current_search_counts(&ch, &database).await?;
+    let projected = projected_search_counts(
+        &ch,
+        &database,
+        &documents_select,
+        &postings_select,
+        &conversation_terms_select,
+    )
+    .await?;
+
+    if !dry_run {
+        for table in [
+            "search_conversation_terms",
+            "search_postings",
+            "search_documents",
+        ] {
+            ch.request_text(
+                &format!("TRUNCATE TABLE {table}"),
+                None,
+                Some(&database),
+                false,
+                None,
+            )
+            .await
+            .with_context(|| format!("failed to truncate {table}"))?;
+        }
+        ch.request_text(
+            &format!("INSERT INTO search_documents {documents_select}"),
+            None,
+            Some(&database),
+            false,
+            None,
+        )
+        .await
+        .context("failed to rebuild search_documents from events")?;
+    }
+
+    let mode = if dry_run { "dry_run" } else { "execute" }.to_string();
+    let notes = vec![
+        "scope: rebuilds only derived search tables from canonical events".to_string(),
+        "derived tables touched: search_documents, search_postings, search_conversation_terms".to_string(),
+        "search_term_stats and search_corpus_stats are views and will reflect rebuilt rows automatically".to_string(),
+        "canonical tables like events and raw_events are not deleted or replayed".to_string(),
+    ];
+
+    Ok(ReindexSnapshot {
+        mode,
+        target: "search_only".to_string(),
+        database,
+        current,
+        projected: if dry_run {
+            projected
+        } else {
+            current_search_counts(&ch, &cfg.clickhouse.database).await?
+        },
+        notes,
+    })
+}
+
 fn backup_table_specs(include_derived: bool) -> Vec<BackupTableSpec> {
     let mut specs = vec![
         BackupTableSpec {
@@ -4038,6 +4263,40 @@ fn render_restore_plan(output: &CliOutput, snapshot: &RestorePlanSnapshot) -> Re
     Ok(())
 }
 
+fn reindex_lines(snapshot: &ReindexSnapshot) -> Vec<String> {
+    vec![
+        format!("mode: {}", snapshot.mode),
+        format!("target: {}", snapshot.target),
+        format!("database: {}", snapshot.database),
+        format!("canonical events: {}", snapshot.projected.events),
+        format!(
+            "search_documents: {} -> {}",
+            snapshot.current.search_documents, snapshot.projected.search_documents
+        ),
+        format!(
+            "search_postings: {} -> {}",
+            snapshot.current.search_postings, snapshot.projected.search_postings
+        ),
+        format!(
+            "search_conversation_terms: {} -> {}",
+            snapshot.current.search_conversation_terms,
+            snapshot.projected.search_conversation_terms
+        ),
+    ]
+    .into_iter()
+    .chain(snapshot.notes.iter().map(|note| format!("note: {note}")))
+    .collect()
+}
+
+fn render_reindex(output: &CliOutput, snapshot: &ReindexSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    output.section("Reindex", &reindex_lines(snapshot));
+    Ok(())
+}
+
 fn render_config_detect(output: &CliOutput, snapshot: &ConfigDetectSnapshot) -> Result<()> {
     if output.is_json() {
         println!("{}", serde_json::to_string_pretty(snapshot)?);
@@ -4353,6 +4612,12 @@ async fn main() -> Result<ExitCode> {
             } else {
                 ExitCode::from(1)
             })
+        }
+        CliCommand::Reindex(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let snapshot = cmd_reindex(&cfg, &args).await?;
+            render_reindex(&output, &snapshot)?;
+            Ok(ExitCode::SUCCESS)
         }
         CliCommand::Run(run) => {
             let (inline_config, passthrough) = parse_config_flag(&run.args)?;
@@ -5382,6 +5647,28 @@ Total transferred file size: 1,024 bytes
     }
 
     #[test]
+    fn clap_parses_reindex_search_only_flags() {
+        let preview = Cli::parse_from(["moraine", "reindex", "--search-only"]);
+        match preview.command {
+            CliCommand::Reindex(args) => {
+                assert!(args.search_only);
+                assert!(preview_mode(args.dry_run, args.execute));
+            }
+            _ => panic!("expected reindex command"),
+        }
+
+        let execute = Cli::parse_from(["moraine", "reindex", "--search-only", "--execute"]);
+        match execute.command {
+            CliCommand::Reindex(args) => {
+                assert!(args.search_only);
+                assert!(args.execute);
+                assert!(!preview_mode(args.dry_run, args.execute));
+            }
+            _ => panic!("expected reindex command"),
+        }
+    }
+
+    #[test]
     fn clap_parses_config_detect_json() {
         let cli = Cli::parse_from(["moraine", "config", "detect", "--json"]);
         match cli.command {
@@ -5420,5 +5707,49 @@ Total transferred file size: 1,024 bytes
             i,
             moraine_config::SourceValidationIssue::OverlappingWatchRoot { .. }
         )));
+    }
+
+    #[test]
+    fn reindex_lines_render_preview_counts() {
+        let lines = reindex_lines(&ReindexSnapshot {
+            mode: "dry_run".to_string(),
+            target: "search_only".to_string(),
+            database: "moraine".to_string(),
+            current: ReindexPreviewCounts {
+                events: 12,
+                search_documents: 8,
+                search_postings: 16,
+                search_conversation_terms: 4,
+            },
+            projected: ReindexPreviewCounts {
+                events: 12,
+                search_documents: 10,
+                search_postings: 20,
+                search_conversation_terms: 5,
+            },
+            notes: vec!["canonical tables are untouched".to_string()],
+        });
+
+        assert!(lines.iter().any(|line| line == "mode: dry_run"));
+        assert!(lines.iter().any(|line| line == "search_documents: 8 -> 10"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "note: canonical tables are untouched"));
+    }
+
+    #[test]
+    fn search_rebuild_sql_helpers_track_current_schema_sql() {
+        let documents = search_documents_select_sql().expect("documents sql");
+        assert!(documents.contains("privacy_policy_version"));
+        assert!(documents.contains("FROM events"));
+        assert!(!documents.contains("moraine.events"));
+
+        let postings = search_postings_select_sql().expect("postings sql");
+        assert!(postings.contains("FROM\n(\n  SELECT"));
+        assert!(postings.contains("FROM search_documents"));
+
+        let conversation = search_conversation_terms_select_sql().expect("conversation sql");
+        assert!(conversation.contains("FROM search_postings FINAL"));
+        assert!(!conversation.contains("INSERT INTO"));
     }
 }
