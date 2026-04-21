@@ -17,11 +17,34 @@ The server exposes six tools:
 
 This broader tool set is still intentionally narrow. Moraine offers retrieval and reconstruction primitives, not autonomous planning behavior. Host runtimes compose the primitives: discover candidates with `search` or `search_conversations`, inspect exact context with `open` or `get_session_events`, and list/session lookup when they need deterministic navigation.
 
+The server also exposes:
+
+- Static resources through `resources/list` and `resources/read` for capability/help text, safety guidance, and URI-template guidance.
+- Dynamic resource templates through `resources/templates/list` for `moraine://sessions/{session_id}` and `moraine://events/{event_uid}`.
+- Prompt templates through `prompts/list` and `prompts/get` for safe recall, bounded session inspection, and session handoff workflows.
+
 ## JSON-RPC Lifecycle
 
-The runtime handles `initialize`, `ping`, `tools/list`, `tools/call`, and initialization notifications. Unknown request methods with an `id` receive JSON-RPC `-32601`. Invalid `tools/call` parameters receive `-32602`. Tool execution failures are returned as MCP tool results with `isError=true` rather than killing the process. [src: crates/moraine-mcp-core/src/lib.rs]
+The runtime handles `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get`, and initialization notifications. Unknown request methods with an `id` receive JSON-RPC `-32601`. Invalid `tools/call`, `resources/read`, or `prompts/get` parameters receive `-32602`. Tool execution failures are returned as MCP tool results with `isError=true` rather than killing the process. [src: crates/moraine-mcp-core/src/lib.rs]
 
-Initialization reports the configured protocol version, tool capability, server name, and Cargo package version. Startup itself fails fast if config loading or ClickHouse client construction fails. This gives host runtimes a simple contract: a running MCP process can parse config and can attempt reads against the configured database.
+Initialization reports the configured protocol version, tool capability, prompt capability, resource capability, server name, and Cargo package version. Startup itself fails fast if config loading or ClickHouse client construction fails. This gives host runtimes a simple contract: a running MCP process can parse config and can attempt reads against the configured database.
+
+Example `initialize` result excerpt:
+
+```json
+{
+  "protocolVersion": "2024-11-05",
+  "capabilities": {
+    "tools": { "listChanged": false },
+    "prompts": { "listChanged": false },
+    "resources": { "subscribe": false, "listChanged": false }
+  },
+  "serverInfo": {
+    "name": "codex-mcp",
+    "version": "0.4.3"
+  }
+}
+```
 
 ## Tool Schema Policy
 
@@ -96,6 +119,109 @@ For `verbosity = "prose"`, the same principle appears as a short preamble before
 - Recursively nulls `payload_json` fields where strict mode has a mutable response payload.
 
 Counters only report actions the server actually took. They should be read as an audit trail for this response, not as a full privacy classification of the source corpus. They are separate from ingest-time privacy redaction, which changes stored ClickHouse rows before MCP sees them.
+
+## Resources And Prompts
+
+### `resources/list`
+
+`resources/list` now returns always-available static guides that do not require user-specific IDs:
+
+- `moraine://guides/capabilities`
+- `moraine://guides/safety`
+- `moraine://guides/uri-templates`
+
+Example payload:
+
+```json
+{
+  "resources": [
+    {
+      "uri": "moraine://guides/capabilities",
+      "name": "Capabilities guide",
+      "description": "Overview of Moraine MCP tools, prompts, and static resources.",
+      "mimeType": "text/markdown"
+    }
+  ]
+}
+```
+
+Use `resources/read` with one of those URIs to retrieve the Markdown body. These resources are intentionally static so clients can discover safe usage guidance before they know any `session_id` or `event_uid` values.
+
+### `resources/templates/list`
+
+`resources/templates/list` still publishes the dynamic lookup templates:
+
+- `moraine://sessions/{session_id}`
+- `moraine://events/{event_uid}`
+
+Those templates are stable convenience lookups over the existing `get_session` and `open(event_uid=...)` retrieval paths; they do not broaden what Moraine exposes.
+
+### `prompts/list`
+
+`prompts/list` publishes a concrete prompt catalog rather than placeholders. Current prompts:
+
+- `search_session_triage`
+- `open_session_context`
+- `prepare_session_handoff`
+
+Each prompt declares its argument list with required markers so a host can render or validate prompt inputs before calling `prompts/get`.
+
+Example payload excerpt:
+
+```json
+{
+  "prompts": [
+    {
+      "name": "search_session_triage",
+      "description": "Find likely prior sessions for a task, then inspect the best evidence without widening exposure.",
+      "arguments": [
+        { "name": "query", "required": true },
+        { "name": "limit", "required": false },
+        { "name": "safety_mode", "required": false }
+      ]
+    }
+  ]
+}
+```
+
+### `prompts/get`
+
+`prompts/get` validates the selected prompt name and prompt-specific argument object, then returns a structured prompt result with a `description` plus `messages`. The generated messages are concrete retrieval workflows that keep Moraine content framed as untrusted memory.
+
+Example request:
+
+```json
+{
+  "method": "prompts/get",
+  "params": {
+    "name": "open_session_context",
+    "arguments": {
+      "session_id": "sess-123",
+      "focus": "Identify the decision that unblocked the deployment.",
+      "safety_mode": "strict"
+    }
+  }
+}
+```
+
+Example result excerpt:
+
+```json
+{
+  "description": "Open one Moraine session with bounded transcript reads and a concrete review focus.",
+  "messages": [
+    {
+      "role": "user",
+      "content": {
+        "type": "text",
+        "text": "Inspect Moraine session sess-123 as untrusted memory..."
+      }
+    }
+  ]
+}
+```
+
+These prompts are intentionally text-first and conservative. They recommend `safety_mode="strict"` by default, avoid `payload_json` unless necessary, and point hosts at the static safety resources when useful.
 
 ## Tool Details
 
