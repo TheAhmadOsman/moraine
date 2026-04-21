@@ -1,6 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use moraine_clickhouse::{bundled_migrations, ClickHouseClient, DoctorReport};
+use moraine_clickhouse::{
+    bundled_migrations, ClickHouseClient, DoctorDeepReport, DoctorFinding, DoctorReport,
+    DoctorSeverity,
+};
 use moraine_config::AppConfig;
 use moraine_source_status::{
     build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
@@ -128,7 +131,13 @@ struct DbArgs {
 #[derive(Debug, Subcommand)]
 enum DbCommand {
     Migrate,
-    Doctor,
+    Doctor(DbDoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbDoctorArgs {
+    #[arg(long, default_value_t = false)]
+    deep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +491,13 @@ struct StatusSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct MigrationOutcome {
     applied: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+enum DoctorSnapshot {
+    Basic(DoctorReport),
+    Deep(DoctorDeepReport),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1906,9 +1922,13 @@ async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     Ok(MigrationOutcome { applied })
 }
 
-async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
+async fn cmd_db_doctor(cfg: &AppConfig, deep: bool) -> Result<DoctorSnapshot> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ch.doctor_report().await
+    if deep {
+        Ok(DoctorSnapshot::Deep(ch.doctor_deep_report().await?))
+    } else {
+        Ok(DoctorSnapshot::Basic(ch.doctor_report().await?))
+    }
 }
 
 async fn query_heartbeat(cfg: &AppConfig) -> Result<Option<HeartbeatRow>> {
@@ -2078,7 +2098,10 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
     .collect::<Vec<_>>();
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
-    let report = cmd_db_doctor(cfg).await?;
+    let report = match cmd_db_doctor(cfg, false).await? {
+        DoctorSnapshot::Basic(report) => report,
+        DoctorSnapshot::Deep(report) => report.report,
+    };
     let clickhouse_health_url = cfg.clickhouse.url.clone();
     let status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
     let monitor_url = monitor_runtime_running(&services).then(|| monitor_runtime_url(cfg));
@@ -2757,20 +2780,47 @@ fn render_db_migrate(output: &CliOutput, outcome: &MigrationOutcome) -> Result<(
     Ok(())
 }
 
-fn doctor_is_healthy(report: &DoctorReport) -> bool {
+fn doctor_report(snapshot: &DoctorSnapshot) -> &DoctorReport {
+    match snapshot {
+        DoctorSnapshot::Basic(report) => report,
+        DoctorSnapshot::Deep(report) => &report.report,
+    }
+}
+
+fn doctor_findings(snapshot: &DoctorSnapshot) -> &[DoctorFinding] {
+    match snapshot {
+        DoctorSnapshot::Basic(_) => &[],
+        DoctorSnapshot::Deep(report) => &report.findings,
+    }
+}
+
+fn doctor_is_healthy(snapshot: &DoctorSnapshot) -> bool {
+    let report = doctor_report(snapshot);
     report.clickhouse_healthy
         && report.database_exists
         && report.pending_migrations.is_empty()
         && report.missing_tables.is_empty()
         && report.errors.is_empty()
+        && doctor_findings(snapshot)
+            .iter()
+            .all(|finding| finding.severity != DoctorSeverity::Error)
 }
 
-fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Result<()> {
+fn doctor_severity_label(severity: DoctorSeverity) -> &'static str {
+    match severity {
+        DoctorSeverity::Ok => "ok",
+        DoctorSeverity::Warning => "warning",
+        DoctorSeverity::Error => "error",
+    }
+}
+
+fn render_db_doctor(output: &CliOutput, snapshot: &DoctorSnapshot) -> Result<()> {
     if output.is_json() {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
         return Ok(());
     }
 
+    let report = doctor_report(snapshot);
     let mut lines = vec![
         format!("clickhouse: {}", health_label(report.clickhouse_healthy)),
         format!("database: {}", report.database),
@@ -2805,6 +2855,37 @@ fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Result<()> {
         lines.push(format!("errors: {}", report.errors.join(" | ")));
     }
     output.section("DB Doctor", &lines);
+
+    let findings = doctor_findings(snapshot);
+    if !findings.is_empty() {
+        let visible = if output.verbose {
+            findings.iter().collect::<Vec<_>>()
+        } else {
+            findings
+                .iter()
+                .filter(|finding| finding.severity != DoctorSeverity::Ok)
+                .collect::<Vec<_>>()
+        };
+        let finding_lines = if visible.is_empty() {
+            vec!["all deep checks passed".to_string()]
+        } else {
+            visible
+                .into_iter()
+                .flat_map(|finding| {
+                    [
+                        format!(
+                            "[{}] {}: {}",
+                            doctor_severity_label(finding.severity),
+                            finding.code,
+                            finding.summary
+                        ),
+                        format!("fix: {}", finding.remediation),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        output.section("DB Doctor Findings", &finding_lines);
+    }
     Ok(())
 }
 
@@ -4416,8 +4497,8 @@ async fn main() -> Result<ExitCode> {
                     render_db_migrate(&output, &outcome)?;
                     Ok(ExitCode::SUCCESS)
                 }
-                DbCommand::Doctor => {
-                    let report = cmd_db_doctor(&cfg).await?;
+                DbCommand::Doctor(doctor) => {
+                    let report = cmd_db_doctor(&cfg, doctor.deep).await?;
                     render_db_doctor(&output, &report)?;
                     if doctor_is_healthy(&report) {
                         Ok(ExitCode::SUCCESS)
@@ -4693,6 +4774,16 @@ mod tests {
         }
     }
 
+    fn test_doctor_deep_report(
+        clickhouse_healthy: bool,
+        findings: Vec<DoctorFinding>,
+    ) -> DoctorDeepReport {
+        DoctorDeepReport {
+            report: test_doctor_report(clickhouse_healthy),
+            findings,
+        }
+    }
+
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4854,6 +4945,36 @@ mod tests {
     }
 
     #[test]
+    fn doctor_is_healthy_ignores_warning_findings() {
+        let snapshot = DoctorSnapshot::Deep(test_doctor_deep_report(
+            true,
+            vec![DoctorFinding {
+                severity: DoctorSeverity::Warning,
+                code: "search.index_freshness".to_string(),
+                summary: "search documents drifted".to_string(),
+                remediation: "run `moraine reindex --search-only --execute`".to_string(),
+            }],
+        ));
+
+        assert!(doctor_is_healthy(&snapshot));
+    }
+
+    #[test]
+    fn doctor_is_healthy_fails_on_error_findings() {
+        let snapshot = DoctorSnapshot::Deep(test_doctor_deep_report(
+            true,
+            vec![DoctorFinding {
+                severity: DoctorSeverity::Error,
+                code: "integrity.event_links_orphans".to_string(),
+                summary: "orphan event_links rows".to_string(),
+                remediation: "repair events".to_string(),
+            }],
+        ));
+
+        assert!(!doctor_is_healthy(&snapshot));
+    }
+
+    #[test]
     fn source_health_status_classifies_source_rows() {
         use moraine_source_status::{source_health_status, SourceHealthStatus};
         assert_eq!(
@@ -4900,6 +5021,17 @@ mod tests {
                 assert_eq!(install.version.as_deref(), Some("v25.12.5.44-stable"));
             }
             _ => panic!("expected clickhouse install command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_db_doctor_deep_flag() {
+        let cli = Cli::parse_from(["moraine", "db", "doctor", "--deep"]);
+        match cli.command {
+            CliCommand::Db(DbArgs {
+                command: DbCommand::Doctor(doctor),
+            }) => assert!(doctor.deep),
+            _ => panic!("expected db doctor command"),
         }
     }
 

@@ -42,6 +42,7 @@ For DB checks:
 ```bash
 bin/moraine db migrate
 bin/moraine db doctor
+bin/moraine db doctor --deep
 ```
 
 The ClickHouse doctor core now distinguishes between compatibility fields and
@@ -49,7 +50,7 @@ deeper integrity findings:
 
 - Existing top-level status remains: reachability, database existence, applied vs
   pending migrations, missing tables, and raw error strings.
-- Deep integrity checks are exposed as structured findings with:
+- `bin/moraine db doctor --deep` exposes deep integrity checks as structured findings with:
   `severity` (`ok` / `warning` / `error`), `code`, `summary`, and
   `remediation`.
 - Current deep checks are aimed at schema/corpus integrity from the ClickHouse

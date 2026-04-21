@@ -28,6 +28,9 @@ preserving the existing top-level report fields used by current callers.
 - Existing doctor consumers can continue reading the legacy top-level fields.
 - New consumers can key off stable finding codes instead of scraping human error
   strings.
+- `bin/moraine db doctor --deep` now exposes the deep finding set directly in
+  CLI plain/rich output and JSON while preserving the legacy JSON shape for the
+  basic `db doctor` mode.
 
 ## Validation
 

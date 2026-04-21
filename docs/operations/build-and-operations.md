@@ -133,6 +133,7 @@ It auto-installs managed ClickHouse when missing and `runtime.clickhouse_auto_in
 cd ~/src/moraine
 bin/moraine db migrate
 bin/moraine db doctor
+bin/moraine db doctor --deep
 bin/moraine db doctor --output json
 ```
 
@@ -142,6 +143,8 @@ bin/moraine db doctor --output json
 - Database existence.
 - Applied vs pending migrations.
 - Required table presence.
+- With `--deep`, derived object health and corpus integrity findings such as orphan
+  rows, missing `raw_events` backing rows, session time drift, and search index drift.
 
 ## Service entrypoints
 
