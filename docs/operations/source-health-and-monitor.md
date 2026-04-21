@@ -73,7 +73,7 @@ Top-level response shape:
 
 The endpoint can still return a non-200 response for failures before partial querying is possible, such as invalid ClickHouse client construction from config.
 
-`GET /api/sources/:source` returns the shared source summary for one configured source using the same status classifier and partial-query behavior as `GET /api/sources`:
+`GET /api/sources/:source` returns the shared source summary for one configured source using the same status classifier and partial-query behavior as `GET /api/sources`. It also includes a runtime block built from `ingest_heartbeats` plus a small warning list that separates file-state issues from ingest-heartbeat lag and watcher degradation:
 
 ```json
 {
@@ -88,17 +88,42 @@ The endpoint can still return a non-200 response for failures before partial que
     "status": "warning",
     "checkpoint_count": 1,
     "latest_checkpoint_at": "2026-04-20 10:15:00",
+    "latest_checkpoint_age_seconds": 12,
     "raw_event_count": 128,
     "ingest_error_count": 2,
     "latest_error_at": "2026-04-20 10:18:00",
     "latest_error_kind": "schema_drift",
     "latest_error_text": "missing field"
   },
-  "query_error": null
+  "runtime": {
+    "latest_heartbeat_at": "2026-04-20 10:18:05",
+    "latest_heartbeat_age_seconds": 4,
+    "queue_depth": 0,
+    "files_active": 1,
+    "files_watched": 8,
+    "append_to_visible_p50_ms": 20,
+    "append_to_visible_p95_ms": 140,
+    "watcher_backend": "native",
+    "watcher_error_count": 0,
+    "watcher_reset_count": 0,
+    "watcher_last_reset_at": null,
+    "heartbeat_cadence_seconds": 5.0,
+    "reconcile_cadence_seconds": 30.0,
+    "lag_indicator": "healthy"
+  },
+  "warnings": [
+    {
+      "kind": "file_state",
+      "severity": "warning",
+      "summary": "This source is ingesting data, but recent file processing also recorded ingest errors."
+    }
+  ],
+  "query_error": null,
+  "runtime_query_error": null
 }
 ```
 
-If one of the ClickHouse reads fails, the monitor still returns the configured source plus the first `query_error` it saw instead of failing the entire drilldown.
+If one of the status-table reads fails, the monitor still returns the configured source plus the first `query_error` it saw instead of failing the entire drilldown. If the heartbeat read fails independently, the response keeps the source summary and sets `runtime_query_error` instead. This keeps partial failures localized to the degraded part of the detail view.
 
 ## Monitor UI
 
@@ -111,7 +136,13 @@ The strip is not a file browser and does not replace the session explorer. Its j
 - A source has ingest errors.
 - ClickHouse source-health queries are degraded.
 
-Selecting a source opens the detail panel. The drilldown now keeps a compact source summary visible above the files/errors tabs so operators can still see status, harness, format, watch root, glob, counts, and latest checkpoint/error metadata while they inspect per-file state or recent ingest failures. The summary is loaded from `GET /api/sources/:source`; the existing `GET /api/sources/:source/files` and `GET /api/sources/:source/errors` endpoints remain focused on file and error detail. Partial failures stay localized to the affected query surface and are shown as `query_error` warnings in the panel instead of collapsing the whole view.
+Selecting a source opens the detail panel. The drilldown now keeps a compact source summary visible above the files/errors tabs so operators can still see status, harness, format, watch root, glob, counts, latest checkpoint/error metadata, heartbeat age, watcher backend/error/reset state, append-to-visible lag, and the configured reconcile cadence while they inspect per-file state or recent ingest failures. The summary is loaded from `GET /api/sources/:source`; the existing `GET /api/sources/:source/files` and `GET /api/sources/:source/errors` endpoints remain focused on file and error detail. Partial failures stay localized to the affected query surface and are shown as `query_error` or `runtime_query_error` warnings in the panel instead of collapsing the whole view.
+
+The warning chips in the detail panel are intentionally typed:
+
+- `file_state`: the shared per-source status says the source has no data yet, or has ingest errors attached to its files/checkpoints.
+- `ingest_heartbeat`: the ingest runtime heartbeat is missing, delayed, stale, or backed up with queue depth.
+- `watcher`: the watcher backend reported errors or rescans/resets in heartbeat state.
 
 ## Status Semantics
 
@@ -159,6 +190,12 @@ When `query_error` is present:
 2. Verify migrations have created `raw_events`, `ingest_errors`, and `ingest_checkpoints`.
 3. Check ClickHouse availability and credentials in config.
 4. Rerun `moraine --output json sources status` to see the same shared snapshot outside the monitor server.
+
+When `runtime_query_error` is present:
+
+1. Query `ingest_heartbeats` directly to confirm the table exists and the latest row deserializes cleanly.
+2. Check whether the deployment is still on a pre-watcher-metrics schema; the detail API falls back to legacy heartbeat columns, but a broader heartbeat query failure still surfaces here.
+3. Confirm the ingest service is running long enough to emit heartbeats on the configured cadence.
 
 ## Source-Specific Notes
 

@@ -5,6 +5,8 @@
     SourceErrorsResponse,
     SourceFilesResponse,
     SourceHealthStatus,
+    SourceLagIndicator,
+    SourceWarningSeverity,
   } from '../types/api';
 
   export let sourceName: string | null = null;
@@ -86,6 +88,43 @@
     return n.toLocaleString();
   }
 
+  function formatSeconds(seconds: number | null | undefined): string {
+    if (seconds == null) return '—';
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${minutes}m`;
+  }
+
+  function formatLagMs(ms: number | null | undefined): string {
+    if (ms == null) return '—';
+    if (ms < 1000) return `${ms} ms`;
+    return `${(ms / 1000).toFixed(1)} s`;
+  }
+
+  function cadenceLabel(seconds: number): string {
+    if (seconds < 60) return `${seconds.toFixed(seconds % 1 === 0 ? 0 : 1)}s`;
+    return `${(seconds / 60).toFixed((seconds / 60) % 1 === 0 ? 0 : 1)}m`;
+  }
+
+  function lagTone(indicator: SourceLagIndicator | null | undefined): 'good' | 'warn' | 'bad' | 'subtle' {
+    if (indicator === 'healthy') return 'good';
+    if (indicator === 'delayed') return 'warn';
+    if (indicator === 'stale') return 'bad';
+    return 'subtle';
+  }
+
+  function warningTone(severity: SourceWarningSeverity): 'warn' | 'bad' {
+    return severity === 'error' ? 'bad' : 'warn';
+  }
+
+  function warningLabel(kind: string): string {
+    if (kind === 'file_state') return 'File state';
+    if (kind === 'ingest_heartbeat') return 'Heartbeat';
+    return 'Watcher';
+  }
+
   function close() {
     loadId += 1;
     loading = false;
@@ -132,6 +171,28 @@
     {:else if summaryData}
       {#if summaryData.query_error}
         <div class="sd-warn" role="status">Summary query: {summaryData.query_error}</div>
+      {/if}
+      {#if summaryData.runtime_query_error}
+        <div class="sd-warn" role="status">Runtime query: {summaryData.runtime_query_error}</div>
+      {/if}
+      {#if summaryData.warnings.length > 0}
+        <div class="sd-warning-list">
+          {#each summaryData.warnings as warning}
+            <div class="sd-warning-card">
+              <div class="sd-summary-label">{warningLabel(warning.kind)}</div>
+              <div class="sd-warning-copy">
+                <span
+                  class="sd-status"
+                  class:sd-status-warn={warningTone(warning.severity) === 'warn'}
+                  class:sd-status-bad={warningTone(warning.severity) === 'bad'}
+                >
+                  {warning.severity}
+                </span>
+                <span>{warning.summary}</span>
+              </div>
+            </div>
+          {/each}
+        </div>
       {/if}
       <div class="sd-summary">
         <div class="sd-summary-main">
@@ -181,7 +242,10 @@
           </div>
           <div class="sd-summary-item">
             <div class="sd-summary-label">Latest Checkpoint</div>
-            <div class="sd-summary-value mono">{summaryData.source.latest_checkpoint_at ?? '—'}</div>
+            <div class="sd-summary-stack">
+              <span class="mono">{summaryData.source.latest_checkpoint_at ?? '—'}</span>
+              <span>Age: {formatSeconds(summaryData.source.latest_checkpoint_age_seconds)}</span>
+            </div>
           </div>
           <div class="sd-summary-item">
             <div class="sd-summary-label">Latest Error</div>
@@ -194,6 +258,47 @@
             {:else}
               <div class="sd-summary-value">—</div>
             {/if}
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Heartbeat</div>
+            <div class="sd-summary-stack">
+              <span class="mono">{summaryData.runtime.latest_heartbeat_at ?? '—'}</span>
+              <span>Age: {formatSeconds(summaryData.runtime.latest_heartbeat_age_seconds)}</span>
+              <span>Every {cadenceLabel(summaryData.runtime.heartbeat_cadence_seconds)}</span>
+            </div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Runtime Lag</div>
+            <div class="sd-summary-stack">
+              <span
+                class="sd-status"
+                class:sd-status-good={lagTone(summaryData.runtime.lag_indicator) === 'good'}
+                class:sd-status-warn={lagTone(summaryData.runtime.lag_indicator) === 'warn'}
+                class:sd-status-bad={lagTone(summaryData.runtime.lag_indicator) === 'bad'}
+              >
+                {summaryData.runtime.lag_indicator ?? 'unknown'}
+              </span>
+              <span>Queue: {summaryData.runtime.queue_depth ?? '—'}</span>
+              <span>Append p95: {formatLagMs(summaryData.runtime.append_to_visible_p95_ms)}</span>
+            </div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Watcher</div>
+            <div class="sd-summary-stack">
+              <span class="mono">{summaryData.runtime.watcher_backend ?? '—'}</span>
+              <span>
+                Errors: {summaryData.runtime.watcher_error_count ?? '—'} | Resets: {summaryData.runtime.watcher_reset_count ?? '—'}
+              </span>
+              <span class="mono">Last reset: {summaryData.runtime.watcher_last_reset_at ?? '—'}</span>
+            </div>
+          </div>
+          <div class="sd-summary-item">
+            <div class="sd-summary-label">Cadence</div>
+            <div class="sd-summary-stack">
+              <span>Heartbeat: {cadenceLabel(summaryData.runtime.heartbeat_cadence_seconds)}</span>
+              <span>Reconcile: {cadenceLabel(summaryData.runtime.reconcile_cadence_seconds)}</span>
+              <span>Watched files: {summaryData.runtime.files_watched ?? '—'}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -372,6 +477,27 @@
     color: var(--warn);
     font-size: 0.8125rem;
     margin-bottom: 0.75rem;
+  }
+
+  .sd-warning-list {
+    display: grid;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .sd-warning-card {
+    padding: 0.625rem 0.75rem;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--panel-alt);
+  }
+
+  .sd-warning-copy {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    font-size: 0.8125rem;
   }
 
   .sd-table-wrap {

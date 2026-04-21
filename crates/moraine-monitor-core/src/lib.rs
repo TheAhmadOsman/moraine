@@ -722,6 +722,9 @@ fn source_detail_payload(snapshot: moraine_source_status::SourceDetailSnapshot) 
         "ok": true,
         "source": snapshot.source,
         "query_error": snapshot.query_error,
+        "runtime": snapshot.runtime,
+        "runtime_query_error": snapshot.runtime_query_error,
+        "warnings": snapshot.warnings,
     })
 }
 
@@ -1602,7 +1605,10 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use moraine_source_status::{SourceDetailSnapshot, SourceHealthStatus, SourceStatusRow};
+    use moraine_source_status::{
+        SourceDetailSnapshot, SourceDetailWarning, SourceHealthStatus, SourceLagIndicator,
+        SourceRuntimeSnapshot, SourceStatusRow, SourceWarningKind, SourceWarningSeverity,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1698,6 +1704,7 @@ mod tests {
                 status: SourceHealthStatus::Warning,
                 checkpoint_count: 3,
                 latest_checkpoint_at: Some("2026-04-20 10:15:00".to_string()),
+                latest_checkpoint_age_seconds: Some(15),
                 raw_event_count: 42,
                 ingest_error_count: 1,
                 latest_error_at: Some("2026-04-20 10:20:00".to_string()),
@@ -1705,6 +1712,28 @@ mod tests {
                 latest_error_text: Some("missing field".to_string()),
             },
             query_error: Some("checkpoint query failed: timeout".to_string()),
+            runtime: SourceRuntimeSnapshot {
+                latest_heartbeat_at: Some("2026-04-20 10:20:30".to_string()),
+                latest_heartbeat_age_seconds: Some(6),
+                queue_depth: Some(0),
+                files_active: Some(1),
+                files_watched: Some(4),
+                append_to_visible_p50_ms: Some(25),
+                append_to_visible_p95_ms: Some(130),
+                watcher_backend: Some("native".to_string()),
+                watcher_error_count: Some(0),
+                watcher_reset_count: Some(0),
+                watcher_last_reset_at: None,
+                heartbeat_cadence_seconds: 5.0,
+                reconcile_cadence_seconds: 30.0,
+                lag_indicator: Some(SourceLagIndicator::Healthy),
+            },
+            runtime_query_error: Some("heartbeat query failed: timeout".to_string()),
+            warnings: vec![SourceDetailWarning {
+                kind: SourceWarningKind::FileState,
+                severity: SourceWarningSeverity::Warning,
+                summary: "This source is ingesting data, but recent file processing also recorded ingest errors.".to_string(),
+            }],
         });
 
         assert_eq!(payload["ok"], json!(true));
@@ -1713,9 +1742,20 @@ mod tests {
         assert_eq!(payload["source"]["watch_root"], json!("/tmp"));
         assert_eq!(payload["source"]["checkpoint_count"], json!(3));
         assert_eq!(
+            payload["source"]["latest_checkpoint_age_seconds"],
+            json!(15)
+        );
+        assert_eq!(
             payload["source"]["latest_error_kind"],
             json!("schema_drift")
         );
+        assert_eq!(payload["runtime"]["watcher_backend"], json!("native"));
+        assert_eq!(payload["runtime"]["lag_indicator"], json!("healthy"));
+        assert_eq!(
+            payload["runtime_query_error"],
+            json!("heartbeat query failed: timeout")
+        );
+        assert_eq!(payload["warnings"][0]["kind"], json!("file_state"));
         assert_eq!(
             payload["query_error"],
             json!("checkpoint query failed: timeout")

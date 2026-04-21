@@ -39,6 +39,7 @@ pub struct SourceStatusRow {
     pub status: SourceHealthStatus,
     pub checkpoint_count: u64,
     pub latest_checkpoint_at: Option<String>,
+    pub latest_checkpoint_age_seconds: Option<u64>,
     pub raw_event_count: u64,
     pub ingest_error_count: u64,
     pub latest_error_at: Option<String>,
@@ -56,6 +57,58 @@ pub struct SourceStatusSnapshot {
 pub struct SourceDetailSnapshot {
     pub source: SourceStatusRow,
     pub query_error: Option<String>,
+    pub runtime: SourceRuntimeSnapshot,
+    pub runtime_query_error: Option<String>,
+    pub warnings: Vec<SourceDetailWarning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceRuntimeSnapshot {
+    pub latest_heartbeat_at: Option<String>,
+    pub latest_heartbeat_age_seconds: Option<u64>,
+    pub queue_depth: Option<u64>,
+    pub files_active: Option<u64>,
+    pub files_watched: Option<u64>,
+    pub append_to_visible_p50_ms: Option<u64>,
+    pub append_to_visible_p95_ms: Option<u64>,
+    pub watcher_backend: Option<String>,
+    pub watcher_error_count: Option<u64>,
+    pub watcher_reset_count: Option<u64>,
+    pub watcher_last_reset_at: Option<String>,
+    pub heartbeat_cadence_seconds: f64,
+    pub reconcile_cadence_seconds: f64,
+    pub lag_indicator: Option<SourceLagIndicator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceWarningKind {
+    FileState,
+    IngestHeartbeat,
+    Watcher,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceWarningSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDetailWarning {
+    pub kind: SourceWarningKind,
+    pub severity: SourceWarningSeverity,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLagIndicator {
+    Healthy,
+    Delayed,
+    Stale,
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +116,7 @@ struct SourceCheckpointStatsRow {
     source_name: String,
     checkpoint_count: u64,
     latest_checkpoint_at: String,
+    latest_checkpoint_age_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +132,32 @@ struct SourceErrorStatsRow {
     latest_error_at: String,
     latest_error_kind: String,
     latest_error_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceRuntimeRow {
+    latest_heartbeat_at: String,
+    latest_heartbeat_age_seconds: u64,
+    queue_depth: u64,
+    files_active: u64,
+    files_watched: u64,
+    append_to_visible_p50_ms: u64,
+    append_to_visible_p95_ms: u64,
+    watcher_backend: String,
+    watcher_error_count: u64,
+    watcher_reset_count: u64,
+    watcher_last_reset_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacySourceRuntimeRow {
+    latest_heartbeat_at: String,
+    latest_heartbeat_age_seconds: u64,
+    queue_depth: u64,
+    files_active: u64,
+    files_watched: u64,
+    append_to_visible_p50_ms: u64,
+    append_to_visible_p95_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,11 +258,61 @@ async fn query_source_checkpoint_stats(
         "SELECT \
             source_name, \
             toUInt64(count()) AS checkpoint_count, \
-            toString(max(updated_at)) AS latest_checkpoint_at \
+            toString(max(updated_at)) AS latest_checkpoint_at, \
+            toUInt64(greatest(dateDiff('second', max(updated_at), now()), 0)) AS latest_checkpoint_age_seconds \
          FROM {db}.ingest_checkpoints FINAL \
          GROUP BY source_name"
     );
     ch.query_rows(&query, None).await
+}
+
+async fn query_source_runtime(ch: &ClickHouseClient, db: &str) -> Result<Option<SourceRuntimeRow>> {
+    let query = format!(
+        "SELECT \
+            toString(max(ts)) AS latest_heartbeat_at, \
+            toUInt64(greatest(dateDiff('second', max(ts), now()), 0)) AS latest_heartbeat_age_seconds, \
+            toUInt64(argMax(queue_depth, ts)) AS queue_depth, \
+            toUInt64(argMax(files_active, ts)) AS files_active, \
+            toUInt64(argMax(files_watched, ts)) AS files_watched, \
+            toUInt64(argMax(append_to_visible_p50_ms, ts)) AS append_to_visible_p50_ms, \
+            toUInt64(argMax(append_to_visible_p95_ms, ts)) AS append_to_visible_p95_ms, \
+            toString(argMax(watcher_backend, ts)) AS watcher_backend, \
+            toUInt64(argMax(watcher_error_count, ts)) AS watcher_error_count, \
+            toUInt64(argMax(watcher_reset_count, ts)) AS watcher_reset_count, \
+            if(toUInt64(argMax(watcher_last_reset_unix_ms, ts)) = 0, '', toString(fromUnixTimestamp64Milli(toInt64(argMax(watcher_last_reset_unix_ms, ts))))) AS watcher_last_reset_at \
+         FROM {db}.ingest_heartbeats"
+    );
+
+    match ch.query_rows(&query, None).await {
+        Ok(rows) => Ok(rows.into_iter().next()),
+        Err(_) => {
+            let legacy_query = format!(
+                "SELECT \
+                    toString(max(ts)) AS latest_heartbeat_at, \
+                    toUInt64(greatest(dateDiff('second', max(ts), now()), 0)) AS latest_heartbeat_age_seconds, \
+                    toUInt64(argMax(queue_depth, ts)) AS queue_depth, \
+                    toUInt64(argMax(files_active, ts)) AS files_active, \
+                    toUInt64(argMax(files_watched, ts)) AS files_watched, \
+                    toUInt64(argMax(append_to_visible_p50_ms, ts)) AS append_to_visible_p50_ms, \
+                    toUInt64(argMax(append_to_visible_p95_ms, ts)) AS append_to_visible_p95_ms \
+                 FROM {db}.ingest_heartbeats"
+            );
+            let rows: Vec<LegacySourceRuntimeRow> = ch.query_rows(&legacy_query, None).await?;
+            Ok(rows.into_iter().next().map(|row| SourceRuntimeRow {
+                latest_heartbeat_at: row.latest_heartbeat_at,
+                latest_heartbeat_age_seconds: row.latest_heartbeat_age_seconds,
+                queue_depth: row.queue_depth,
+                files_active: row.files_active,
+                files_watched: row.files_watched,
+                append_to_visible_p50_ms: row.append_to_visible_p50_ms,
+                append_to_visible_p95_ms: row.append_to_visible_p95_ms,
+                watcher_backend: "unknown".to_string(),
+                watcher_error_count: 0,
+                watcher_reset_count: 0,
+                watcher_last_reset_at: String::new(),
+            }))
+        }
+    }
 }
 
 async fn query_source_raw_counts(ch: &ClickHouseClient, db: &str) -> Result<Vec<SourceCountRow>> {
@@ -256,12 +386,170 @@ fn build_source_status_row(
         checkpoint_count,
         latest_checkpoint_at: checkpoint
             .and_then(|row| option_if_non_empty(&row.latest_checkpoint_at)),
+        latest_checkpoint_age_seconds: checkpoint.map(|row| row.latest_checkpoint_age_seconds),
         raw_event_count,
         ingest_error_count,
         latest_error_at: error.and_then(|row| option_if_non_empty(&row.latest_error_at)),
         latest_error_kind: error.and_then(|row| option_if_non_empty(&row.latest_error_kind)),
         latest_error_text: error.and_then(|row| option_if_non_empty(&row.latest_error_text)),
     }
+}
+
+fn sanitize_cadence(seconds: f64, minimum_seconds: f64) -> f64 {
+    if seconds.is_finite() {
+        seconds.max(minimum_seconds)
+    } else {
+        minimum_seconds
+    }
+}
+
+fn runtime_lag_indicator(runtime: &SourceRuntimeSnapshot) -> Option<SourceLagIndicator> {
+    let age = runtime.latest_heartbeat_age_seconds? as f64;
+    let delayed_after = runtime.heartbeat_cadence_seconds * 3.0;
+    let stale_after = runtime.heartbeat_cadence_seconds * 6.0;
+
+    Some(if age >= stale_after {
+        SourceLagIndicator::Stale
+    } else if age >= delayed_after || runtime.queue_depth.unwrap_or(0) > 0 {
+        SourceLagIndicator::Delayed
+    } else {
+        SourceLagIndicator::Healthy
+    })
+}
+
+fn build_source_runtime_snapshot(
+    cfg: &AppConfig,
+    runtime: Option<SourceRuntimeRow>,
+) -> SourceRuntimeSnapshot {
+    let heartbeat_cadence_seconds = sanitize_cadence(cfg.ingest.heartbeat_interval_seconds, 1.0);
+    let reconcile_cadence_seconds = sanitize_cadence(cfg.ingest.reconcile_interval_seconds, 5.0);
+
+    let mut snapshot = if let Some(runtime) = runtime {
+        SourceRuntimeSnapshot {
+            latest_heartbeat_at: option_if_non_empty(&runtime.latest_heartbeat_at),
+            latest_heartbeat_age_seconds: Some(runtime.latest_heartbeat_age_seconds),
+            queue_depth: Some(runtime.queue_depth),
+            files_active: Some(runtime.files_active),
+            files_watched: Some(runtime.files_watched),
+            append_to_visible_p50_ms: Some(runtime.append_to_visible_p50_ms),
+            append_to_visible_p95_ms: Some(runtime.append_to_visible_p95_ms),
+            watcher_backend: option_if_non_empty(&runtime.watcher_backend),
+            watcher_error_count: Some(runtime.watcher_error_count),
+            watcher_reset_count: Some(runtime.watcher_reset_count),
+            watcher_last_reset_at: option_if_non_empty(&runtime.watcher_last_reset_at),
+            heartbeat_cadence_seconds,
+            reconcile_cadence_seconds,
+            lag_indicator: None,
+        }
+    } else {
+        SourceRuntimeSnapshot {
+            latest_heartbeat_at: None,
+            latest_heartbeat_age_seconds: None,
+            queue_depth: None,
+            files_active: None,
+            files_watched: None,
+            append_to_visible_p50_ms: None,
+            append_to_visible_p95_ms: None,
+            watcher_backend: None,
+            watcher_error_count: None,
+            watcher_reset_count: None,
+            watcher_last_reset_at: None,
+            heartbeat_cadence_seconds,
+            reconcile_cadence_seconds,
+            lag_indicator: Some(SourceLagIndicator::Unknown),
+        }
+    };
+
+    if snapshot.latest_heartbeat_at.is_some() {
+        snapshot.lag_indicator = runtime_lag_indicator(&snapshot);
+    }
+
+    snapshot
+}
+
+fn build_source_detail_warnings(
+    source: &SourceStatusRow,
+    runtime: &SourceRuntimeSnapshot,
+    query_error: Option<&str>,
+    runtime_query_error: Option<&str>,
+) -> Vec<SourceDetailWarning> {
+    let mut warnings = Vec::new();
+
+    if query_error.is_none() {
+        match source.status {
+            SourceHealthStatus::Error => warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::FileState,
+                severity: SourceWarningSeverity::Error,
+                summary: "Ingest errors are landing, but this source has not produced usable raw rows yet.".to_string(),
+            }),
+            SourceHealthStatus::Warning => warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::FileState,
+                severity: SourceWarningSeverity::Warning,
+                summary: "This source is ingesting data, but recent file processing also recorded ingest errors.".to_string(),
+            }),
+            SourceHealthStatus::Unknown if source.enabled && source.checkpoint_count == 0 && source.raw_event_count == 0 => {
+                warnings.push(SourceDetailWarning {
+                    kind: SourceWarningKind::FileState,
+                    severity: SourceWarningSeverity::Warning,
+                    summary: "No checkpoints or raw rows have been recorded for this source yet.".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if runtime_query_error.is_none() {
+        match runtime.lag_indicator {
+            Some(SourceLagIndicator::Stale) => warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::IngestHeartbeat,
+                severity: SourceWarningSeverity::Error,
+                summary: format!(
+                    "Latest ingest heartbeat is {}s old, which is stale for the configured {:.0}s cadence.",
+                    runtime.latest_heartbeat_age_seconds.unwrap_or_default(),
+                    runtime.heartbeat_cadence_seconds
+                ),
+            }),
+            Some(SourceLagIndicator::Delayed) => warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::IngestHeartbeat,
+                severity: SourceWarningSeverity::Warning,
+                summary: if runtime.queue_depth.unwrap_or(0) > 0 {
+                    format!(
+                        "Ingest runtime is carrying a queue depth of {} and may be delayed.",
+                        runtime.queue_depth.unwrap_or_default()
+                    )
+                } else {
+                    format!(
+                        "Latest ingest heartbeat is {}s old, which is slower than the configured {:.0}s cadence.",
+                        runtime.latest_heartbeat_age_seconds.unwrap_or_default(),
+                        runtime.heartbeat_cadence_seconds
+                    )
+                },
+            }),
+            Some(SourceLagIndicator::Unknown) => warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::IngestHeartbeat,
+                severity: SourceWarningSeverity::Warning,
+                summary: "No ingest heartbeat has been recorded yet, so runtime lag is unknown.".to_string(),
+            }),
+            _ => {}
+        }
+
+        if runtime.watcher_error_count.unwrap_or(0) > 0
+            || runtime.watcher_reset_count.unwrap_or(0) > 0
+        {
+            warnings.push(SourceDetailWarning {
+                kind: SourceWarningKind::Watcher,
+                severity: SourceWarningSeverity::Warning,
+                summary: format!(
+                    "Watcher backend={} with {} errors and {} rescans/resets observed in heartbeat state.",
+                    runtime.watcher_backend.as_deref().unwrap_or("unknown"),
+                    runtime.watcher_error_count.unwrap_or_default(),
+                    runtime.watcher_reset_count.unwrap_or_default()
+                ),
+            });
+        }
+    }
+
+    warnings
 }
 
 async fn query_source_status_state(ch: &ClickHouseClient, db: &str) -> SourceStatusQueryState {
@@ -382,19 +670,34 @@ pub async fn build_source_detail_snapshot(
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
     let state = query_source_status_state(&ch, &db).await;
+    let (runtime_row, runtime_query_error) = match query_source_runtime(&ch, &db).await {
+        Ok(row) => (row, None),
+        Err(err) => (None, Some(format!("heartbeat query failed: {err}"))),
+    };
     let checkpoint = state.checkpoints.get(source_name);
     let raw_event_count = state.raw_counts.get(source_name).copied().unwrap_or(0);
     let error = state.errors.get(source_name);
+    let source = build_source_status_row(
+        source,
+        checkpoint,
+        raw_event_count,
+        error,
+        state.query_error.as_deref(),
+    );
+    let runtime = build_source_runtime_snapshot(cfg, runtime_row);
+    let warnings = build_source_detail_warnings(
+        &source,
+        &runtime,
+        state.query_error.as_deref(),
+        runtime_query_error.as_deref(),
+    );
 
     Ok(SourceDetailSnapshot {
-        source: build_source_status_row(
-            source,
-            checkpoint,
-            raw_event_count,
-            error,
-            state.query_error.as_deref(),
-        ),
+        source,
         query_error: state.query_error,
+        runtime,
+        runtime_query_error,
+        warnings,
     })
 }
 
@@ -792,6 +1095,7 @@ mod tests {
             source_name: source.name.clone(),
             checkpoint_count: 3,
             latest_checkpoint_at: "2026-04-20 10:15:00".to_string(),
+            latest_checkpoint_age_seconds: 12,
         };
         let error = SourceErrorStatsRow {
             source_name: source.name.clone(),
@@ -813,6 +1117,7 @@ mod tests {
             row.latest_checkpoint_at.as_deref(),
             Some("2026-04-20 10:15:00")
         );
+        assert_eq!(row.latest_checkpoint_age_seconds, Some(12));
         assert_eq!(row.raw_event_count, 42);
         assert_eq!(row.ingest_error_count, 2);
         assert_eq!(row.latest_error_at.as_deref(), Some("2026-04-20 10:20:00"));
@@ -834,6 +1139,7 @@ mod tests {
             source_name: source.name.clone(),
             checkpoint_count: 0,
             latest_checkpoint_at: String::new(),
+            latest_checkpoint_age_seconds: 0,
         };
         let error = SourceErrorStatsRow {
             source_name: source.name.clone(),
@@ -848,8 +1154,81 @@ mod tests {
 
         assert_eq!(row.status, SourceHealthStatus::Unknown);
         assert!(row.latest_checkpoint_at.is_none());
+        assert_eq!(row.latest_checkpoint_age_seconds, Some(0));
         assert!(row.latest_error_at.is_none());
         assert!(row.latest_error_kind.is_none());
         assert!(row.latest_error_text.is_none());
+    }
+
+    #[test]
+    fn build_source_runtime_snapshot_marks_stale_heartbeat() {
+        let mut cfg = moraine_config::AppConfig::default();
+        cfg.ingest.heartbeat_interval_seconds = 5.0;
+        cfg.ingest.reconcile_interval_seconds = 30.0;
+
+        let runtime = build_source_runtime_snapshot(
+            &cfg,
+            Some(SourceRuntimeRow {
+                latest_heartbeat_at: "2026-04-20 10:15:00".to_string(),
+                latest_heartbeat_age_seconds: 45,
+                queue_depth: 0,
+                files_active: 1,
+                files_watched: 3,
+                append_to_visible_p50_ms: 20,
+                append_to_visible_p95_ms: 120,
+                watcher_backend: "native".to_string(),
+                watcher_error_count: 0,
+                watcher_reset_count: 0,
+                watcher_last_reset_at: String::new(),
+            }),
+        );
+
+        assert_eq!(runtime.lag_indicator, Some(SourceLagIndicator::Stale));
+        assert_eq!(runtime.heartbeat_cadence_seconds, 5.0);
+        assert_eq!(runtime.reconcile_cadence_seconds, 30.0);
+    }
+
+    #[test]
+    fn build_source_detail_warnings_distinguishes_file_runtime_and_watcher_state() {
+        let source = SourceStatusRow {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            format: "opencode_sqlite".to_string(),
+            enabled: true,
+            glob: "/tmp/opencode.db".to_string(),
+            watch_root: "/tmp".to_string(),
+            status: SourceHealthStatus::Warning,
+            checkpoint_count: 3,
+            latest_checkpoint_at: Some("2026-04-20 10:15:00".to_string()),
+            latest_checkpoint_age_seconds: Some(18),
+            raw_event_count: 42,
+            ingest_error_count: 2,
+            latest_error_at: Some("2026-04-20 10:20:00".to_string()),
+            latest_error_kind: Some("schema_drift".to_string()),
+            latest_error_text: Some("missing field".to_string()),
+        };
+        let runtime = SourceRuntimeSnapshot {
+            latest_heartbeat_at: Some("2026-04-20 10:20:30".to_string()),
+            latest_heartbeat_age_seconds: Some(16),
+            queue_depth: Some(2),
+            files_active: Some(1),
+            files_watched: Some(4),
+            append_to_visible_p50_ms: Some(50),
+            append_to_visible_p95_ms: Some(250),
+            watcher_backend: Some("mixed".to_string()),
+            watcher_error_count: Some(1),
+            watcher_reset_count: Some(2),
+            watcher_last_reset_at: Some("2026-04-20 10:19:59".to_string()),
+            heartbeat_cadence_seconds: 5.0,
+            reconcile_cadence_seconds: 30.0,
+            lag_indicator: Some(SourceLagIndicator::Delayed),
+        };
+
+        let warnings = build_source_detail_warnings(&source, &runtime, None, None);
+
+        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings[0].kind, SourceWarningKind::FileState);
+        assert_eq!(warnings[1].kind, SourceWarningKind::IngestHeartbeat);
+        assert_eq!(warnings[2].kind, SourceWarningKind::Watcher);
     }
 }
