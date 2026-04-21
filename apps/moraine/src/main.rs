@@ -43,6 +43,10 @@ const BACKUP_MANIFEST_VERSION: u32 = 1;
 const SYNC_MANIFEST_VERSION: u32 = 2;
 const DESTRUCTIVE_BACKUP_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const DESTRUCTIVE_BACKUP_MAX_AGE_LABEL: &str = "24h";
+const REINDEX_STATE_VERSION: u32 = 1;
+const REINDEX_STATE_DIR: &str = "reindex";
+const REINDEX_SEARCH_STATE_FILE: &str = "search-only-state.json";
+const DEFAULT_REINDEX_BATCH_SIZE: u64 = 50_000;
 
 const DEFAULT_CLICKHOUSE_TAG: &str = "v25.12.5.44-stable";
 const CH_URL_MACOS_X86_64: &str = "https://github.com/ClickHouse/ClickHouse/releases/download/v25.12.5.44-stable/clickhouse-macos";
@@ -361,6 +365,12 @@ struct ReindexArgs {
     dry_run: bool,
     #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
     execute: bool,
+    #[arg(long, value_name = "ROWS", default_value_t = DEFAULT_REINDEX_BATCH_SIZE)]
+    batch_size: u64,
+    #[arg(long, default_value_t = false, conflicts_with = "reset_state")]
+    resume: bool,
+    #[arg(long, default_value_t = false)]
+    reset_state: bool,
     #[arg(long, default_value_t = false)]
     no_backup_check: bool,
 }
@@ -817,11 +827,43 @@ struct ReindexPreviewCounts {
     search_conversation_terms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SearchReindexCursor {
+    ingested_at: String,
+    event_uid: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SearchReindexState {
+    state_version: u32,
+    target: String,
+    database: String,
+    status: String,
+    started_unix_seconds: u64,
+    updated_unix_seconds: u64,
+    batch_size: u64,
+    tables_truncated: bool,
+    high_watermark: Option<SearchReindexCursor>,
+    last_cursor: Option<SearchReindexCursor>,
+    pending_cursor: Option<SearchReindexCursor>,
+    pending_documents: u64,
+    batches_completed: u64,
+    documents_inserted: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ReindexSnapshot {
     mode: String,
     target: String,
     database: String,
+    state_path: String,
+    batch_size: u64,
+    resume: bool,
+    reset_state: bool,
+    batches_completed: u64,
+    documents_inserted: u64,
+    high_watermark: Option<SearchReindexCursor>,
+    last_cursor: Option<SearchReindexCursor>,
     current: ReindexPreviewCounts,
     projected: ReindexPreviewCounts,
     notes: Vec<String>,
@@ -1106,6 +1148,7 @@ fn pid_file_runtime_status(paths: &RuntimePaths, service: Service) -> Option<Ser
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_launchctl_pid(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
         let value = line.trim().strip_prefix("pid = ")?;
@@ -3869,16 +3912,37 @@ struct CountRow {
     rows: u64,
 }
 
-fn extract_sql_body_after(sql: &str, marker: &str) -> Result<String> {
+#[derive(Debug, Deserialize)]
+struct SearchReindexCursorRow {
+    ingested_at: String,
+    event_uid: String,
+}
+
+fn extract_sql_statement_after(sql: &str, marker: &str) -> Result<String> {
     let start = sql
         .find(marker)
         .ok_or_else(|| anyhow!("missing SQL marker `{marker}`"))?;
     let body = &sql[start + marker.len()..];
+    let mut in_single_quote = false;
+    let mut chars = body.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_single_quote && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                chars.next();
+            } else {
+                in_single_quote = !in_single_quote;
+            }
+            continue;
+        }
+        if ch == ';' && !in_single_quote {
+            return Ok(body[..idx].trim().to_string());
+        }
+    }
     Ok(body.trim().trim_end_matches(';').trim().to_string())
 }
 
 fn search_documents_select_sql() -> Result<String> {
-    extract_sql_body_after(
+    extract_sql_statement_after(
         PRIVACY_METADATA_SQL,
         "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_documents_from_events\nTO moraine.search_documents\nAS\n",
     )
@@ -3886,7 +3950,7 @@ fn search_documents_select_sql() -> Result<String> {
 }
 
 fn search_postings_select_sql() -> Result<String> {
-    extract_sql_body_after(
+    extract_sql_statement_after(
         SEARCH_INDEX_SQL,
         "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_postings\nTO moraine.search_postings\nAS\n",
     )
@@ -3894,7 +3958,7 @@ fn search_postings_select_sql() -> Result<String> {
 }
 
 fn search_conversation_terms_select_sql() -> Result<String> {
-    let insert_sql = extract_sql_body_after(
+    let insert_sql = extract_sql_statement_after(
         SEARCH_CONVERSATION_TERMS_SQL,
         "INSERT INTO moraine.search_conversation_terms\n",
     )?;
@@ -3981,11 +4045,260 @@ async fn ensure_reindex_ready(ch: &ClickHouseClient) -> Result<()> {
     Ok(())
 }
 
+fn reindex_state_path(cfg: &AppConfig) -> PathBuf {
+    PathBuf::from(&cfg.runtime.root_dir)
+        .join(REINDEX_STATE_DIR)
+        .join(REINDEX_SEARCH_STATE_FILE)
+}
+
+fn read_search_reindex_state(path: &Path) -> Result<Option<SearchReindexState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read reindex state {}", path.display()))?;
+    let state = serde_json::from_str(&text)
+        .with_context(|| format!("invalid reindex state {}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn write_search_reindex_state(path: &Path, state: &SearchReindexState) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(state).context("encode reindex state")?;
+    write_atomic_bytes(path, &bytes)
+}
+
+fn search_cursor_tuple(cursor: &SearchReindexCursor) -> String {
+    format!(
+        "(parseDateTime64BestEffort({}, 3), {})",
+        quote_sql_string(&cursor.ingested_at),
+        quote_sql_string(&cursor.event_uid)
+    )
+}
+
+fn search_reindex_predicate(
+    lower_exclusive: Option<&SearchReindexCursor>,
+    upper_inclusive: Option<&SearchReindexCursor>,
+) -> String {
+    let mut clauses = Vec::new();
+    if let Some(lower) = lower_exclusive {
+        clauses.push(format!(
+            "(ingested_at, event_uid) > {}",
+            search_cursor_tuple(lower)
+        ));
+    }
+    if let Some(upper) = upper_inclusive {
+        clauses.push(format!(
+            "(ingested_at, event_uid) <= {}",
+            search_cursor_tuple(upper)
+        ));
+    } else {
+        clauses.push("0".to_string());
+    }
+    clauses.join(" AND ")
+}
+
+async fn query_search_high_watermark(
+    ch: &ClickHouseClient,
+    database: &str,
+    documents_select: &str,
+) -> Result<Option<SearchReindexCursor>> {
+    let query = format!(
+        "SELECT toString(ingested_at) AS ingested_at, event_uid \
+         FROM ({documents_select}) \
+         ORDER BY ingested_at DESC, event_uid DESC \
+         LIMIT 1 \
+         FORMAT JSONEachRow"
+    );
+    let rows: Vec<SearchReindexCursorRow> = ch.query_json_each_row(&query, Some(database)).await?;
+    Ok(rows.into_iter().next().map(|row| SearchReindexCursor {
+        ingested_at: row.ingested_at,
+        event_uid: row.event_uid,
+    }))
+}
+
+async fn query_next_search_reindex_batch(
+    ch: &ClickHouseClient,
+    database: &str,
+    documents_select: &str,
+    last_cursor: Option<&SearchReindexCursor>,
+    high_watermark: Option<&SearchReindexCursor>,
+    batch_size: u64,
+) -> Result<(u64, Option<SearchReindexCursor>)> {
+    let predicate = search_reindex_predicate(last_cursor, high_watermark);
+    let limited = format!(
+        "SELECT ingested_at, event_uid \
+         FROM ({documents_select}) \
+         WHERE {predicate} \
+         ORDER BY ingested_at, event_uid \
+         LIMIT {batch_size}"
+    );
+    let rows = query_count(
+        ch,
+        database,
+        &format!("SELECT toUInt64(count()) AS rows FROM ({limited})"),
+    )
+    .await?;
+    if rows == 0 {
+        return Ok((0, None));
+    }
+
+    let query = format!(
+        "SELECT toString(ingested_at) AS ingested_at, event_uid \
+         FROM ({limited}) \
+         ORDER BY ingested_at DESC, event_uid DESC \
+         LIMIT 1 \
+         FORMAT JSONEachRow"
+    );
+    let cursor_rows: Vec<SearchReindexCursorRow> =
+        ch.query_json_each_row(&query, Some(database)).await?;
+    let cursor = cursor_rows
+        .into_iter()
+        .next()
+        .map(|row| SearchReindexCursor {
+            ingested_at: row.ingested_at,
+            event_uid: row.event_uid,
+        })
+        .ok_or_else(|| anyhow!("reindex batch reported {rows} rows but no cursor"))?;
+
+    Ok((rows, Some(cursor)))
+}
+
+async fn search_documents_between_count(
+    ch: &ClickHouseClient,
+    database: &str,
+    lower_exclusive: Option<&SearchReindexCursor>,
+    upper_inclusive: Option<&SearchReindexCursor>,
+) -> Result<u64> {
+    let predicate = search_reindex_predicate(lower_exclusive, upper_inclusive);
+    query_count(
+        ch,
+        database,
+        &format!("SELECT toUInt64(count()) AS rows FROM search_documents WHERE {predicate}"),
+    )
+    .await
+}
+
+async fn insert_search_document_batch(
+    ch: &ClickHouseClient,
+    database: &str,
+    documents_select: &str,
+    lower_exclusive: Option<&SearchReindexCursor>,
+    upper_inclusive: Option<&SearchReindexCursor>,
+    limit: u64,
+) -> Result<()> {
+    let predicate = search_reindex_predicate(lower_exclusive, upper_inclusive);
+    let query = format!(
+        "INSERT INTO search_documents \
+         SELECT * FROM ({documents_select}) \
+         WHERE {predicate} \
+         ORDER BY ingested_at, event_uid \
+         LIMIT {limit}"
+    );
+    ch.request_text(&query, None, Some(database), false, None)
+        .await
+        .context("failed to insert search_documents reindex batch")?;
+    Ok(())
+}
+
+async fn truncate_search_reindex_tables(ch: &ClickHouseClient, database: &str) -> Result<()> {
+    for table in [
+        "search_conversation_terms",
+        "search_postings",
+        "search_documents",
+    ] {
+        ch.request_text(
+            &format!("TRUNCATE TABLE {table}"),
+            None,
+            Some(database),
+            false,
+            None,
+        )
+        .await
+        .with_context(|| format!("failed to truncate {table}"))?;
+    }
+    Ok(())
+}
+
+async fn rebuild_search_conversation_terms(
+    ch: &ClickHouseClient,
+    database: &str,
+    conversation_terms_select: &str,
+) -> Result<()> {
+    ch.request_text(
+        "TRUNCATE TABLE search_conversation_terms",
+        None,
+        Some(database),
+        false,
+        None,
+    )
+    .await
+    .context("failed to truncate search_conversation_terms")?;
+    ch.request_text(
+        &format!("INSERT INTO search_conversation_terms {conversation_terms_select}"),
+        None,
+        Some(database),
+        false,
+        None,
+    )
+    .await
+    .context("failed to rebuild search_conversation_terms")?;
+    Ok(())
+}
+
+fn new_search_reindex_state(
+    database: &str,
+    batch_size: u64,
+    high_watermark: Option<SearchReindexCursor>,
+) -> SearchReindexState {
+    let now = unix_now_seconds();
+    SearchReindexState {
+        state_version: REINDEX_STATE_VERSION,
+        target: "search_only".to_string(),
+        database: database.to_string(),
+        status: "running".to_string(),
+        started_unix_seconds: now,
+        updated_unix_seconds: now,
+        batch_size,
+        tables_truncated: false,
+        high_watermark,
+        last_cursor: None,
+        pending_cursor: None,
+        pending_documents: 0,
+        batches_completed: 0,
+        documents_inserted: 0,
+    }
+}
+
+fn validate_resume_state(state: &SearchReindexState, database: &str) -> Result<()> {
+    if state.state_version != REINDEX_STATE_VERSION {
+        bail!(
+            "reindex state version {} is unsupported (expected {REINDEX_STATE_VERSION})",
+            state.state_version
+        );
+    }
+    if state.target != "search_only" {
+        bail!("reindex state target `{}` is not search_only", state.target);
+    }
+    if state.database != database {
+        bail!(
+            "reindex state database `{}` does not match active database `{database}`",
+            state.database
+        );
+    }
+    if state.status != "running" && state.status != "complete" {
+        bail!("reindex state has unsupported status `{}`", state.status);
+    }
+    Ok(())
+}
+
 async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnapshot> {
     if !args.search_only {
         bail!(
             "only `moraine reindex --search-only` is implemented in this slice; full corpus replay is not available"
         );
+    }
+    if args.batch_size == 0 {
+        bail!("--batch-size must be greater than zero");
     }
 
     let dry_run = preview_mode(args.dry_run, args.execute);
@@ -4003,6 +4316,7 @@ async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnaps
     let postings_select = search_postings_select_sql()?;
     let conversation_terms_select = search_conversation_terms_select_sql()?;
     let database = cfg.clickhouse.database.clone();
+    let state_path = reindex_state_path(cfg);
 
     let current = current_search_counts(&ch, &database).await?;
     let projected = projected_search_counts(
@@ -4014,37 +4328,125 @@ async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnaps
     )
     .await?;
 
-    if !dry_run {
-        for table in [
-            "search_conversation_terms",
-            "search_postings",
-            "search_documents",
-        ] {
-            ch.request_text(
-                &format!("TRUNCATE TABLE {table}"),
-                None,
-                Some(&database),
-                false,
-                None,
-            )
-            .await
-            .with_context(|| format!("failed to truncate {table}"))?;
-        }
-        ch.request_text(
-            &format!("INSERT INTO search_documents {documents_select}"),
-            None,
-            Some(&database),
-            false,
-            None,
+    let mut state = if dry_run {
+        new_search_reindex_state(
+            &database,
+            args.batch_size,
+            query_search_high_watermark(&ch, &database, &documents_select).await?,
         )
-        .await
-        .context("failed to rebuild search_documents from events")?;
+    } else {
+        if args.reset_state && state_path.exists() {
+            fs::remove_file(&state_path)
+                .with_context(|| format!("failed to remove {}", state_path.display()))?;
+        }
+
+        match read_search_reindex_state(&state_path)? {
+            Some(existing) if args.resume => {
+                validate_resume_state(&existing, &database)?;
+                existing
+            }
+            Some(existing) if existing.status == "running" => {
+                bail!(
+                    "reindex state {} is still running; pass --resume to continue it or --reset-state to discard it",
+                    state_path.display()
+                );
+            }
+            Some(existing) => {
+                validate_resume_state(&existing, &database)?;
+                new_search_reindex_state(
+                    &database,
+                    args.batch_size,
+                    query_search_high_watermark(&ch, &database, &documents_select).await?,
+                )
+            }
+            None if args.resume => {
+                bail!(
+                    "cannot resume search reindex because state file does not exist: {}",
+                    state_path.display()
+                );
+            }
+            None => new_search_reindex_state(
+                &database,
+                args.batch_size,
+                query_search_high_watermark(&ch, &database, &documents_select).await?,
+            ),
+        }
+    };
+
+    if !dry_run && state.status == "running" {
+        write_search_reindex_state(&state_path, &state)?;
+
+        if !state.tables_truncated {
+            truncate_search_reindex_tables(&ch, &database).await?;
+            state.tables_truncated = true;
+            state.updated_unix_seconds = unix_now_seconds();
+            write_search_reindex_state(&state_path, &state)?;
+        }
+
+        loop {
+            if let Some(pending_cursor) = state.pending_cursor.clone() {
+                let committed = search_documents_between_count(
+                    &ch,
+                    &database,
+                    state.last_cursor.as_ref(),
+                    Some(&pending_cursor),
+                )
+                .await?;
+                if committed < state.pending_documents {
+                    insert_search_document_batch(
+                        &ch,
+                        &database,
+                        &documents_select,
+                        state.last_cursor.as_ref(),
+                        Some(&pending_cursor),
+                        state.pending_documents,
+                    )
+                    .await?;
+                }
+                state.last_cursor = Some(pending_cursor);
+                state.documents_inserted = state
+                    .documents_inserted
+                    .saturating_add(state.pending_documents);
+                state.batches_completed = state.batches_completed.saturating_add(1);
+                state.pending_cursor = None;
+                state.pending_documents = 0;
+                state.updated_unix_seconds = unix_now_seconds();
+                write_search_reindex_state(&state_path, &state)?;
+                continue;
+            }
+
+            let (batch_rows, batch_cursor) = query_next_search_reindex_batch(
+                &ch,
+                &database,
+                &documents_select,
+                state.last_cursor.as_ref(),
+                state.high_watermark.as_ref(),
+                state.batch_size,
+            )
+            .await?;
+            let Some(batch_cursor) = batch_cursor else {
+                break;
+            };
+
+            state.pending_cursor = Some(batch_cursor);
+            state.pending_documents = batch_rows;
+            state.updated_unix_seconds = unix_now_seconds();
+            write_search_reindex_state(&state_path, &state)?;
+        }
+
+        rebuild_search_conversation_terms(&ch, &database, &conversation_terms_select).await?;
+        state.status = "complete".to_string();
+        state.updated_unix_seconds = unix_now_seconds();
+        write_search_reindex_state(&state_path, &state)?;
     }
 
     let mode = if dry_run { "dry_run" } else { "execute" }.to_string();
     let notes = vec![
         "scope: rebuilds only derived search tables from canonical events".to_string(),
-        "derived tables touched: search_documents, search_postings, search_conversation_terms".to_string(),
+        "fresh execute truncates search_documents, search_postings, and search_conversation_terms before rebuilding".to_string(),
+        "resume continues from the local state file without truncating tables again".to_string(),
+        format!("state file: {}", state_path.display()),
+        format!("batch size: {}", state.batch_size),
         "search_term_stats and search_corpus_stats are views and will reflect rebuilt rows automatically".to_string(),
         "canonical tables like events and raw_events are not deleted or replayed".to_string(),
     ];
@@ -4053,6 +4455,14 @@ async fn cmd_reindex(cfg: &AppConfig, args: &ReindexArgs) -> Result<ReindexSnaps
         mode,
         target: "search_only".to_string(),
         database,
+        state_path: state_path.display().to_string(),
+        batch_size: state.batch_size,
+        resume: args.resume,
+        reset_state: args.reset_state,
+        batches_completed: state.batches_completed,
+        documents_inserted: state.documents_inserted,
+        high_watermark: state.high_watermark,
+        last_cursor: state.last_cursor,
         current,
         projected: if dry_run {
             projected
@@ -5163,6 +5573,12 @@ fn reindex_lines(snapshot: &ReindexSnapshot) -> Vec<String> {
         format!("mode: {}", snapshot.mode),
         format!("target: {}", snapshot.target),
         format!("database: {}", snapshot.database),
+        format!("state path: {}", snapshot.state_path),
+        format!("batch size: {}", snapshot.batch_size),
+        format!("resume: {}", snapshot.resume),
+        format!("reset state: {}", snapshot.reset_state),
+        format!("batches completed: {}", snapshot.batches_completed),
+        format!("documents inserted: {}", snapshot.documents_inserted),
         format!("canonical events: {}", snapshot.projected.events),
         format!(
             "search_documents: {} -> {}",
@@ -5176,6 +5592,22 @@ fn reindex_lines(snapshot: &ReindexSnapshot) -> Vec<String> {
             "search_conversation_terms: {} -> {}",
             snapshot.current.search_conversation_terms,
             snapshot.projected.search_conversation_terms
+        ),
+        format!(
+            "high watermark: {}",
+            snapshot
+                .high_watermark
+                .as_ref()
+                .map(|cursor| format!("{} / {}", cursor.ingested_at, cursor.event_uid))
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!(
+            "last cursor: {}",
+            snapshot
+                .last_cursor
+                .as_ref()
+                .map(|cursor| format!("{} / {}", cursor.ingested_at, cursor.event_uid))
+                .unwrap_or_else(|| "-".to_string())
         ),
     ]
     .into_iter()
@@ -6994,6 +7426,9 @@ Total transferred file size: 1,024 bytes
             CliCommand::Reindex(args) => {
                 assert!(args.search_only);
                 assert!(preview_mode(args.dry_run, args.execute));
+                assert_eq!(args.batch_size, DEFAULT_REINDEX_BATCH_SIZE);
+                assert!(!args.resume);
+                assert!(!args.reset_state);
                 assert!(!args.no_backup_check);
             }
             _ => panic!("expected reindex command"),
@@ -7004,12 +7439,17 @@ Total transferred file size: 1,024 bytes
             "reindex",
             "--search-only",
             "--execute",
+            "--batch-size",
+            "250",
+            "--resume",
             "--no-backup-check",
         ]);
         match execute.command {
             CliCommand::Reindex(args) => {
                 assert!(args.search_only);
                 assert!(args.execute);
+                assert_eq!(args.batch_size, 250);
+                assert!(args.resume);
                 assert!(args.no_backup_check);
                 assert!(!preview_mode(args.dry_run, args.execute));
             }
@@ -7074,6 +7514,20 @@ Total transferred file size: 1,024 bytes
             mode: "dry_run".to_string(),
             target: "search_only".to_string(),
             database: "moraine".to_string(),
+            state_path: "/tmp/reindex/search-only-state.json".to_string(),
+            batch_size: 500,
+            resume: false,
+            reset_state: false,
+            batches_completed: 2,
+            documents_inserted: 400,
+            high_watermark: Some(SearchReindexCursor {
+                ingested_at: "2026-04-20 00:00:00.000".to_string(),
+                event_uid: "evt-high".to_string(),
+            }),
+            last_cursor: Some(SearchReindexCursor {
+                ingested_at: "2026-04-19 00:00:00.000".to_string(),
+                event_uid: "evt-last".to_string(),
+            }),
             current: ReindexPreviewCounts {
                 events: 12,
                 search_documents: 8,
@@ -7090,10 +7544,68 @@ Total transferred file size: 1,024 bytes
         });
 
         assert!(lines.iter().any(|line| line == "mode: dry_run"));
+        assert!(lines.iter().any(|line| line == "batch size: 500"));
+        assert!(lines.iter().any(|line| line == "batches completed: 2"));
+        assert!(lines.iter().any(|line| line == "documents inserted: 400"));
         assert!(lines.iter().any(|line| line == "search_documents: 8 -> 10"));
         assert!(lines
             .iter()
+            .any(|line| line == "high watermark: 2026-04-20 00:00:00.000 / evt-high"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "last cursor: 2026-04-19 00:00:00.000 / evt-last"));
+        assert!(lines
+            .iter()
             .any(|line| line == "note: canonical tables are untouched"));
+    }
+
+    #[test]
+    fn search_reindex_predicate_uses_cursor_bounds() {
+        let lower = SearchReindexCursor {
+            ingested_at: "2026-04-20 01:02:03.004".to_string(),
+            event_uid: "evt'lower".to_string(),
+        };
+        let upper = SearchReindexCursor {
+            ingested_at: "2026-04-21 05:06:07.008".to_string(),
+            event_uid: "evt-upper".to_string(),
+        };
+
+        let predicate = search_reindex_predicate(Some(&lower), Some(&upper));
+
+        assert!(predicate.contains("(ingested_at, event_uid) >"));
+        assert!(predicate.contains("(ingested_at, event_uid) <="));
+        assert!(predicate.contains("'evt''lower'"));
+        assert!(predicate.contains("'evt-upper'"));
+    }
+
+    #[test]
+    fn search_reindex_state_round_trips() {
+        let root = temp_dir("search-reindex-state");
+        let path = root.join("state.json");
+        let state = new_search_reindex_state(
+            "moraine",
+            123,
+            Some(SearchReindexCursor {
+                ingested_at: "2026-04-20 00:00:00.000".to_string(),
+                event_uid: "evt-high".to_string(),
+            }),
+        );
+
+        write_search_reindex_state(&path, &state).expect("write state");
+        let restored = read_search_reindex_state(&path)
+            .expect("read state")
+            .expect("state exists");
+
+        assert_eq!(restored.state_version, REINDEX_STATE_VERSION);
+        assert_eq!(restored.database, "moraine");
+        assert_eq!(restored.batch_size, 123);
+        assert_eq!(restored.status, "running");
+        assert_eq!(
+            restored.high_watermark.as_ref().unwrap().event_uid,
+            "evt-high"
+        );
+        validate_resume_state(&restored, "moraine").expect("valid state");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7106,9 +7618,12 @@ Total transferred file size: 1,024 bytes
         let postings = search_postings_select_sql().expect("postings sql");
         assert!(postings.contains("FROM\n(\n  SELECT"));
         assert!(postings.contains("FROM search_documents"));
+        assert!(!postings.contains("DROP TABLE"));
+        assert!(!postings.contains("CREATE VIEW"));
 
         let conversation = search_conversation_terms_select_sql().expect("conversation sql");
         assert!(conversation.contains("FROM search_postings FINAL"));
         assert!(!conversation.contains("INSERT INTO"));
+        assert!(!conversation.contains("CREATE MATERIALIZED VIEW"));
     }
 }

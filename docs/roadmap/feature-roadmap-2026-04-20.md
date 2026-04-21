@@ -239,14 +239,23 @@ Effort: L
 Implement a first-class reindex command that can rebuild from source files,
 remote import mirrors, or an existing `raw_events` corpus.
 
+Status: search-only rebuild has a bounded/resumable execution path. Full source
+replay, per-source replay, and privacy-policy reprocessing remain future work.
+
 First slice:
+
+- `moraine reindex --search-only`
+- `--dry-run` showing affected rows and search docs.
+- `--execute --batch-size <rows>` for bounded search-document rebuilds.
+- `--execute --resume` to continue an interrupted search rebuild.
+- `--execute --reset-state` to discard an abandoned local state file.
+
+Later slices:
 
 - `moraine reindex --all`
 - `moraine reindex --source <name>`
-- `moraine reindex --search-only`
 - `moraine reindex --privacy-policy-version <version>`
-- `--dry-run` showing affected sources, checkpoints, rows, search docs, and
-  estimated storage.
+- source/raw-event replay with checkpoint reset planning and storage estimates.
 
 Edge cases:
 
@@ -262,6 +271,8 @@ Acceptance criteria:
 - Reindex never destroys old data without an explicit backup check.
 - Search rebuild is deterministic for the same corpus and config.
 - The command reports exactly what it reset, rebuilt, and skipped.
+- Interrupted search rebuilds can resume from a local state file without
+  truncating derived tables again.
 
 ### R03 - Database Doctor and Integrity Audit
 

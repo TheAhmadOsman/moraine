@@ -363,9 +363,20 @@ Execute the rebuild:
 moraine reindex --search-only --execute
 ```
 
+Tune batch size or resume an interrupted rebuild:
+
+```bash
+moraine reindex --search-only --execute --batch-size 25000
+moraine reindex --search-only --execute --resume
+moraine reindex --search-only --execute --reset-state
+```
+
 This slice is intentionally narrow:
 
 - It rebuilds `search_documents`, `search_postings`, and `search_conversation_terms` only.
+- It writes a resume file under `runtime.root_dir/reindex/search-only-state.json`.
+- Fresh execute truncates the derived search tables once; `--resume` continues
+  from the state file without truncating again.
 - It does not replay sources, rewrite `raw_events`, or rebuild canonical `events`.
 - It requires the current schema; if migrations are pending, run `moraine db migrate` first.
 - `search_term_stats` and `search_corpus_stats` are views, so they reflect rebuilt rows automatically.
