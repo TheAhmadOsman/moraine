@@ -29,6 +29,8 @@ The runtime handles `initialize`, `ping`, `tools/list`, `tools/call`, `resources
 
 Initialization reports the configured protocol version, tool capability, prompt capability, resource capability, server name, and Cargo package version. Startup itself fails fast if config loading or ClickHouse client construction fails. This gives host runtimes a simple contract: a running MCP process can parse config and can attempt reads against the configured database.
 
+`crates/moraine-mcp-core` now keeps a focused conformance regression corpus around those wire methods, not just helper formatting tests. The corpus exercises the real request dispatcher for `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, and `prompts/get`, and asserts stable host-facing invariants: required top-level fields, published strict schemas, static catalog entries, and the distinction between JSON-RPC request errors and MCP tool-result errors. This protects hosts from silent contract drift when contributors touch MCP internals.
+
 Example `initialize` result excerpt:
 
 ```json
@@ -60,6 +62,20 @@ Example `initialize` result excerpt:
 Argument structs also use strict deserialization, so unknown fields fail before execution. This makes schema mistakes visible to hosts instead of being silently ignored. [src: crates/moraine-mcp-core/src/lib.rs]
 
 The output schemas describe the structured payload returned when `verbosity = "full"`. Default prose responses still use the normal MCP `content` array and include no `structuredContent`. Agents that need stable machine-readable fields should request `full`; agents that want compact model-readable output should use default `prose`.
+
+## Conformance Corpus
+
+The conformance bar for Moraine MCP is intentionally narrower than full end-to-end retrieval correctness, but stronger than unit-testing isolated helpers.
+
+Current regression coverage protects these host assumptions:
+
+- `initialize` always publishes `protocolVersion`, `capabilities`, and `serverInfo` in the expected shape.
+- `tools/list` continues to publish the same retrieval tool catalog with strict `inputSchema` and `outputSchema` metadata.
+- `tools/call` keeps argument-validation failures visible. Malformed outer params stay JSON-RPC `-32602`; per-tool validation and execution failures stay MCP tool results with `isError=true`.
+- `resources/list`, `resources/templates/list`, and `prompts/list` keep the static guide, URI-template, and prompt catalogs stable enough for host discovery code to rely on.
+- `resources/read` and `prompts/get` continue returning concrete, text-first safety guidance instead of placeholder stubs.
+
+This suite is meant to catch contract regressions when the MCP surface changes. It is not a substitute for sandbox smoke tests against a live stack; use the sandbox path when a change touches ClickHouse-backed retrieval behavior.
 
 ## Shared Arguments
 
