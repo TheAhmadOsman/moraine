@@ -14,7 +14,8 @@ Scope: C02 remote import profiles, C03 config wizard/source discovery, C11 porta
 
 ### `apps/moraine` CLI
 - New commands:
-  - `moraine import sync <name>` — previews profile config (live sync disabled unless a future slice wires `--execute`).
+  - `moraine import sync <name>` — previews the configured host, remote paths, and local mirror.
+  - `moraine import sync <name> --execute` — runs system `rsync` over `ssh`, creates the configured local mirror if needed, and persists a sync manifest at `<runtime.root_dir>/imports/<name>.json`.
   - `moraine import status` — shows all configured profiles and last sync manifest.
   - `moraine archive export --out-dir <dir>` — previews export manifest (live export disabled unless a future slice wires `--execute`).
   - `moraine archive import --input <dir>` — previews archive tables (live import disabled unless a future slice wires `--execute`).
@@ -33,12 +34,11 @@ Scope: C02 remote import profiles, C03 config wizard/source discovery, C11 porta
 
 ## What Is Intentionally Stubbed
 
-Live execution paths are disabled in this foundation slice:
-- `import sync --execute` returns a clear not-implemented error.
+Live execution paths are still disabled for the archive contract slice:
 - `archive export --execute` returns a clear not-implemented error.
 - `archive import --execute` returns a clear not-implemented error.
 
-These stubs preserve the CLI contract, rendering layer, and JSON output schemas while leaving actual subprocess/ClickHouse I/O for a follow-up slice.
+`import sync --execute` is now live and records transfer counts, bytes, duration, and `last_error` when a started sync fails. The archive commands remain stubbed to preserve their CLI contract and JSON output schemas while leaving actual ClickHouse export/import I/O for a follow-up slice.
 
 ## Validation
 

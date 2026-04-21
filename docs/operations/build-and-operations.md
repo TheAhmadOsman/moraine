@@ -264,7 +264,7 @@ Legacy wrappers remain only as fail-fast stubs:
 
 ## Remote Import Profiles
 
-Import profiles describe how agent session files from remote machines should be mirrored into a local directory that can be ingested as a source. The current CLI slice previews and validates these profiles; live rsync execution is reserved for the next implementation slice. Configure a profile under `[imports.<name>]` in `config.toml`:
+Import profiles describe how agent session files from remote machines should be mirrored into a local directory that can be ingested as a source. Configure a profile under `[imports.<name>]` in `config.toml`:
 
 ```toml
 [imports.vm503]
@@ -278,10 +278,17 @@ cadence = "manual"
 
 Commands:
 
-- `moraine import sync <name>` — preview the profile and planned local mirror.
+- `moraine import sync <name>` — preview the configured host, remote paths, and local mirror without mutating disk.
+- `moraine import sync <name> --execute` — create the local mirror directory if needed, then run system `rsync` over `ssh` for each configured `<host>:<remote_path>/` into the configured `local_mirror`.
 - `moraine import status` — show all profiles and their last sync manifest.
 
-Future live sync will store manifests as JSON under `~/.moraine/imports/<name>.json`.
+Live sync requires:
+
+- `rsync` on the local machine.
+- working remote SSH access for the configured host alias or hostname.
+- `rsync` available on the remote host, because the transfer runs through standard `rsync` over `ssh`.
+
+Execution records a JSON manifest at `<runtime.root_dir>/imports/<name>.json` with the sync timestamp, source host and paths, local mirror path, transferred file counts, transferred bytes, elapsed time, and `last_error` when a run fails after starting. Include and exclude patterns are passed through conservatively to `rsync`; preview mode still skips command execution.
 
 ## Backup and Restore
 

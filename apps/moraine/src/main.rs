@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
@@ -542,6 +543,13 @@ struct SyncResult {
     profile_name: String,
     success: bool,
     manifest: SyncManifest,
+}
+
+#[derive(Debug, Default)]
+struct RsyncStats {
+    files_copied: u64,
+    bytes_copied: u64,
+    files_skipped: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2878,6 +2886,31 @@ fn sync_manifest_path(cfg: &AppConfig, name: &str) -> PathBuf {
     imports_dir(cfg).join(format!("{name}.json"))
 }
 
+fn sync_timestamp() -> String {
+    format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    )
+}
+
+fn build_sync_manifest(name: &str, profile: &moraine_config::ImportProfile) -> SyncManifest {
+    SyncManifest {
+        profile_name: name.to_string(),
+        synced_at: sync_timestamp(),
+        source_host: profile.host.clone(),
+        source_paths: profile.remote_paths.clone(),
+        local_mirror: profile.local_mirror.clone(),
+        files_copied: 0,
+        bytes_copied: 0,
+        files_skipped: 0,
+        duration_ms: 0,
+        last_error: None,
+    }
+}
+
 fn read_sync_manifest(cfg: &AppConfig, name: &str) -> Result<Option<SyncManifest>> {
     let path = sync_manifest_path(cfg, name);
     if !path.exists() {
@@ -2890,38 +2923,186 @@ fn read_sync_manifest(cfg: &AppConfig, name: &str) -> Result<Option<SyncManifest
     Ok(Some(manifest))
 }
 
+fn write_sync_manifest(cfg: &AppConfig, name: &str, manifest: &SyncManifest) -> Result<()> {
+    let imports_dir = imports_dir(cfg);
+    fs::create_dir_all(&imports_dir)
+        .with_context(|| format!("failed to create imports dir {}", imports_dir.display()))?;
+    let path = sync_manifest_path(cfg, name);
+    let bytes = serde_json::to_vec_pretty(manifest).context("encode sync manifest")?;
+    fs::write(&path, bytes)
+        .with_context(|| format!("failed to write sync manifest {}", path.display()))
+}
+
+fn ensure_rsync_available() -> Result<()> {
+    match Command::new("rsync")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            bail!("rsync is required for `moraine import sync --execute` (exit status {status})")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("rsync is required for `moraine import sync --execute` and was not found on PATH")
+        }
+        Err(err) => Err(err).context("failed to probe rsync availability"),
+    }
+}
+
+fn build_rsync_args(
+    profile: &moraine_config::ImportProfile,
+    remote_path: &str,
+    destination: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "-az".to_string(),
+        "--prune-empty-dirs".to_string(),
+        "--stats".to_string(),
+        "-e".to_string(),
+        "ssh".to_string(),
+    ];
+
+    if !profile.include_patterns.is_empty() {
+        args.push("--include".to_string());
+        args.push("*/".to_string());
+        for pattern in &profile.include_patterns {
+            args.push("--include".to_string());
+            args.push(pattern.clone());
+        }
+        for pattern in &profile.exclude_patterns {
+            args.push("--exclude".to_string());
+            args.push(pattern.clone());
+        }
+        args.push("--exclude".to_string());
+        args.push("*".to_string());
+    } else {
+        for pattern in &profile.exclude_patterns {
+            args.push("--exclude".to_string());
+            args.push(pattern.clone());
+        }
+    }
+
+    let remote_root = remote_path.trim_end_matches('/');
+    args.push(format!("{}:{remote_root}/", profile.host));
+    args.push(destination.display().to_string());
+    args
+}
+
+fn parse_rsync_stat_value(text: &str, prefix: &str) -> Option<u64> {
+    let rest = text.strip_prefix(prefix)?.trim();
+    let number = rest
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(',')
+        .replace(',', "");
+    number.parse().ok()
+}
+
+fn parse_rsync_stats(output: &str) -> RsyncStats {
+    let mut total_files = None;
+    let mut files_copied = None;
+    let mut bytes_copied = None;
+
+    for line in output.lines().map(str::trim) {
+        if total_files.is_none() {
+            total_files = parse_rsync_stat_value(line, "Number of files:");
+        }
+        if files_copied.is_none() {
+            files_copied = parse_rsync_stat_value(line, "Number of regular files transferred:");
+        }
+        if bytes_copied.is_none() {
+            bytes_copied = parse_rsync_stat_value(line, "Total transferred file size:");
+        }
+    }
+
+    let files_copied = files_copied.unwrap_or(0);
+    let total_files = total_files.unwrap_or(files_copied);
+    RsyncStats {
+        files_copied,
+        bytes_copied: bytes_copied.unwrap_or(0),
+        files_skipped: total_files.saturating_sub(files_copied),
+    }
+}
+
+fn command_output_text(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (true, true) => String::new(),
+    }
+}
+
 async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<SyncResult> {
     let profile = cfg
         .imports
         .get(name)
         .ok_or_else(|| anyhow!("import profile '{}' not found in config", name))?;
 
-    if !dry_run {
-        bail!("live sync is not yet implemented; omit --execute to preview");
-    }
+    let mut manifest = build_sync_manifest(name, profile);
 
-    let manifest = SyncManifest {
-        profile_name: name.to_string(),
-        synced_at: format!(
-            "{}",
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        ),
-        source_host: profile.host.clone(),
-        source_paths: profile.remote_paths.clone(),
-        local_mirror: profile.local_mirror.clone(),
-        files_copied: 0,
-        bytes_copied: 0,
-        files_skipped: 0,
-        duration_ms: 0,
-        last_error: None,
-    };
+    if !dry_run {
+        ensure_rsync_available()?;
+
+        let local_mirror = PathBuf::from(&profile.local_mirror);
+        fs::create_dir_all(&local_mirror).with_context(|| {
+            format!(
+                "failed to create local import mirror {}",
+                local_mirror.display()
+            )
+        })?;
+
+        let started = Instant::now();
+        for remote_path in &profile.remote_paths {
+            let output = match Command::new("rsync")
+                .args(build_rsync_args(profile, remote_path, &local_mirror))
+                .output()
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    manifest.duration_ms = started.elapsed().as_millis() as u64;
+                    manifest.last_error = Some(format!(
+                        "failed to execute rsync for {}:{}: {}",
+                        profile.host, remote_path, err
+                    ));
+                    write_sync_manifest(cfg, name, &manifest)?;
+                    bail!(manifest.last_error.clone().unwrap_or_default());
+                }
+            };
+
+            if !output.status.success() {
+                manifest.duration_ms = started.elapsed().as_millis() as u64;
+                let detail = command_output_text(&output);
+                manifest.last_error = Some(if detail.is_empty() {
+                    format!("rsync failed for {}:{}", profile.host, remote_path)
+                } else {
+                    format!(
+                        "rsync failed for {}:{}: {detail}",
+                        profile.host, remote_path
+                    )
+                });
+                write_sync_manifest(cfg, name, &manifest)?;
+                bail!(manifest.last_error.clone().unwrap_or_default());
+            }
+
+            let stats = parse_rsync_stats(&command_output_text(&output));
+            manifest.files_copied += stats.files_copied;
+            manifest.bytes_copied += stats.bytes_copied;
+            manifest.files_skipped += stats.files_skipped;
+        }
+
+        manifest.synced_at = sync_timestamp();
+        manifest.duration_ms = started.elapsed().as_millis() as u64;
+        write_sync_manifest(cfg, name, &manifest)?;
+    }
 
     Ok(SyncResult {
         profile_name: name.to_string(),
-        success: true,
+        success: manifest.last_error.is_none(),
         manifest,
     })
 }
@@ -3648,15 +3829,28 @@ fn render_import_sync(output: &CliOutput, result: &SyncResult) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(result)?);
         return Ok(());
     }
-    let lines = vec![
+    let lines = import_sync_lines(result);
+    output.section("Import Sync", &lines);
+    Ok(())
+}
+
+fn import_sync_lines(result: &SyncResult) -> Vec<String> {
+    let mut lines = vec![
         format!("profile: {}", result.profile_name),
         format!("success: {}", result.success),
+        format!("host: {}", result.manifest.source_host),
+        format!("source paths: {}", result.manifest.source_paths.join(", ")),
+        format!("mirror: {}", result.manifest.local_mirror),
+        format!("synced at: {}", result.manifest.synced_at),
         format!("files copied: {}", result.manifest.files_copied),
+        format!("files skipped: {}", result.manifest.files_skipped),
         format!("bytes copied: {}", result.manifest.bytes_copied),
         format!("duration: {}ms", result.manifest.duration_ms),
     ];
-    output.section("Import Sync", &lines);
-    Ok(())
+    if let Some(error) = &result.manifest.last_error {
+        lines.push(format!("last error: {error}"));
+    }
+    lines
 }
 
 fn render_import_status(output: &CliOutput, snapshot: &ImportStatusSnapshot) -> Result<()> {
@@ -4234,6 +4428,14 @@ mod tests {
         }
     }
 
+    fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+            .block_on(future)
+    }
+
     #[test]
     fn tail_lines_returns_last_n_without_trailing_newline() {
         let root = temp_dir("tail-lines-basic");
@@ -4728,6 +4930,120 @@ mod tests {
         let verified = cmd_archive_verify(&root).expect("verify");
         assert_eq!(verified.tables[0].rows, 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_sync_preview_mode_still_works() {
+        let root = temp_dir("import-sync-preview");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.imports.insert(
+            "pc".to_string(),
+            moraine_config::ImportProfile {
+                host: "pc".to_string(),
+                remote_paths: vec!["~/.codex/sessions".to_string()],
+                local_mirror: root.join("mirror").display().to_string(),
+                include_patterns: vec!["**/*.jsonl".to_string()],
+                exclude_patterns: vec!["**/.git".to_string()],
+                cadence: "manual".to_string(),
+            },
+        );
+
+        let result = run_async(cmd_import_sync(&cfg, "pc", true)).expect("preview sync");
+        assert!(result.success);
+        assert_eq!(result.manifest.files_copied, 0);
+        assert_eq!(result.manifest.bytes_copied, 0);
+        assert!(!sync_manifest_path(&cfg, "pc").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_sync_execute_rejects_missing_rsync() {
+        let _env_lock = lock_env_vars();
+        let _path_guard = EnvVarGuard::capture("PATH");
+
+        let root = temp_dir("import-sync-missing-rsync");
+        let empty_path = root.join("bin");
+        fs::create_dir_all(&empty_path).expect("create empty path dir");
+        std::env::set_var("PATH", &empty_path);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.imports.insert(
+            "pc".to_string(),
+            moraine_config::ImportProfile {
+                host: "pc".to_string(),
+                remote_paths: vec!["~/.codex/sessions".to_string()],
+                local_mirror: root.join("mirror").display().to_string(),
+                include_patterns: Vec::new(),
+                exclude_patterns: Vec::new(),
+                cadence: "manual".to_string(),
+            },
+        );
+
+        let err = run_async(cmd_import_sync(&cfg, "pc", false)).expect_err("missing rsync");
+        assert!(err.to_string().contains("rsync is required"));
+        assert!(!sync_manifest_path(&cfg, "pc").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_manifest_round_trip_and_render_lines_include_error() {
+        let root = temp_dir("import-sync-manifest");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+
+        let profile = moraine_config::ImportProfile {
+            host: "pc".to_string(),
+            remote_paths: vec!["~/.codex/sessions".to_string()],
+            local_mirror: root.join("mirror").display().to_string(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            cadence: "manual".to_string(),
+        };
+        let mut manifest = build_sync_manifest("pc", &profile);
+        manifest.files_copied = 3;
+        manifest.bytes_copied = 42;
+        manifest.duration_ms = 99;
+        manifest.last_error = Some("rsync failed".to_string());
+
+        write_sync_manifest(&cfg, "pc", &manifest).expect("write sync manifest");
+        let round_trip = read_sync_manifest(&cfg, "pc")
+            .expect("read manifest")
+            .expect("manifest exists");
+        assert_eq!(round_trip.profile_name, manifest.profile_name);
+        assert_eq!(round_trip.local_mirror, manifest.local_mirror);
+        assert_eq!(round_trip.files_copied, 3);
+        assert_eq!(round_trip.last_error.as_deref(), Some("rsync failed"));
+
+        let lines = import_sync_lines(&SyncResult {
+            profile_name: "pc".to_string(),
+            success: false,
+            manifest: round_trip,
+        });
+        assert!(lines.iter().any(|line| line.contains("mirror:")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("last error: rsync failed")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_rsync_stats_extracts_transfer_counts() {
+        let stats = parse_rsync_stats(
+            r#"
+Number of files: 8 (reg: 5, dir: 3)
+Number of regular files transferred: 2
+Total transferred file size: 1,024 bytes
+"#,
+        );
+
+        assert_eq!(stats.files_copied, 2);
+        assert_eq!(stats.bytes_copied, 1024);
+        assert_eq!(stats.files_skipped, 6);
     }
 
     #[test]
