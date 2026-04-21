@@ -543,13 +543,9 @@ impl ClickHouseClient {
             findings.push(
                 self.doctor_count_finding(
                     "integrity.events_missing_raw_events",
-                    &format!(
-                        "SELECT toUInt64(count()) AS total FROM {}.events FINAL WHERE event_uid NOT IN (SELECT event_uid FROM {}.raw_events)",
-                        escape_identifier(&self.cfg.database),
-                        escape_identifier(&self.cfg.database)
-                    ),
+                    &events_missing_raw_events_query(&self.cfg.database),
                     "Every normalized event still has a backing raw_events row.",
-                    "events without raw_events backing rows",
+                    "events without raw_events source-coordinate backing rows",
                     "Re-import or restore the missing raw rows before relying on replay, audits, or provenance checks."
                         .to_string(),
                     DoctorSeverity::Error,
@@ -568,12 +564,9 @@ impl ClickHouseClient {
             findings.push(
                 self.doctor_count_finding(
                     "integrity.session_time_ranges",
-                    &format!(
-                        "SELECT toUInt64(count()) AS total FROM (SELECT session_id, min(session_date) AS min_session_date, max(session_date) AS max_session_date, toDate(min(event_ts)) AS first_event_date, toDate(max(event_ts)) AS last_event_date FROM {}.events FINAL GROUP BY session_id HAVING min_session_date != max_session_date OR min_session_date > last_event_date OR max_session_date < first_event_date)",
-                        escape_identifier(&self.cfg.database)
-                    ),
+                    &session_time_ranges_query(&self.cfg.database),
                     "Session time ranges are internally consistent.",
-                    "sessions with impossible time ranges",
+                    "sessions with session_date ranges outside event_ts ranges",
                     "Rebuild the affected sessions so `session_date` and event timestamps come from the same normalized source."
                         .to_string(),
                     DoctorSeverity::Warning,
@@ -927,6 +920,44 @@ fn expected_schema_objects() -> &'static [ExpectedSchemaObject] {
             engine: "MaterializedView",
         },
     ]
+}
+
+fn events_missing_raw_events_query(database: &str) -> String {
+    let db = escape_identifier(database);
+    format!(
+        "SELECT toUInt64(count()) AS total \
+         FROM {db}.events FINAL \
+         WHERE (source_name, source_file, source_generation, source_offset, source_line_no) \
+         NOT IN (\
+             SELECT source_name, source_file, source_generation, source_offset, source_line_no \
+             FROM {db}.raw_events\
+         )"
+    )
+}
+
+fn session_time_ranges_query(database: &str) -> String {
+    let db = escape_identifier(database);
+    format!(
+        "SELECT toUInt64(count()) AS total \
+         FROM (\
+             SELECT \
+                 session_id, \
+                 countIf(event_ts >= toDateTime64('2000-01-01 00:00:00', 3)) AS real_event_count, \
+                 countIf(session_date != toDate('1970-01-01')) AS real_session_date_rows, \
+                 minIf(session_date, session_date != toDate('1970-01-01')) AS min_session_date, \
+                 maxIf(session_date, session_date != toDate('1970-01-01')) AS max_session_date, \
+                 toDate(minIf(event_ts, event_ts >= toDateTime64('2000-01-01 00:00:00', 3))) AS first_event_date, \
+                 toDate(maxIf(event_ts, event_ts >= toDateTime64('2000-01-01 00:00:00', 3))) AS last_event_date \
+             FROM {db}.events FINAL \
+             GROUP BY session_id \
+             HAVING real_event_count > 0 \
+                 AND real_session_date_rows > 0 \
+                 AND (\
+                     dateDiff('day', max_session_date, first_event_date) > 2 \
+                     OR dateDiff('day', last_event_date, min_session_date) > 2\
+                 )\
+         )"
+    )
 }
 
 fn doctor_findings_from_report(report: &DoctorReport) -> Vec<DoctorFinding> {
@@ -1458,6 +1489,25 @@ mod tests {
             .summary
             .contains("mv_search_documents_from_events has engine View"));
         assert!(finding.summary.contains("v_conversation_trace"));
+    }
+
+    #[test]
+    fn events_missing_raw_events_query_uses_source_coordinates() {
+        let query = events_missing_raw_events_query("moraine");
+
+        assert!(query.contains("source_name, source_file, source_generation"));
+        assert!(query.contains("source_offset, source_line_no"));
+        assert!(!query.contains("event_uid NOT IN"));
+    }
+
+    #[test]
+    fn session_time_ranges_query_ignores_synthetic_epoch_and_allows_timezone_skew() {
+        let query = session_time_ranges_query("moraine");
+
+        assert!(query.contains("session_date != toDate('1970-01-01')"));
+        assert!(query.contains("event_ts >= toDateTime64('2000-01-01 00:00:00', 3)"));
+        assert!(query.contains("dateDiff('day', max_session_date, first_event_date) > 2"));
+        assert!(query.contains("dateDiff('day', last_event_date, min_session_date) > 2"));
     }
 
     #[test]

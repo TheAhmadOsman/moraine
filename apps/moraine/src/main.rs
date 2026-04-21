@@ -464,6 +464,7 @@ struct ClickHouseAsset {
 struct ServiceRuntimeStatus {
     service: Service,
     pid: Option<u32>,
+    supervisor: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1034,6 +1035,68 @@ fn service_running(paths: &RuntimePaths, service: Service) -> Option<u32> {
     } else {
         None
     }
+}
+
+fn pid_file_runtime_status(paths: &RuntimePaths, service: Service) -> Option<ServiceRuntimeStatus> {
+    service_running(paths, service).map(|pid| ServiceRuntimeStatus {
+        service,
+        pid: Some(pid),
+        supervisor: "pid_file".to_string(),
+    })
+}
+
+fn parse_launchctl_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("pid = ")?;
+        value.trim().parse::<u32>().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_runtime_status(service: Service) -> Option<ServiceRuntimeStatus> {
+    let uid = Command::new("id").arg("-u").output().ok()?;
+    if !uid.status.success() {
+        return None;
+    }
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    if uid.is_empty() {
+        return None;
+    }
+
+    let label = format!("local.moraine.{}", service.name());
+    let target = format!("gui/{uid}/{label}");
+    let output = Command::new("launchctl")
+        .arg("print")
+        .arg(&target)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_launchctl_pid(&text).and_then(|pid| {
+        is_pid_running(pid).then(|| ServiceRuntimeStatus {
+            service,
+            pid: Some(pid),
+            supervisor: format!("launchd:{label}"),
+        })
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_runtime_status(_service: Service) -> Option<ServiceRuntimeStatus> {
+    None
+}
+
+fn service_runtime_status(paths: &RuntimePaths, service: Service) -> ServiceRuntimeStatus {
+    pid_file_runtime_status(paths, service)
+        .or_else(|| launchd_runtime_status(service))
+        .unwrap_or(ServiceRuntimeStatus {
+            service,
+            pid: None,
+            supervisor: "none".to_string(),
+        })
 }
 
 fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {
@@ -2110,10 +2173,7 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
     ]
     .iter()
     .copied()
-    .map(|service| ServiceRuntimeStatus {
-        service,
-        pid: service_running(paths, service),
-    })
+    .map(|service| service_runtime_status(paths, service))
     .collect::<Vec<_>>();
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
@@ -2388,13 +2448,18 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                 );
+                cols.push(row.supervisor.clone());
             }
             cols
         })
         .collect();
 
     if output.verbose {
-        output.table("Services", &["", "state", "endpoint", "pid"], &service_rows);
+        output.table(
+            "Services",
+            &["", "state", "endpoint", "pid", "supervisor"],
+            &service_rows,
+        );
     } else {
         output.table("Services", &["", "state", "endpoint"], &service_rows);
     }
@@ -5110,6 +5175,7 @@ mod tests {
         let services = vec![ServiceRuntimeStatus {
             service: Service::ClickHouse,
             pid: None,
+            supervisor: "pid_file".to_string(),
         }];
         let report = test_doctor_report(true);
         let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
@@ -5125,6 +5191,7 @@ mod tests {
         let services = vec![ServiceRuntimeStatus {
             service: Service::ClickHouse,
             pid: Some(4242),
+            supervisor: "pid_file".to_string(),
         }];
         let report = test_doctor_report(false);
         let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
@@ -5389,10 +5456,12 @@ mod tests {
             ServiceRuntimeStatus {
                 service: Service::ClickHouse,
                 pid: Some(100),
+                supervisor: "pid_file".to_string(),
             },
             ServiceRuntimeStatus {
                 service: Service::Monitor,
                 pid: Some(200),
+                supervisor: "launchd:local.moraine.monitor".to_string(),
             },
         ];
         assert!(monitor_runtime_running(&services));
@@ -5400,8 +5469,22 @@ mod tests {
         let stopped_monitor = vec![ServiceRuntimeStatus {
             service: Service::Monitor,
             pid: None,
+            supervisor: "none".to_string(),
         }];
         assert!(!monitor_runtime_running(&stopped_monitor));
+    }
+
+    #[test]
+    fn parse_launchctl_pid_reads_running_job_pid() {
+        let output = r#"
+gui/501/local.moraine.monitor = {
+    state = running
+    pid = 96013
+}
+"#;
+
+        assert_eq!(parse_launchctl_pid(output), Some(96013));
+        assert_eq!(parse_launchctl_pid("state = waiting"), None);
     }
 
     #[test]
