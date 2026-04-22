@@ -8,7 +8,8 @@ Scope: Wave 4 operational safety, C04 source diagnostics
 - Added `moraine sources drift` with `--include-disabled` and JSON output.
 - Extended shared source file diagnostics with `canonical_event_count` from `events FINAL`.
 - Added source-level drift findings for expected idle sources, missing files, unobserved disk files, stale files, checkpoint-only files, raw rows without canonical events, canonical events without raw rows, ingest errors, SQLite sidecars, filesystem errors, and partial ClickHouse query failures.
-- Treated zero-byte Kimi CLI `.jsonl` sidecars with no ingest state as intentionally skipped for stale and unobserved drift classification.
+- Treated zero-byte JSONL files with no ingest state as intentionally skipped for stale and unobserved drift classification.
+- Excluded timestamp fallback diagnostics from source-health and source-drift error counts while keeping them queryable through `moraine sources errors`.
 - Updated monitor source file API typing and UI copy so raw rows and canonical events are visible together.
 
 ## Operational Use
@@ -19,8 +20,8 @@ Use `moraine sources drift` when source health looks ambiguous or after remote i
 - checkpoint exists but no rows landed;
 - raw rows landed but normalization emitted no events;
 - canonical events exist without raw backing rows;
-- ingest errors explain a source or file gap.
-- widened Kimi CLI globs can include empty placeholder sidecars without producing false stale or unobserved findings.
+- actionable ingest errors explain a source or file gap.
+- widened JSONL globs can include empty placeholder files without producing false stale or unobserved findings.
 
 ## Validation
 

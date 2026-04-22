@@ -240,7 +240,9 @@ struct FileLatestErrorRow {
     source_file: String,
     latest_error_at: String,
     latest_error_age_seconds: u64,
+    #[serde(rename = "latest_error_kind")]
     error_kind: String,
+    #[serde(rename = "latest_error_text")]
     error_text: String,
 }
 
@@ -493,7 +495,9 @@ async fn query_source_error_stats(
             argMax(error_kind, ingested_at) AS latest_error_kind, \
             argMax(error_text, ingested_at) AS latest_error_text \
          FROM {db}.ingest_errors \
-         GROUP BY source_name"
+         WHERE {} \
+         GROUP BY source_name",
+        actionable_ingest_error_predicate()
     );
     ch.query_rows(&query, None).await
 }
@@ -987,12 +991,13 @@ async fn query_file_latest_errors(
             source_file, \
             toString(max(ingested_at)) AS latest_error_at, \
             toUInt64(greatest(dateDiff('second', max(ingested_at), now()), 0)) AS latest_error_age_seconds, \
-            argMax(error_kind, ingested_at) AS error_kind, \
-            argMax(error_text, ingested_at) AS error_text \
+            argMax(error_kind, ingested_at) AS latest_error_kind, \
+            argMax(error_text, ingested_at) AS latest_error_text \
          FROM {db}.ingest_errors \
-         WHERE source_name = '{}' \
+         WHERE source_name = '{}' AND {} \
          GROUP BY source_file",
-        escape_literal(source_name)
+        escape_literal(source_name),
+        actionable_ingest_error_predicate()
     );
     ch.query_rows(&query, None).await
 }
@@ -1042,13 +1047,21 @@ fn sqlite_sidecar_flags(source: &IngestSource, path: &str) -> (Option<bool>, Opt
     (Some(wal), Some(shm))
 }
 
-fn is_empty_kimi_jsonl_sidecar(
+fn actionable_ingest_error_predicate() -> &'static str {
+    "error_kind != 'timestamp_parse_error'"
+}
+
+fn is_jsonl_source(source: &IngestSource) -> bool {
+    source.format.is_empty() || source.format == "jsonl"
+}
+
+fn is_empty_jsonl_placeholder(
     source: &IngestSource,
     path: &str,
     on_disk: bool,
     size_bytes: u64,
 ) -> bool {
-    if !on_disk || size_bytes != 0 || source.harness != "kimi-cli" {
+    if !on_disk || size_bytes != 0 || !is_jsonl_source(source) {
         return false;
     }
 
@@ -1066,7 +1079,7 @@ fn source_file_is_observation_free(file: &SourceFileRow) -> bool {
 }
 
 fn source_file_is_intentionally_skipped(source: &IngestSource, file: &SourceFileRow) -> bool {
-    is_empty_kimi_jsonl_sidecar(source, &file.path, file.on_disk, file.size_bytes)
+    is_empty_jsonl_placeholder(source, &file.path, file.on_disk, file.size_bytes)
         && source_file_is_observation_free(file)
 }
 
@@ -1124,7 +1137,7 @@ fn build_source_file_row(
         && canonical_stats.is_none()
         && latest_error.is_none();
     let intentionally_skipped =
-        is_empty_kimi_jsonl_sidecar(source, path_str, on_disk, size_bytes) && observation_free;
+        is_empty_jsonl_placeholder(source, path_str, on_disk, size_bytes) && observation_free;
     let stale_reason = if intentionally_skipped {
         None
     } else {
@@ -1768,6 +1781,14 @@ mod tests {
         assert_eq!(escape_literal("it's"), "it\\'s");
     }
 
+    #[test]
+    fn actionable_ingest_error_predicate_excludes_timestamp_fallback_noise() {
+        assert_eq!(
+            actionable_ingest_error_predicate(),
+            "error_kind != 'timestamp_parse_error'"
+        );
+    }
+
     fn test_source_file(
         path: &str,
         on_disk: bool,
@@ -1957,13 +1978,13 @@ mod tests {
     }
 
     #[test]
-    fn build_source_drift_row_skips_empty_kimi_jsonl_sidecars() {
+    fn build_source_drift_row_skips_empty_jsonl_placeholders() {
         let source = IngestSource {
-            name: "kimi-cli".to_string(),
-            harness: "kimi-cli".to_string(),
+            name: "pc-claude".to_string(),
+            harness: "claude-code".to_string(),
             enabled: true,
-            glob: "/tmp/kimi/**/*.jsonl".to_string(),
-            watch_root: "/tmp/kimi".to_string(),
+            glob: "/tmp/claude/**/*.jsonl".to_string(),
+            watch_root: "/tmp/claude".to_string(),
             format: "jsonl".to_string(),
         };
         let snapshot = SourceFilesSnapshot {
@@ -1971,7 +1992,7 @@ mod tests {
             watch_root: source.watch_root.clone(),
             glob: source.glob.clone(),
             files: vec![test_source_file_with_size(
-                "/tmp/kimi/work/session/context.jsonl",
+                "/tmp/claude/project/empty-session.jsonl",
                 true,
                 0,
                 false,
@@ -1995,16 +2016,16 @@ mod tests {
     }
 
     #[test]
-    fn build_source_drift_row_keeps_non_kimi_empty_jsonl_visible() {
+    fn build_source_drift_row_keeps_non_empty_jsonl_visible() {
         let source = test_source("codex", true);
         let snapshot = SourceFilesSnapshot {
             source_name: source.name.clone(),
             watch_root: source.watch_root.clone(),
             glob: source.glob.clone(),
             files: vec![test_source_file_with_size(
-                "/tmp/codex/empty.jsonl",
+                "/tmp/codex/non-empty.jsonl",
                 true,
-                0,
+                1,
                 false,
                 0,
                 0,

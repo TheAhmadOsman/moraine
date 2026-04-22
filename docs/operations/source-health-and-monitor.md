@@ -24,7 +24,7 @@ The command reads `[[ingest.sources]]` from the resolved config and joins that c
 - `ingest_checkpoints` for checkpoint count and latest checkpoint timestamp.
 - `raw_events` for raw ingested row count.
 - `events` for normalized canonical event count in file/drift diagnostics.
-- `ingest_errors` for error count plus latest error timestamp, kind, and text.
+- `ingest_errors` for actionable error count plus latest error timestamp, kind, and text. Timestamp fallback diagnostics (`timestamp_parse_error`) remain queryable through `moraine sources errors`, but source health excludes them because they usually mean an accepted legacy/control record lacked a timestamp and normalized with the documented epoch fallback.
 
 The JSON output is the most stable integration surface for scripts. It returns:
 
@@ -64,7 +64,7 @@ The JSON output is the most stable integration surface for scripts. It returns:
 - `canonical_without_raw`: normalized events exist without raw backing rows.
 - `ingest_errors`: one or more ingest errors are recorded.
 
-Zero-byte Kimi CLI `.jsonl` files are treated as intentionally skipped when they have no checkpoint, raw, canonical, or error state. This keeps widened Kimi globs such as `~/.kimi/sessions/**/*.jsonl` from reporting stale or unobserved drift for placeholder sidecars, while non-empty Kimi sidecars and empty files from other harnesses still surface normally.
+Zero-byte JSONL files are treated as intentionally skipped when they have no checkpoint, raw, canonical, or actionable error state. This keeps placeholder session files from reporting stale or unobserved drift, while non-empty JSONL files still surface normally.
 
 The JSON shape is intended for automation. Human output summarizes source-level counts and then lists typed findings with example paths.
 
@@ -168,7 +168,7 @@ Each file row is additive and can now include:
 - `stale_reason`, which explains the heuristic when a file appears behind its on-disk writes.
 - `sqlite_wal_present` and `sqlite_shm_present` for `opencode_sqlite` sources only. These fields are intentionally heuristic: they report whether sibling `*.db-wal` and `*.db-shm` files are currently visible next to a base `.db` path, not whether every SQLite-based source format necessarily uses sidecars.
 
-For Kimi CLI sources, zero-byte `.jsonl` files with no ingest state are left out of `stale` and `unobserved_disk_files` classification. They still appear in disk/glob counts and file listings, which makes the skip auditable without turning known-empty sidecars into warnings.
+For JSONL sources, zero-byte files with no ingest state are left out of `stale` and `unobserved_disk_files` classification. They still appear in disk/glob counts and file listings, which makes the skip auditable without turning known-empty placeholders into warnings.
 
 Partial failures stay localized to the affected query surface and are shown as `query_error` or `runtime_query_error` warnings in the panel instead of collapsing the whole view.
 
@@ -208,7 +208,7 @@ When a source is `warning`:
 
 1. Inspect `latest_error_kind` and `latest_error_text`.
 2. Open the source drilldown and sort mentally by the file-state badges: `missing`, `stale`, and `erroring` are the quickest path to the offending file.
-3. Query `ingest_errors` by `source_name` for examples.
+3. Query `ingest_errors` by `source_name` for examples. `timestamp_parse_error` rows are timestamp-quality diagnostics, not source-health warnings, unless accompanied by actionable parse or normalization errors.
 4. Compare raw source records against the relevant normalizer path in `crates/moraine-ingest-core/src/normalize.rs` or dispatcher path in `crates/moraine-ingest-core/src/dispatch.rs`.
 5. Treat repeated new errors after an upstream tool upgrade as likely schema drift.
 
