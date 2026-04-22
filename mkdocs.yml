@@ -66,6 +66,7 @@ nav:
       - Workspace Ownership: architecture/workspace-ownership.md
   - Roadmap:
       - Feature Roadmap 2026-04-20: roadmap/feature-roadmap-2026-04-20.md
+      - Implementation Waves 2026-04-22: roadmap/implementation-waves-2026-04-22.md
       - Strategic Specs Index: roadmap/specs/README.md
       - Ownership & Review: roadmap/specs/OWNERSHIP.md
       - P2 Specs:
@@ -87,6 +88,24 @@ nav:
           - S05 Anomaly Detection: roadmap/specs/S05-anomaly-detection.md
           - S06 Multimodal: roadmap/specs/S06-multimodal.md
       - Changelog:
+          - Index: roadmap/changelog/README.md
+          - Backup and Restore CLI: roadmap/changelog/backup-restore-cli.md
+          - Database Doctor Deep Core: roadmap/changelog/doctor-deep-core.md
+          - Import Config Export Foundation: roadmap/changelog/2026-04-20-import-config-export-slice.md
+          - Import Mirror Manifests: roadmap/changelog/import-mirror-manifests.md
+          - MCP Conformance Corpus: roadmap/changelog/mcp-conformance-corpus.md
+          - MCP Conformance and Safety: roadmap/changelog/mcp-conformance-safety-r11-r12.md
+          - MCP Prompts and Resources: roadmap/changelog/mcp-prompts-resources.md
+          - Migration Safety and Compatibility: roadmap/changelog/migration-safety-compat.md
+          - OpenCode Hardening Fixtures: roadmap/changelog/opencode-hardening-fixtures.md
+          - Operational Safety E2E: roadmap/changelog/operational-safety-e2e.md
+          - Privacy Encryption: roadmap/changelog/privacy-encryption.md
+          - Reindex Search Rebuild: roadmap/changelog/reindex-search-rebuild.md
+          - Search Quality Evaluation: roadmap/changelog/search-quality-evaluation.md
+          - Source Drift Diagnostics: roadmap/changelog/source-drift-diagnostics.md
+          - Source Error Quarantine: roadmap/changelog/source-error-quarantine.md
+          - Source File Runtime Detail: roadmap/changelog/source-file-runtime-detail.md
+          - Source Monitor: roadmap/changelog/source-monitor.md
           - Strategic Docs 2026-04-20: roadmap/changelog/strategic-docs.md
   - Development:
       - Dev Sandbox: development/sandbox.md

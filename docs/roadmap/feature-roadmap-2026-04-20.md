@@ -7,6 +7,11 @@ ingested into local ClickHouse, normalized into deterministic event/session
 tables, searched through BM25 and conversation APIs, exposed through MCP, and
 operated through CLI plus monitor UI.
 
+Implementation status was refreshed on April 22, 2026 through `60c7bf6
+feat(sources): add ingest error quarantine`. Use the [implementation waves
+index](implementation-waves-2026-04-22.md) for the current landed/postponed
+map across the roadmap implementation branches.
+
 The goal is not to add features for their own sake. The goal is to make Moraine
 more useful as durable agent memory, safer as an MCP retrieval surface, easier
 to operate over months of local and remote sessions, and easier to extend as new
@@ -93,23 +98,29 @@ Moraine should become a dependable local memory system for agentic work:
 - Ingest-time privacy redaction with explicit non-retroactive behavior and
   reversible AES-256-GCM `encrypt_raw` support.
 - Verified backup manifests with real `JSONEachRow` table exports, checksums,
-  source inventory, migration metadata, and dry-run restore planning.
+  source inventory, migration metadata, dry-run restore planning, and staging
+  restore execution.
 - Sandbox-based QA path for ingest, monitor, MCP, and schema changes.
 - OpenCode WAL sibling mapping and schema drift visibility.
+- Search quality evaluation tooling for offline/live BM25 regression checks.
+- Exact-coordinate source error quarantine for known-bad historical rows.
 
 ## Current Implementation Snapshot
 
 The roadmap intentionally includes both landed foundations and remaining work.
-As of `8377a8b`, these foundations are already in `main`:
+As of `60c7bf6`, these foundations are already in `main`:
 
 | Area | Landed foundation | Remaining roadmap work |
 |---|---|---|
-| R01 backup/restore | `backup create/list/verify` exports real ClickHouse `JSONEachRow` files and verifies checksums; `restore --execute` can restore verified backups into a fresh staging database. | Active database replacement, broader post-restore integrity automation, and sandbox e2e proof. |
-| R08 OpenCode hardening | WAL sibling watcher mapping, strict watermark paging, schema drift errors with `PRAGMA user_version`, and fixtures. | Broader OpenCode schema compatibility matrix and user-facing drift remediation. |
-| R09 privacy encryption | AES-256-GCM envelopes, env/file key loading, privacy metadata columns, and fail-closed missing-key behavior. | Key rotation, decrypt/export admin workflow, key backup checks, and re-encryption policy. |
-| R11/R12 MCP safety | Strict input schemas, output schemas, `safety_mode`, safety metadata, prose preamble, and regression tests. | Broader client conformance fixtures, MCP resources/prompts, and hostile-memory corpus tests. |
-| C02/C03 imports/config | Import-profile preview/status, config source discovery, validation, and interactive wizard foundations. | Live sync execution, mirror manifests, scheduling, and conflict/error surfacing. |
-| C04 source health | Shared CLI/monitor source status, `/api/sources`, `/api/sources/:source/files`, and `/api/sources/:source/errors`. | Rich source drilldown UI, file timelines, WAL visibility, and remediation actions. |
+| R01 backup/restore | `backup create/list/verify` exports real ClickHouse `JSONEachRow` files and verifies checksums; restore supports dry-run planning and fresh staging-database execution. | Active database replacement, broader post-restore integrity automation, and recovery runbooks. |
+| R02 reindex/search rebuild | `reindex --search-only` supports dry-run, execute, bounded batches, and resume. | Full canonical raw-source replay and privacy-policy reprocessing orchestration. |
+| R03/R04/R05 doctor and migration safety | Deep doctor findings, backup gates for risky operations, and ClickHouse compatibility reporting are in place. | Host corpus repair workflow and expanded gates for future active restore/privacy reprocess commands. |
+| R07/C04 source diagnostics | Shared CLI/monitor source status, `/api/sources`, `/api/sources/:source/files`, `/api/sources/:source/errors`, source drift, runtime/file detail, and source error quarantine are in place. | Remediation actions, file timelines, and launchd-aware local service status. |
+| R08 OpenCode hardening | WAL sibling watcher mapping, strict watermark paging, schema drift errors with observed table/column detail, and fixtures are in place. | Broader OpenCode schema compatibility matrix and user-facing upgrade remediation. |
+| R09/R10 privacy | AES-256-GCM envelopes, env/file key loading, privacy metadata columns, fail-closed missing-key behavior, and explicit non-retroactive policy docs are in place. | Key rotation, decrypt/export admin workflow, key backup checks, privacy audit, and re-encryption policy. |
+| R11/R12/C10 MCP safety | Strict input schemas, output schemas, `safety_mode`, safety metadata, prose preamble, conformance corpus, resources, and prompts are in place. | Hostile-memory regression corpus and broader client compatibility fixtures. |
+| C02/C03 imports/config | Import-profile preview/status, executable rsync sync, versioned mirror manifests, config source discovery, validation, and wizard foundations are in place. | Scheduling, conflict/error surfacing, and monitor import visibility. |
+| C07 search evaluation | Offline/live search quality evaluation harness with qrels, sample fixtures, and IR metrics is in place. | Curated qrels, CI thresholds, feedback capture, and ranking experiments. |
 | C11 archives | Portable archive preview/import/verify contract. | Live portable export/import and compatibility validation across versions. |
 
 ## Highest-Leverage Sequence
@@ -117,18 +128,19 @@ As of `8377a8b`, these foundations are already in `main`:
 This is the recommended order if we want the fastest path to a richer product
 without building on shaky operations:
 
-1. Finish the P0 operational safety loop: live restore, clean reindex, deep
-   doctor, migration gates, and backup-before-destructive-work enforcement.
+1. Finish the remaining P0 operational safety loop: active restore replacement,
+   full clean raw-source replay, host corpus repair planning, and broader
+   post-restore integrity automation.
 2. Add the P0 ingest durability loop: disk-backed retry spool, spool privacy
-   policy, checkpoint audit, and source drift reports.
+   policy, and checkpoint audit.
 3. Finish the P0 privacy loop: policy audit, key rotation, re-encryption,
    decrypt/export admin path, and monitor visibility.
-4. Expand P0 MCP safety into a client conformance corpus and hostile-memory
-   regression suite.
+4. Expand P0 MCP safety into a hostile-memory regression suite and broader
+   client compatibility fixtures.
 5. P1 monitor session explorer and source drilldown.
-6. P1 retrieval evaluation, field weighting, phrase/proximity search, and query
-   feedback loop.
-7. P1 remote import sync automation and source-adapter boundaries.
+6. P1 search quality work: curated qrels, field weighting, phrase/proximity
+   search, and query feedback loop.
+7. P1 remote import scheduling and source-adapter boundaries.
 8. P1 MCP resources/prompts and saved retrieval workflows.
 9. P2 summaries, curated memory, graph/entity layer, alerts, and OTel export.
 10. P3 hosted/team/multi-node modes after local mode is operationally mature.
