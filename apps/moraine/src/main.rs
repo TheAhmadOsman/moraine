@@ -39,6 +39,7 @@ const PRIVACY_METADATA_SQL: &str = include_str!("../../../sql/013_privacy_metada
 const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const BACKUP_TABLES_DIR: &str = "tables";
 const BACKUP_MANIFEST_VERSION: u32 = 1;
+const SYNC_MANIFEST_VERSION: u32 = 2;
 const DESTRUCTIVE_BACKUP_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const DESTRUCTIVE_BACKUP_MAX_AGE_LABEL: &str = "24h";
 
@@ -570,16 +571,56 @@ struct DownSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SyncManifest {
+    #[serde(default = "default_sync_manifest_version")]
+    manifest_version: u32,
     profile_name: String,
     synced_at: String,
     source_host: String,
     source_paths: Vec<String>,
     local_mirror: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    files_seen: u64,
     files_copied: u64,
     bytes_copied: u64,
     files_skipped: u64,
     duration_ms: u64,
+    #[serde(default)]
+    rsync_exit_code: Option<i32>,
+    #[serde(default)]
+    last_success: Option<SyncSuccessManifest>,
+    #[serde(default)]
+    sources: Vec<SyncSourceManifest>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SyncSuccessManifest {
+    synced_at: String,
+    source_host: String,
+    source_paths: Vec<String>,
+    local_mirror: String,
+    files_seen: u64,
+    files_copied: u64,
+    bytes_copied: u64,
+    files_skipped: u64,
+    duration_ms: u64,
+    source_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SyncSourceManifest {
+    source_path: String,
+    destination: String,
+    status: String,
+    files_seen: u64,
+    files_copied: u64,
+    bytes_copied: u64,
+    files_skipped: u64,
+    duration_ms: u64,
+    rsync_exit_code: Option<i32>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -591,6 +632,7 @@ struct SyncResult {
 
 #[derive(Debug, Default)]
 struct RsyncStats {
+    files_seen: u64,
     files_copied: u64,
     bytes_copied: u64,
     files_skipped: u64,
@@ -3133,17 +3175,73 @@ fn sync_timestamp() -> String {
     )
 }
 
-fn build_sync_manifest(name: &str, profile: &moraine_config::ImportProfile) -> SyncManifest {
+fn default_sync_manifest_version() -> u32 {
+    1
+}
+
+fn normalize_sync_manifest(manifest: &mut SyncManifest) {
+    if manifest.status.is_empty() {
+        manifest.status = if manifest.last_error.is_some() {
+            "failed".to_string()
+        } else {
+            "success".to_string()
+        };
+    }
+    if manifest.last_success.is_none()
+        && manifest.status == "success"
+        && manifest.last_error.is_none()
+    {
+        manifest.last_success = Some(SyncSuccessManifest {
+            synced_at: manifest.synced_at.clone(),
+            source_host: manifest.source_host.clone(),
+            source_paths: manifest.source_paths.clone(),
+            local_mirror: manifest.local_mirror.clone(),
+            files_seen: manifest.files_seen,
+            files_copied: manifest.files_copied,
+            bytes_copied: manifest.bytes_copied,
+            files_skipped: manifest.files_skipped,
+            duration_ms: manifest.duration_ms,
+            source_count: manifest.source_paths.len() as u64,
+        });
+    }
+}
+
+fn sync_success_from_manifest(manifest: &SyncManifest) -> SyncSuccessManifest {
+    SyncSuccessManifest {
+        synced_at: manifest.synced_at.clone(),
+        source_host: manifest.source_host.clone(),
+        source_paths: manifest.source_paths.clone(),
+        local_mirror: manifest.local_mirror.clone(),
+        files_seen: manifest.files_seen,
+        files_copied: manifest.files_copied,
+        bytes_copied: manifest.bytes_copied,
+        files_skipped: manifest.files_skipped,
+        duration_ms: manifest.duration_ms,
+        source_count: manifest.sources.len() as u64,
+    }
+}
+
+fn build_sync_manifest(
+    name: &str,
+    profile: &moraine_config::ImportProfile,
+    previous: Option<&SyncManifest>,
+) -> SyncManifest {
     SyncManifest {
+        manifest_version: SYNC_MANIFEST_VERSION,
         profile_name: name.to_string(),
         synced_at: sync_timestamp(),
         source_host: profile.host.clone(),
         source_paths: profile.remote_paths.clone(),
         local_mirror: profile.local_mirror.clone(),
+        status: "pending".to_string(),
+        files_seen: 0,
         files_copied: 0,
         bytes_copied: 0,
         files_skipped: 0,
         duration_ms: 0,
+        rsync_exit_code: None,
+        last_success: previous.and_then(|manifest| manifest.last_success.clone()),
+        sources: Vec::new(),
         last_error: None,
     }
 }
@@ -3155,8 +3253,9 @@ fn read_sync_manifest(cfg: &AppConfig, name: &str) -> Result<Option<SyncManifest
     }
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read sync manifest {}", path.display()))?;
-    let manifest: SyncManifest = serde_json::from_str(&text)
+    let mut manifest: SyncManifest = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse sync manifest {}", path.display()))?;
+    normalize_sync_manifest(&mut manifest);
     Ok(Some(manifest))
 }
 
@@ -3166,7 +3265,7 @@ fn write_sync_manifest(cfg: &AppConfig, name: &str, manifest: &SyncManifest) -> 
         .with_context(|| format!("failed to create imports dir {}", imports_dir.display()))?;
     let path = sync_manifest_path(cfg, name);
     let bytes = serde_json::to_vec_pretty(manifest).context("encode sync manifest")?;
-    fs::write(&path, bytes)
+    write_atomic_bytes(&path, &bytes)
         .with_context(|| format!("failed to write sync manifest {}", path.display()))
 }
 
@@ -3255,11 +3354,12 @@ fn parse_rsync_stats(output: &str) -> RsyncStats {
     }
 
     let files_copied = files_copied.unwrap_or(0);
-    let total_files = total_files.unwrap_or(files_copied);
+    let files_seen = total_files.unwrap_or(files_copied);
     RsyncStats {
+        files_seen,
         files_copied,
         bytes_copied: bytes_copied.unwrap_or(0),
-        files_skipped: total_files.saturating_sub(files_copied),
+        files_skipped: files_seen.saturating_sub(files_copied),
     }
 }
 
@@ -3274,13 +3374,60 @@ fn command_output_text(output: &Output) -> String {
     }
 }
 
+fn sync_source_manifest(
+    remote_path: &str,
+    local_mirror: &Path,
+    status: &str,
+    stats: RsyncStats,
+    duration_ms: u64,
+    rsync_exit_code: Option<i32>,
+    error: Option<String>,
+) -> SyncSourceManifest {
+    SyncSourceManifest {
+        source_path: remote_path.to_string(),
+        destination: local_mirror.display().to_string(),
+        status: status.to_string(),
+        files_seen: stats.files_seen,
+        files_copied: stats.files_copied,
+        bytes_copied: stats.bytes_copied,
+        files_skipped: stats.files_skipped,
+        duration_ms,
+        rsync_exit_code,
+        error,
+    }
+}
+
+fn append_not_started_sync_sources(
+    manifest: &mut SyncManifest,
+    profile: &moraine_config::ImportProfile,
+    local_mirror: &Path,
+    start_index: usize,
+) {
+    for remote_path in profile.remote_paths.iter().skip(start_index) {
+        manifest.sources.push(sync_source_manifest(
+            remote_path,
+            local_mirror,
+            "not_started",
+            RsyncStats::default(),
+            0,
+            None,
+            None,
+        ));
+    }
+}
+
 async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<SyncResult> {
     let profile = cfg
         .imports
         .get(name)
         .ok_or_else(|| anyhow!("import profile '{}' not found in config", name))?;
 
-    let mut manifest = build_sync_manifest(name, profile);
+    let previous = if dry_run {
+        read_sync_manifest(cfg, name).ok().flatten()
+    } else {
+        read_sync_manifest(cfg, name)?
+    };
+    let mut manifest = build_sync_manifest(name, profile, previous.as_ref());
 
     if !dry_run {
         ensure_rsync_available()?;
@@ -3294,7 +3441,8 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
         })?;
 
         let started = Instant::now();
-        for remote_path in &profile.remote_paths {
+        for (index, remote_path) in profile.remote_paths.iter().enumerate() {
+            let source_started = Instant::now();
             let output = match Command::new("rsync")
                 .args(build_rsync_args(profile, remote_path, &local_mirror))
                 .output()
@@ -3302,10 +3450,26 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
                 Ok(output) => output,
                 Err(err) => {
                     manifest.duration_ms = started.elapsed().as_millis() as u64;
+                    manifest.status = "failed".to_string();
                     manifest.last_error = Some(format!(
                         "failed to execute rsync for {}:{}: {}",
                         profile.host, remote_path, err
                     ));
+                    manifest.sources.push(sync_source_manifest(
+                        remote_path,
+                        &local_mirror,
+                        "failed",
+                        RsyncStats::default(),
+                        source_started.elapsed().as_millis() as u64,
+                        None,
+                        manifest.last_error.clone(),
+                    ));
+                    append_not_started_sync_sources(
+                        &mut manifest,
+                        profile,
+                        &local_mirror,
+                        index + 1,
+                    );
                     write_sync_manifest(cfg, name, &manifest)?;
                     bail!(manifest.last_error.clone().unwrap_or_default());
                 }
@@ -3313,6 +3477,8 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
 
             if !output.status.success() {
                 manifest.duration_ms = started.elapsed().as_millis() as u64;
+                manifest.status = "failed".to_string();
+                manifest.rsync_exit_code = output.status.code();
                 let detail = command_output_text(&output);
                 manifest.last_error = Some(if detail.is_empty() {
                     format!("rsync failed for {}:{}", profile.host, remote_path)
@@ -3322,24 +3488,49 @@ async fn cmd_import_sync(cfg: &AppConfig, name: &str, dry_run: bool) -> Result<S
                         profile.host, remote_path
                     )
                 });
+                manifest.sources.push(sync_source_manifest(
+                    remote_path,
+                    &local_mirror,
+                    "failed",
+                    parse_rsync_stats(&detail),
+                    source_started.elapsed().as_millis() as u64,
+                    output.status.code(),
+                    manifest.last_error.clone(),
+                ));
+                append_not_started_sync_sources(&mut manifest, profile, &local_mirror, index + 1);
                 write_sync_manifest(cfg, name, &manifest)?;
                 bail!(manifest.last_error.clone().unwrap_or_default());
             }
 
             let stats = parse_rsync_stats(&command_output_text(&output));
+            manifest.files_seen += stats.files_seen;
             manifest.files_copied += stats.files_copied;
             manifest.bytes_copied += stats.bytes_copied;
             manifest.files_skipped += stats.files_skipped;
+            manifest.sources.push(sync_source_manifest(
+                remote_path,
+                &local_mirror,
+                "success",
+                stats,
+                source_started.elapsed().as_millis() as u64,
+                output.status.code(),
+                None,
+            ));
         }
 
         manifest.synced_at = sync_timestamp();
         manifest.duration_ms = started.elapsed().as_millis() as u64;
+        manifest.status = "success".to_string();
+        manifest.rsync_exit_code = Some(0);
+        manifest.last_success = Some(sync_success_from_manifest(&manifest));
         write_sync_manifest(cfg, name, &manifest)?;
+    } else {
+        manifest.status = "preview".to_string();
     }
 
     Ok(SyncResult {
         profile_name: name.to_string(),
-        success: manifest.last_error.is_none(),
+        success: manifest.status != "failed",
         manifest,
     })
 }
@@ -4385,15 +4576,31 @@ fn import_sync_lines(result: &SyncResult) -> Vec<String> {
     let mut lines = vec![
         format!("profile: {}", result.profile_name),
         format!("success: {}", result.success),
+        format!("status: {}", result.manifest.status),
         format!("host: {}", result.manifest.source_host),
         format!("source paths: {}", result.manifest.source_paths.join(", ")),
         format!("mirror: {}", result.manifest.local_mirror),
         format!("synced at: {}", result.manifest.synced_at),
+        format!("files seen: {}", result.manifest.files_seen),
         format!("files copied: {}", result.manifest.files_copied),
         format!("files skipped: {}", result.manifest.files_skipped),
         format!("bytes copied: {}", result.manifest.bytes_copied),
         format!("duration: {}ms", result.manifest.duration_ms),
     ];
+    if let Some(last_success) = &result.manifest.last_success {
+        lines.push(format!("last successful sync: {}", last_success.synced_at));
+    }
+    for source in &result.manifest.sources {
+        lines.push(format!(
+            "source {}: {} (seen {}, copied {}, skipped {}, bytes {})",
+            source.source_path,
+            source.status,
+            source.files_seen,
+            source.files_copied,
+            source.files_skipped,
+            source.bytes_copied
+        ));
+    }
     if let Some(error) = &result.manifest.last_error {
         lines.push(format!("last error: {error}"));
     }
@@ -4412,7 +4619,13 @@ fn render_import_status(output: &CliOutput, snapshot: &ImportStatusSnapshot) -> 
             let last_sync = p
                 .last_sync
                 .as_ref()
-                .map(|m| format!("{} ({} files)", m.synced_at, m.files_copied))
+                .map(|m| format!("{} ({})", m.synced_at, m.status))
+                .unwrap_or_else(|| "never".to_string());
+            let last_success = p
+                .last_sync
+                .as_ref()
+                .and_then(|m| m.last_success.as_ref())
+                .map(|s| format!("{} ({} copied)", s.synced_at, s.files_copied))
                 .unwrap_or_else(|| "never".to_string());
             vec![
                 p.name.clone(),
@@ -4420,12 +4633,20 @@ fn render_import_status(output: &CliOutput, snapshot: &ImportStatusSnapshot) -> 
                 p.local_mirror.clone(),
                 p.cadence.clone(),
                 last_sync,
+                last_success,
             ]
         })
         .collect();
     output.table(
         "Import Profiles",
-        &["name", "host", "mirror", "cadence", "last_sync"],
+        &[
+            "name",
+            "host",
+            "mirror",
+            "cadence",
+            "last_run",
+            "last_success",
+        ],
         &rows,
     );
     Ok(())
@@ -4969,6 +5190,9 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarGuard {
@@ -5012,6 +5236,16 @@ mod tests {
     fn write_file(path: &Path) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(path, b"#!/bin/sh\n").expect("write file");
+    }
+
+    #[cfg(unix)]
+    fn write_fake_rsync(root: &Path, body: &str) -> PathBuf {
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let path = bin_dir.join("rsync");
+        fs::write(&path, body).expect("write fake rsync");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake rsync");
+        bin_dir
     }
 
     fn test_doctor_report(clickhouse_healthy: bool) -> DoctorReport {
@@ -5693,10 +5927,11 @@ gui/501/local.moraine.monitor = {
             exclude_patterns: Vec::new(),
             cadence: "manual".to_string(),
         };
-        let mut manifest = build_sync_manifest("pc", &profile);
+        let mut manifest = build_sync_manifest("pc", &profile, None);
         manifest.files_copied = 3;
         manifest.bytes_copied = 42;
         manifest.duration_ms = 99;
+        manifest.status = "failed".to_string();
         manifest.last_error = Some("rsync failed".to_string());
 
         write_sync_manifest(&cfg, "pc", &manifest).expect("write sync manifest");
@@ -5706,6 +5941,7 @@ gui/501/local.moraine.monitor = {
         assert_eq!(round_trip.profile_name, manifest.profile_name);
         assert_eq!(round_trip.local_mirror, manifest.local_mirror);
         assert_eq!(round_trip.files_copied, 3);
+        assert_eq!(round_trip.status, "failed");
         assert_eq!(round_trip.last_error.as_deref(), Some("rsync failed"));
 
         let lines = import_sync_lines(&SyncResult {
@@ -5721,6 +5957,153 @@ gui/501/local.moraine.monitor = {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn import_sync_execute_writes_per_source_manifest_and_last_success() {
+        let _env_lock = lock_env_vars();
+        let _path_guard = EnvVarGuard::capture("PATH");
+
+        let root = temp_dir("import-sync-execute-manifest");
+        let bin_dir = write_fake_rsync(
+            &root,
+            r#"#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "rsync version 3.2.7"
+  exit 0
+fi
+printf '%s\n' \
+  'Number of files: 5 (reg: 3, dir: 2)' \
+  'Number of regular files transferred: 2' \
+  'Total transferred file size: 123 bytes'
+exit 0
+"#,
+        );
+        std::env::set_var("PATH", &bin_dir);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.imports.insert(
+            "pc".to_string(),
+            moraine_config::ImportProfile {
+                host: "pc".to_string(),
+                remote_paths: vec!["~/.codex/sessions".to_string(), "~/.claude".to_string()],
+                local_mirror: root.join("mirror").display().to_string(),
+                include_patterns: Vec::new(),
+                exclude_patterns: Vec::new(),
+                cadence: "manual".to_string(),
+            },
+        );
+
+        let result = run_async(cmd_import_sync(&cfg, "pc", false)).expect("execute sync");
+        assert!(result.success);
+        assert_eq!(result.manifest.manifest_version, SYNC_MANIFEST_VERSION);
+        assert_eq!(result.manifest.status, "success");
+        assert_eq!(result.manifest.files_seen, 10);
+        assert_eq!(result.manifest.files_copied, 4);
+        assert_eq!(result.manifest.files_skipped, 6);
+        assert_eq!(result.manifest.bytes_copied, 246);
+        assert_eq!(result.manifest.sources.len(), 2);
+        assert_eq!(result.manifest.sources[0].source_path, "~/.codex/sessions");
+        assert_eq!(result.manifest.sources[0].status, "success");
+        assert_eq!(
+            result
+                .manifest
+                .last_success
+                .as_ref()
+                .expect("last success")
+                .source_count,
+            2
+        );
+
+        let round_trip = read_sync_manifest(&cfg, "pc")
+            .expect("read manifest")
+            .expect("manifest exists");
+        assert_eq!(round_trip.status, "success");
+        assert_eq!(round_trip.sources.len(), 2);
+        assert!(round_trip.last_success.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_sync_failure_preserves_previous_last_success() {
+        let _env_lock = lock_env_vars();
+        let _path_guard = EnvVarGuard::capture("PATH");
+
+        let root = temp_dir("import-sync-failure-manifest");
+        let bin_dir = write_fake_rsync(
+            &root,
+            r#"#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "rsync version 3.2.7"
+  exit 0
+fi
+printf '%s\n' \
+  'Number of files: 4 (reg: 3, dir: 1)' \
+  'Number of regular files transferred: 1' \
+  'Total transferred file size: 77 bytes'
+echo "network down" >&2
+exit 12
+"#,
+        );
+        std::env::set_var("PATH", &bin_dir);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        let mirror = root.join("mirror");
+        cfg.imports.insert(
+            "pc".to_string(),
+            moraine_config::ImportProfile {
+                host: "pc".to_string(),
+                remote_paths: vec!["~/.codex/sessions".to_string(), "~/.claude".to_string()],
+                local_mirror: mirror.display().to_string(),
+                include_patterns: Vec::new(),
+                exclude_patterns: Vec::new(),
+                cadence: "manual".to_string(),
+            },
+        );
+        fs::create_dir_all(imports_dir(&cfg)).expect("create imports dir");
+        fs::write(
+            sync_manifest_path(&cfg, "pc"),
+            format!(
+                r#"{{
+  "profile_name": "pc",
+  "synced_at": "12345",
+  "source_host": "pc",
+  "source_paths": ["~/.codex/sessions"],
+  "local_mirror": "{}",
+  "files_copied": 7,
+  "bytes_copied": 700,
+  "files_skipped": 2,
+  "duration_ms": 99,
+  "last_error": null
+}}"#,
+                mirror.display()
+            ),
+        )
+        .expect("write legacy manifest");
+
+        let err = run_async(cmd_import_sync(&cfg, "pc", false)).expect_err("failed sync");
+        assert!(err.to_string().contains("network down"));
+
+        let manifest = read_sync_manifest(&cfg, "pc")
+            .expect("read failed manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.status, "failed");
+        assert_eq!(manifest.rsync_exit_code, Some(12));
+        assert_eq!(manifest.files_copied, 0);
+        assert_eq!(manifest.sources.len(), 2);
+        assert_eq!(manifest.sources[0].status, "failed");
+        assert_eq!(manifest.sources[0].rsync_exit_code, Some(12));
+        assert_eq!(manifest.sources[1].status, "not_started");
+        let last_success = manifest.last_success.expect("previous last success");
+        assert_eq!(last_success.synced_at, "12345");
+        assert_eq!(last_success.files_copied, 7);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn parse_rsync_stats_extracts_transfer_counts() {
         let stats = parse_rsync_stats(
@@ -5731,6 +6114,7 @@ Total transferred file size: 1,024 bytes
 "#,
         );
 
+        assert_eq!(stats.files_seen, 8);
         assert_eq!(stats.files_copied, 2);
         assert_eq!(stats.bytes_copied, 1024);
         assert_eq!(stats.files_skipped, 6);

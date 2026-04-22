@@ -298,7 +298,7 @@ Commands:
 
 - `moraine import sync <name>` — preview the configured host, remote paths, and local mirror without mutating disk.
 - `moraine import sync <name> --execute` — create the local mirror directory if needed, then run system `rsync` over `ssh` for each configured `<host>:<remote_path>/` into the configured `local_mirror`.
-- `moraine import status` — show all profiles and their last sync manifest.
+- `moraine import status` — show all profiles, last run state, and last successful sync.
 
 Live sync requires:
 
@@ -306,7 +306,14 @@ Live sync requires:
 - working remote SSH access for the configured host alias or hostname.
 - `rsync` available on the remote host, because the transfer runs through standard `rsync` over `ssh`.
 
-Execution records a JSON manifest at `<runtime.root_dir>/imports/<name>.json` with the sync timestamp, source host and paths, local mirror path, transferred file counts, transferred bytes, elapsed time, and `last_error` when a run fails after starting. Include and exclude patterns are passed through conservatively to `rsync`; preview mode still skips command execution.
+Execution records a JSON manifest at `<runtime.root_dir>/imports/<name>.json`. Manifest version 2 records:
+
+- profile name, source host, configured remote paths, local mirror, and current run status;
+- aggregate `files_seen`, `files_copied`, `files_skipped`, `bytes_copied`, duration, and rsync exit code;
+- one `sources[]` entry per configured remote path with that path's rsync status, counts, duration, exit code, and error text when present;
+- `last_success`, which preserves the last known-good sync even if a later run fails partway through.
+
+Failed runs write the manifest before returning an error when rsync starts but fails. Paths that were not attempted after a failure are recorded with `status = "not_started"`. If `rsync` is missing locally, the command fails before writing a new manifest so the previous known-good state is not overwritten. Include and exclude patterns are passed through conservatively to `rsync`; preview mode still skips command execution.
 
 ## Backup and Restore
 

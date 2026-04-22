@@ -106,9 +106,8 @@ max_query_terms = 32
 
 # Remote import profiles mirror sessions from another machine into a local
 # directory that can then be ingested as a source. `cadence` can be
-# "manual", "on_start", "5min", "30min", or "1h". The sync command uses rsync
-# over SSH and records a manifest under ~/.moraine/imports/ once live sync is
-# enabled. Current CLI support previews configured profiles.
+# "manual", "on_start", "5min", "30min", or "1h". The sync command can execute
+# rsync over SSH and records a versioned manifest under ~/.moraine/imports/.
 # [imports.vm503]
 # host = "vm503.local"
 # remote_paths = ["~/.codex/sessions", "~/.claude/projects"]

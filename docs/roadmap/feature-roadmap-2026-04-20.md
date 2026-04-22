@@ -649,7 +649,8 @@ First slice:
 - Add `[imports.<name>]` config for SSH host, remote paths, local mirror path,
   include/exclude patterns, and cadence.
 - Provide `moraine import sync <name>` and `moraine import status`.
-- Record sync manifests with file counts, bytes, last success, and errors.
+- Record versioned sync manifests with aggregate and per-source file counts,
+  bytes, rsync result, last success, and errors.
 
 Edge cases:
 
