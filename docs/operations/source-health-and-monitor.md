@@ -26,6 +26,18 @@ The command reads `[[ingest.sources]]` from the resolved config and joins that c
 - `events` for normalized canonical event count in file/drift diagnostics.
 - `ingest_errors` for actionable error count plus latest error timestamp, kind, and text. Timestamp fallback diagnostics (`timestamp_parse_error`) remain queryable through `moraine sources errors`, but source health excludes them because they usually mean an accepted legacy/control record lacked a timestamp and normalized with the documented epoch fallback.
 
+Known-bad historical ingest-error rows can also be ignored by exact coordinate in config. This is intended for corrupted imported transcripts where preserving the raw mirror matters more than deleting or editing a few bad lines. The ignore only affects source status, source drift, and file-level latest-error classification; `moraine sources errors` and the monitor error drilldown still return the row with `ignored = true` and the configured reason. Error detail views order configured ignores first, actionable errors next, and timestamp fallback diagnostics last so quarantined rows are easy to audit even when a source has many timestamp diagnostics.
+
+```toml
+[[source_status.ignored_ingest_errors]]
+source_name = "pc-claude"
+source_file = "~/.moraine/imports/pc/claude/projects/project/session.jsonl"
+source_line_no = 10
+source_offset = 8015
+error_kind = "json_parse_error"
+reason = "Historical mirrored transcript row contains corrupted bytes."
+```
+
 The JSON output is the most stable integration surface for scripts. It returns:
 
 ```json
@@ -208,7 +220,7 @@ When a source is `warning`:
 
 1. Inspect `latest_error_kind` and `latest_error_text`.
 2. Open the source drilldown and sort mentally by the file-state badges: `missing`, `stale`, and `erroring` are the quickest path to the offending file.
-3. Query `ingest_errors` by `source_name` for examples. `timestamp_parse_error` rows are timestamp-quality diagnostics, not source-health warnings, unless accompanied by actionable parse or normalization errors.
+3. Query `ingest_errors` by `source_name` for examples. `timestamp_parse_error` rows are timestamp-quality diagnostics, not source-health warnings, unless accompanied by actionable parse or normalization errors. Configured quarantines are still returned by `moraine sources errors` with `ignored = true`.
 4. Compare raw source records against the relevant normalizer path in `crates/moraine-ingest-core/src/normalize.rs` or dispatcher path in `crates/moraine-ingest-core/src/dispatch.rs`.
 5. Treat repeated new errors after an upstream tool upgrade as likely schema drift.
 

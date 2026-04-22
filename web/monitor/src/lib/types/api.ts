@@ -192,6 +192,8 @@ export interface SourceErrorRow {
   error_kind: string;
   error_text: string;
   raw_fragment: string;
+  ignored: boolean;
+  ignore_reason: string | null;
 }
 
 export interface SourceErrorsResponse {

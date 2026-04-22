@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
+use moraine_config::IgnoredIngestError;
 use moraine_config::IngestSource;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -259,6 +260,8 @@ pub struct SourceErrorRow {
     pub error_kind: String,
     pub error_text: String,
     pub raw_fragment: String,
+    pub ignored: bool,
+    pub ignore_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -486,7 +489,9 @@ async fn query_source_raw_counts(ch: &ClickHouseClient, db: &str) -> Result<Vec<
 async fn query_source_error_stats(
     ch: &ClickHouseClient,
     db: &str,
+    cfg: &AppConfig,
 ) -> Result<Vec<SourceErrorStatsRow>> {
+    let active_error_predicate = active_ingest_error_predicate(cfg);
     let query = format!(
         "SELECT \
             source_name, \
@@ -497,7 +502,7 @@ async fn query_source_error_stats(
          FROM {db}.ingest_errors \
          WHERE {} \
          GROUP BY source_name",
-        actionable_ingest_error_predicate()
+        active_error_predicate
     );
     ch.query_rows(&query, None).await
 }
@@ -713,7 +718,11 @@ fn build_source_detail_warnings(
     warnings
 }
 
-async fn query_source_status_state(ch: &ClickHouseClient, db: &str) -> SourceStatusQueryState {
+async fn query_source_status_state(
+    ch: &ClickHouseClient,
+    db: &str,
+    cfg: &AppConfig,
+) -> SourceStatusQueryState {
     let mut query_error = None::<String>;
     let checkpoint_rows = match query_source_checkpoint_stats(ch, db).await {
         Ok(rows) => rows,
@@ -731,7 +740,7 @@ async fn query_source_status_state(ch: &ClickHouseClient, db: &str) -> SourceSta
             Vec::new()
         }
     };
-    let error_rows = match query_source_error_stats(ch, db).await {
+    let error_rows = match query_source_error_stats(ch, db, cfg).await {
         Ok(rows) => rows,
         Err(err) => {
             if query_error.is_none() {
@@ -790,7 +799,7 @@ pub async fn build_source_status_snapshot(
 ) -> Result<SourceStatusSnapshot> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
-    let state = query_source_status_state(&ch, &db).await;
+    let state = query_source_status_state(&ch, &db, cfg).await;
 
     let mut sources = Vec::new();
     for source in &cfg.ingest.sources {
@@ -830,7 +839,7 @@ pub async fn build_source_detail_snapshot(
 
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
-    let state = query_source_status_state(&ch, &db).await;
+    let state = query_source_status_state(&ch, &db, cfg).await;
     let (runtime_row, runtime_query_error) = match query_source_runtime(&ch, &db).await {
         Ok(row) => (row, None),
         Err(err) => (None, Some(format!("heartbeat query failed: {err}"))),
@@ -985,7 +994,9 @@ async fn query_file_latest_errors(
     ch: &ClickHouseClient,
     db: &str,
     source_name: &str,
+    cfg: &AppConfig,
 ) -> Result<Vec<FileLatestErrorRow>> {
+    let active_error_predicate = active_ingest_error_predicate(cfg);
     let query = format!(
         "SELECT \
             source_file, \
@@ -997,7 +1008,7 @@ async fn query_file_latest_errors(
          WHERE source_name = '{}' AND {} \
          GROUP BY source_file",
         escape_literal(source_name),
-        actionable_ingest_error_predicate()
+        active_error_predicate
     );
     ch.query_rows(&query, None).await
 }
@@ -1049,6 +1060,104 @@ fn sqlite_sidecar_flags(source: &IngestSource, path: &str) -> (Option<bool>, Opt
 
 fn actionable_ingest_error_predicate() -> &'static str {
     "error_kind != 'timestamp_parse_error'"
+}
+
+fn ignored_ingest_error_clause(ignore: &IgnoredIngestError) -> Option<String> {
+    if ignore.source_name.is_empty()
+        || ignore.source_file.is_empty()
+        || ignore.error_kind.is_empty()
+        || (ignore.source_line_no.is_none() && ignore.source_offset.is_none())
+    {
+        return None;
+    }
+
+    let mut terms = vec![
+        format!("source_name = '{}'", escape_literal(&ignore.source_name)),
+        format!("source_file = '{}'", escape_literal(&ignore.source_file)),
+        format!("error_kind = '{}'", escape_literal(&ignore.error_kind)),
+    ];
+    if let Some(line_no) = ignore.source_line_no {
+        terms.push(format!("source_line_no = {line_no}"));
+    }
+    if let Some(offset) = ignore.source_offset {
+        terms.push(format!("source_offset = {offset}"));
+    }
+
+    Some(format!("({})", terms.join(" AND ")))
+}
+
+fn active_ingest_error_predicate(cfg: &AppConfig) -> String {
+    let ignored = cfg
+        .source_status
+        .ignored_ingest_errors
+        .iter()
+        .filter_map(ignored_ingest_error_clause)
+        .collect::<Vec<_>>();
+
+    if ignored.is_empty() {
+        actionable_ingest_error_predicate().to_string()
+    } else {
+        format!(
+            "{} AND NOT ({})",
+            actionable_ingest_error_predicate(),
+            ignored.join(" OR ")
+        )
+    }
+}
+
+fn ignored_ingest_error_predicate(cfg: &AppConfig) -> Option<String> {
+    let ignored = cfg
+        .source_status
+        .ignored_ingest_errors
+        .iter()
+        .filter_map(ignored_ingest_error_clause)
+        .collect::<Vec<_>>();
+
+    if ignored.is_empty() {
+        None
+    } else {
+        Some(format!("({})", ignored.join(" OR ")))
+    }
+}
+
+fn source_error_detail_order_by(cfg: &AppConfig) -> String {
+    match ignored_ingest_error_predicate(cfg) {
+        Some(ignored) => {
+            format!("{ignored} DESC, (error_kind = 'timestamp_parse_error') ASC, ingested_at DESC")
+        }
+        None => "(error_kind = 'timestamp_parse_error') ASC, ingested_at DESC".to_string(),
+    }
+}
+
+fn ignored_ingest_error_reason(
+    cfg: &AppConfig,
+    source_name: &str,
+    source_file: &str,
+    source_line_no: u64,
+    source_offset: u64,
+    error_kind: &str,
+) -> Option<String> {
+    cfg.source_status
+        .ignored_ingest_errors
+        .iter()
+        .find(|ignore| {
+            ignore.source_name == source_name
+                && ignore.source_file == source_file
+                && ignore.error_kind == error_kind
+                && ignore
+                    .source_line_no
+                    .is_none_or(|line_no| line_no == source_line_no)
+                && ignore
+                    .source_offset
+                    .is_none_or(|offset| offset == source_offset)
+        })
+        .map(|ignore| {
+            if ignore.reason.is_empty() {
+                "configured ignore".to_string()
+            } else {
+                ignore.reason.clone()
+            }
+        })
 }
 
 fn is_jsonl_source(source: &IngestSource) -> bool {
@@ -1255,7 +1364,7 @@ pub async fn build_source_files_snapshot(
             Vec::new()
         }
     };
-    let latest_error_rows = match query_file_latest_errors(&ch, &db, source_name).await {
+    let latest_error_rows = match query_file_latest_errors(&ch, &db, source_name, cfg).await {
         Ok(rows) => rows,
         Err(err) => {
             if query_error.is_none() {
@@ -1654,7 +1763,9 @@ async fn query_source_errors_detail(
     db: &str,
     source_name: &str,
     limit: u32,
+    cfg: &AppConfig,
 ) -> Result<Vec<IngestErrorDetailRow>> {
+    let order_by = source_error_detail_order_by(cfg);
     let query = format!(
         "SELECT \
             toString(ingested_at) AS ingested_at, \
@@ -1666,7 +1777,7 @@ async fn query_source_errors_detail(
             raw_fragment \
          FROM {db}.ingest_errors \
          WHERE source_name = '{}' \
-         ORDER BY ingested_at DESC \
+         ORDER BY {order_by} \
          LIMIT {}",
         escape_literal(source_name),
         limit.clamp(1, 1000)
@@ -1692,17 +1803,29 @@ pub async fn build_source_errors_snapshot(
     let db = quote_identifier(&cfg.clickhouse.database);
 
     let mut query_error = None;
-    let errors = match query_source_errors_detail(&ch, &db, source_name, limit).await {
+    let errors = match query_source_errors_detail(&ch, &db, source_name, limit, cfg).await {
         Ok(rows) => rows
             .into_iter()
-            .map(|row| SourceErrorRow {
-                ingested_at: row.ingested_at,
-                source_file: row.source_file,
-                source_line_no: row.source_line_no,
-                source_offset: row.source_offset,
-                error_kind: row.error_kind,
-                error_text: row.error_text,
-                raw_fragment: row.raw_fragment,
+            .map(|row| {
+                let ignore_reason = ignored_ingest_error_reason(
+                    cfg,
+                    source_name,
+                    &row.source_file,
+                    row.source_line_no,
+                    row.source_offset,
+                    &row.error_kind,
+                );
+                SourceErrorRow {
+                    ingested_at: row.ingested_at,
+                    source_file: row.source_file,
+                    source_line_no: row.source_line_no,
+                    source_offset: row.source_offset,
+                    error_kind: row.error_kind,
+                    error_text: row.error_text,
+                    raw_fragment: row.raw_fragment,
+                    ignored: ignore_reason.is_some(),
+                    ignore_reason,
+                }
             })
             .collect(),
         Err(err) => {
@@ -1787,6 +1910,84 @@ mod tests {
             actionable_ingest_error_predicate(),
             "error_kind != 'timestamp_parse_error'"
         );
+    }
+
+    #[test]
+    fn active_ingest_error_predicate_excludes_configured_quarantine_rows() {
+        let mut cfg = AppConfig::default();
+        cfg.source_status.ignored_ingest_errors = vec![IgnoredIngestError {
+            source_name: "pc-claude".to_string(),
+            source_file: "/tmp/project/session.jsonl".to_string(),
+            source_line_no: Some(10),
+            source_offset: Some(8015),
+            error_kind: "json_parse_error".to_string(),
+            reason: "historical corrupted mirror row".to_string(),
+        }];
+
+        let predicate = active_ingest_error_predicate(&cfg);
+
+        assert!(predicate.contains("error_kind != 'timestamp_parse_error'"));
+        assert!(predicate.contains("source_name = 'pc-claude'"));
+        assert!(predicate.contains("source_file = '/tmp/project/session.jsonl'"));
+        assert!(predicate.contains("source_line_no = 10"));
+        assert!(predicate.contains("source_offset = 8015"));
+        assert!(predicate.contains("error_kind = 'json_parse_error'"));
+    }
+
+    #[test]
+    fn source_error_detail_order_by_prioritizes_ignored_and_actionable_errors() {
+        let mut cfg = AppConfig::default();
+        cfg.source_status.ignored_ingest_errors = vec![IgnoredIngestError {
+            source_name: "pc-claude".to_string(),
+            source_file: "/tmp/project/session.jsonl".to_string(),
+            source_line_no: Some(10),
+            source_offset: Some(8015),
+            error_kind: "json_parse_error".to_string(),
+            reason: "historical corrupted mirror row".to_string(),
+        }];
+
+        let order_by = source_error_detail_order_by(&cfg);
+
+        assert!(order_by.starts_with("((source_name = 'pc-claude'"));
+        assert!(order_by.contains("source_line_no = 10"));
+        assert!(order_by.contains("source_offset = 8015"));
+        assert!(order_by.contains(") DESC"));
+        assert!(order_by.contains("(error_kind = 'timestamp_parse_error') ASC"));
+    }
+
+    #[test]
+    fn ignored_ingest_error_reason_matches_exact_coordinates() {
+        let mut cfg = AppConfig::default();
+        cfg.source_status.ignored_ingest_errors = vec![IgnoredIngestError {
+            source_name: "pc-claude".to_string(),
+            source_file: "/tmp/project/session.jsonl".to_string(),
+            source_line_no: Some(10),
+            source_offset: Some(8015),
+            error_kind: "json_parse_error".to_string(),
+            reason: "historical corrupted mirror row".to_string(),
+        }];
+
+        assert_eq!(
+            ignored_ingest_error_reason(
+                &cfg,
+                "pc-claude",
+                "/tmp/project/session.jsonl",
+                10,
+                8015,
+                "json_parse_error",
+            )
+            .as_deref(),
+            Some("historical corrupted mirror row")
+        );
+        assert!(ignored_ingest_error_reason(
+            &cfg,
+            "pc-claude",
+            "/tmp/project/session.jsonl",
+            11,
+            8015,
+            "json_parse_error",
+        )
+        .is_none());
     }
 
     fn test_source_file(

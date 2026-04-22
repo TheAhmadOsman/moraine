@@ -455,8 +455,14 @@
                 <div class="sd-error-meta">
                   <span class="sd-error-time mono">{err.ingested_at}</span>
                   <span class="sd-error-kind">{err.error_kind}</span>
+                  {#if err.ignored}
+                    <span class="sd-error-ignored" title={err.ignore_reason ?? ''}>ignored</span>
+                  {/if}
                   <span class="sd-error-file mono" title={err.source_file}>{err.source_file}</span>
                 </div>
+                {#if err.ignored && err.ignore_reason}
+                  <div class="sd-error-note">{err.ignore_reason}</div>
+                {/if}
                 <div class="sd-error-text">{err.error_text}</div>
                 {#if err.raw_fragment}
                   <pre class="sd-error-raw">{err.raw_fragment}</pre>
@@ -725,12 +731,28 @@
     letter-spacing: 0.04em;
   }
 
+  .sd-error-ignored {
+    padding: 0.0625rem 0.375rem;
+    border-radius: 0.375rem;
+    background: rgba(82, 82, 82, 0.12);
+    color: var(--subtle);
+    font-weight: 600;
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+  }
+
   .sd-error-file {
     color: var(--subtle);
     max-width: 280px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .sd-error-note {
+    margin-bottom: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--subtle);
   }
 
   .sd-error-text {

@@ -194,6 +194,30 @@ impl Default for PrivacyConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+pub struct SourceStatusConfig {
+    #[serde(default)]
+    pub ignored_ingest_errors: Vec<IgnoredIngestError>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredIngestError {
+    #[serde(default)]
+    pub source_name: String,
+    #[serde(default)]
+    pub source_file: String,
+    #[serde(default)]
+    pub source_line_no: Option<u64>,
+    #[serde(default)]
+    pub source_offset: Option<u64>,
+    #[serde(default)]
+    pub error_kind: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ImportProfile {
     #[serde(default)]
     pub host: String,
@@ -226,6 +250,8 @@ pub struct AppConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    #[serde(default)]
+    pub source_status: SourceStatusConfig,
     #[serde(default)]
     pub imports: std::collections::HashMap<String, ImportProfile>,
 }
@@ -751,6 +777,9 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     }
 
     cfg.privacy.encryption_key_file = expand_path(&cfg.privacy.encryption_key_file);
+    for ignored in &mut cfg.source_status.ignored_ingest_errors {
+        ignored.source_file = expand_path(&ignored.source_file);
+    }
 
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);
     cfg.runtime.root_dir = expand_path(&cfg.runtime.root_dir);
@@ -1246,6 +1275,41 @@ extra = "not-allowed"
         assert!(
             format!("{err:#}").contains("unknown field `extra`"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_source_status_ignored_ingest_errors() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let path = write_temp_config(
+            r#"
+[[source_status.ignored_ingest_errors]]
+source_name = "pc-claude"
+source_file = "~/.moraine/imports/pc/claude/projects/project/session.jsonl"
+source_line_no = 10
+source_offset = 8015
+error_kind = "json_parse_error"
+reason = "historical source line contains embedded NUL bytes"
+"#,
+            "source-status-ignore",
+        );
+
+        let cfg = load_config(&path).expect("source-status ignore config should load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.source_status.ignored_ingest_errors.len(), 1);
+        let ignored = &cfg.source_status.ignored_ingest_errors[0];
+        assert_eq!(ignored.source_name, "pc-claude");
+        assert_eq!(
+            ignored.source_file,
+            format!("{home}/.moraine/imports/pc/claude/projects/project/session.jsonl")
+        );
+        assert_eq!(ignored.source_line_no, Some(10));
+        assert_eq!(ignored.source_offset, Some(8015));
+        assert_eq!(ignored.error_kind, "json_parse_error");
+        assert_eq!(
+            ignored.reason,
+            "historical source line contains embedded NUL bytes"
         );
     }
 

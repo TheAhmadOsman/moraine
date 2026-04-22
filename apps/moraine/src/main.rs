@@ -2936,6 +2936,8 @@ fn render_sources_errors(output: &CliOutput, snapshot: &SourceErrorsSnapshot) ->
                 err.source_file.clone(),
             ];
             if output.verbose {
+                row.push(if err.ignored { "yes" } else { "no" }.to_string());
+                row.push(err.ignore_reason.clone().unwrap_or_else(|| "-".to_string()));
                 row.push(err.error_text.clone());
                 row.push(err.raw_fragment.clone());
             }
@@ -2950,7 +2952,15 @@ fn render_sources_errors(output: &CliOutput, snapshot: &SourceErrorsSnapshot) ->
                 snapshot.source_name,
                 snapshot.errors.len()
             ),
-            &["time", "kind", "file", "text", "raw fragment"],
+            &[
+                "time",
+                "kind",
+                "file",
+                "ignored",
+                "ignore reason",
+                "text",
+                "raw fragment",
+            ],
             &rows,
         );
     } else {

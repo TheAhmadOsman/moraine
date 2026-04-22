@@ -104,6 +104,17 @@ max_query_terms = 32
 # encryption_key_env = "MORAINE_ENCRYPTION_KEY"
 # encryption_key_file = "~/.moraine/keys/local-main.key"
 
+# Source health can ignore exact known-bad historical ingest-error rows without
+# deleting source transcripts or ClickHouse audit rows. Ignored rows remain
+# visible in `moraine sources errors` and the monitor error drilldown.
+# [[source_status.ignored_ingest_errors]]
+# source_name = "pc-claude"
+# source_file = "~/.moraine/imports/pc/claude/projects/project/session.jsonl"
+# source_line_no = 10
+# source_offset = 8015
+# error_kind = "json_parse_error"
+# reason = "Historical mirrored transcript row contains corrupted bytes."
+
 # Remote import profiles mirror sessions from another machine into a local
 # directory that can then be ingested as a source. `cadence` can be
 # "manual", "on_start", "5min", "30min", or "1h". The sync command can execute
