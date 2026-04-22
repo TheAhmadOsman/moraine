@@ -22,6 +22,14 @@ synthetic `.jsonl` fixtures, asserts heartbeats / search rows / monitor
 routes / MCP smoke, tears itself down. Run it before opening a PR for
 changes to ingest, monitor, MCP, or schema.
 
+`scripts/ci/operational-safety-e2e.sh` is the operational safety gate for
+maintenance features. It boots a disposable sandbox, drops synthetic fixture
+files into the generated `/sandbox/fixtures` source dirs, then validates deep
+doctor, source drift, import sync manifests, backup/verify, staging restore,
+and search-only reindex execute/resume against the same ClickHouse instance.
+Run it before merging changes that affect backup/restore, reindex, import
+sync, source diagnostics, doctor checks, or sandbox config behavior.
+
 The sandbox is the dev loop. It keeps the stack running for hand-poking,
 builds the worktree's binaries *inside* the container (so linux-only
 behavior gets exercised from a macOS host), and can optionally expose
