@@ -3018,6 +3018,9 @@ fn normalize_kimi_cli_wire_event(
             let input_other = to_u32(token_usage.get("input_other"));
             let input_cache_read = to_u32(token_usage.get("input_cache_read"));
             let input_cache_creation = to_u32(token_usage.get("input_cache_creation"));
+            let input_tokens = input_other
+                .saturating_add(input_cache_read)
+                .saturating_add(input_cache_creation);
             let output = to_u32(token_usage.get("output"));
 
             let uid = kimi_cli_event_uid(ctx, &payload_json, "wire:status_update");
@@ -3030,7 +3033,7 @@ fn normalize_kimi_cli_wire_event(
                 "",
                 &payload_json,
             );
-            row.insert("input_tokens".to_string(), json!(input_other));
+            row.insert("input_tokens".to_string(), json!(input_tokens));
             row.insert("output_tokens".to_string(), json!(output));
             row.insert("cache_read_tokens".to_string(), json!(input_cache_read));
             row.insert(
@@ -3060,9 +3063,14 @@ fn normalize_kimi_cli_wire_event(
             };
             push_progress("wire:hook", "event_msg", text, "event_msg");
         }
+        "SubagentEvent" => {
+            // Parent wires duplicate these events; the sub-agent wire carries
+            // the real record. Keep the raw row, but avoid double-counting a
+            // synthetic parent progress row.
+        }
         "MCPLoadingBegin" | "MCPLoadingEnd" | "MCPStatusSnapshot" | "BtwBegin" | "BtwEnd"
-        | "SubagentEvent" | "Notification" | "PlanDisplay" | "ApprovalRequest"
-        | "ApprovalResponse" | "QuestionRequest" | "QuestionResponse" => {
+        | "Notification" | "PlanDisplay" | "ApprovalRequest" | "ApprovalResponse"
+        | "QuestionRequest" | "QuestionResponse" => {
             push_progress(
                 &format!("wire:{msg_type}"),
                 "progress",
@@ -3089,11 +3097,21 @@ fn normalize_kimi_cli_event(
     top_type: &str,
     base_uid: &str,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    if record.get("role").is_some() {
+    let (mut events, links, tools) = if record.get("role").is_some() {
         normalize_kimi_cli_context_record(record, ctx, base_uid)
     } else {
         normalize_kimi_cli_wire_event(record, ctx, top_type, base_uid)
+    };
+
+    // The Kimi wire/context schemas do not expose the active model. Use the
+    // harness slug so Kimi rows remain visible in model-based token analytics.
+    for row in events.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("model".to_string(), json!("kimi-cli"));
+        }
     }
+
+    (events, links, tools)
 }
 
 fn normalize_opencode_event(
@@ -4074,6 +4092,78 @@ mod tests {
             "anthropic"
         );
         assert!(out.error_rows.is_empty());
+    }
+
+    #[test]
+    fn kimi_cli_status_update_stamps_placeholder_model_and_sums_input_buckets() {
+        let record = json!({
+            "timestamp": 1776735761.27701_f64,
+            "message": {
+                "type": "StatusUpdate",
+                "payload": {
+                    "message_id": "msg_abc",
+                    "context_usage": 0.42,
+                    "token_usage": {
+                        "input_other": 1234,
+                        "input_cache_read": 56,
+                        "input_cache_creation": 78,
+                        "output": 90
+                    }
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "kimi-cli",
+            "kimi-cli",
+            "/Users/eric/.kimi/sessions/work-abc/sess-xyz/wire.jsonl",
+            1,
+            1,
+            5,
+            500,
+            "",
+            "",
+        )
+        .expect("kimi status update should normalize");
+
+        assert_eq!(out.event_rows.len(), 1);
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("model").and_then(Value::as_str), Some("kimi-cli"));
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(1368));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(90));
+        assert_eq!(out.model_hint, "kimi-cli");
+    }
+
+    #[test]
+    fn kimi_cli_content_part_stamps_placeholder_model() {
+        let record = json!({
+            "timestamp": 1776735761.27701_f64,
+            "message": {
+                "type": "ContentPart",
+                "payload": {
+                    "type": "text",
+                    "text": "hello there"
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "kimi-cli",
+            "kimi-cli",
+            "/Users/eric/.kimi/sessions/work-abc/sess-xyz/wire.jsonl",
+            1,
+            1,
+            6,
+            600,
+            "",
+            "",
+        )
+        .expect("kimi content part should normalize");
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("model").and_then(Value::as_str), Some("kimi-cli"));
     }
 
     #[test]

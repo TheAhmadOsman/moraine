@@ -116,8 +116,28 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
         usage.get("payload_type").and_then(Value::as_str),
         Some("token_count")
     );
-    assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(10));
+    // Kimi reports cached and non-cached input in separate buckets; the
+    // normalized total must include all input buckets.
+    assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(13));
     assert_eq!(usage.get("output_tokens").and_then(Value::as_u64), Some(5));
+    assert_eq!(
+        usage.get("cache_read_tokens").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        usage.get("cache_write_tokens").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    for record in &rows {
+        for event in &record.event_rows {
+            assert_eq!(
+                event.get("model").and_then(Value::as_str),
+                Some("kimi-cli"),
+                "every emitted Kimi event should carry the placeholder model"
+            );
+        }
+    }
 }
 
 #[test]
@@ -138,6 +158,27 @@ fn kimi_context_fixture_uses_synthetic_timestamps_without_errors() {
         Some("token_count")
     );
     assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(42));
+    assert_eq!(usage.get("model").and_then(Value::as_str), Some("kimi-cli"));
+}
+
+#[test]
+fn kimi_subagent_event_emits_raw_row_but_no_normalized_event() {
+    let rows = normalize_lines("wire.jsonl");
+    let subagent_row = rows
+        .iter()
+        .find(|row| {
+            row.raw_row
+                .get("top_type")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "SubagentEvent")
+                .unwrap_or(false)
+        })
+        .expect("fixture contains a SubagentEvent record");
+
+    assert!(!subagent_row.raw_row.is_null());
+    assert!(subagent_row.event_rows.is_empty());
+    assert!(subagent_row.tool_rows.is_empty());
+    assert!(subagent_row.error_rows.is_empty());
 }
 
 #[test]
