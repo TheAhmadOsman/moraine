@@ -400,10 +400,11 @@
                       </div>
                     </td>
                     <td>
-                      <div class="sd-cell-stack mono">
-                        <span>{formatCount(file.raw_event_count)} rows</span>
-                        <span>{formatTimestampWithAge(file.latest_raw_event_at, file.latest_raw_event_age_seconds)}</span>
-                      </div>
+	                      <div class="sd-cell-stack mono">
+	                        <span>Raw: {formatCount(file.raw_event_count)}</span>
+	                        <span>Events: {formatCount(file.canonical_event_count)}</span>
+	                        <span>{formatTimestampWithAge(file.latest_raw_event_at, file.latest_raw_event_age_seconds)}</span>
+	                      </div>
                     </td>
                     <td>
                       <div class="sd-cell-stack mono">

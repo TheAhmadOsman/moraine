@@ -6,8 +6,9 @@ use moraine_clickhouse::{
 };
 use moraine_config::AppConfig;
 use moraine_source_status::{
-    build_source_errors_snapshot, build_source_files_snapshot, build_source_status_snapshot,
-    SourceErrorsSnapshot, SourceFilesSnapshot, SourceStatusSnapshot,
+    build_source_drift_snapshot, build_source_errors_snapshot, build_source_files_snapshot,
+    build_source_status_snapshot, SourceDriftSnapshot, SourceErrorsSnapshot, SourceFilesSnapshot,
+    SourceStatusSnapshot,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
@@ -197,6 +198,7 @@ enum SourcesCommand {
     Status(SourcesStatusArgs),
     Files(SourcesFilesArgs),
     Errors(SourcesErrorsArgs),
+    Drift(SourcesDriftArgs),
 }
 
 #[derive(Debug, Args)]
@@ -217,6 +219,12 @@ struct SourcesErrorsArgs {
     source: String,
     #[arg(long, default_value_t = 50)]
     limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct SourcesDriftArgs {
+    #[arg(long, default_value_t = false)]
+    include_disabled: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2109,6 +2117,10 @@ async fn cmd_sources_errors(
     build_source_errors_snapshot(cfg, source, limit).await
 }
 
+async fn cmd_sources_drift(cfg: &AppConfig, include_disabled: bool) -> Result<SourceDriftSnapshot> {
+    build_source_drift_snapshot(cfg, include_disabled).await
+}
+
 fn quote_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
@@ -2772,6 +2784,7 @@ fn render_sources_files(output: &CliOutput, snapshot: &SourceFilesSnapshot) -> R
                 file.size_bytes.to_string(),
                 file.modified_at.clone().unwrap_or_else(|| "-".to_string()),
                 file.raw_event_count.to_string(),
+                file.canonical_event_count.to_string(),
                 file.checkpoint_offset
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -2811,6 +2824,7 @@ fn render_sources_files(output: &CliOutput, snapshot: &SourceFilesSnapshot) -> R
                 "size",
                 "modified",
                 "raw",
+                "events",
                 "checkpoint",
                 "status",
                 "line",
@@ -2825,7 +2839,15 @@ fn render_sources_files(output: &CliOutput, snapshot: &SourceFilesSnapshot) -> R
                 "Source Files: {} ({} matches)",
                 snapshot.source_name, snapshot.glob_match_count
             ),
-            &["path", "size", "modified", "raw", "checkpoint", "status"],
+            &[
+                "path",
+                "size",
+                "modified",
+                "raw",
+                "events",
+                "checkpoint",
+                "status",
+            ],
             &rows,
         );
     }
@@ -2888,6 +2910,146 @@ fn render_sources_errors(output: &CliOutput, snapshot: &SourceErrorsSnapshot) ->
             &rows,
         );
     }
+    Ok(())
+}
+
+fn render_sources_drift(output: &CliOutput, snapshot: &SourceDriftSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    if let Some(error) = &snapshot.query_error {
+        output.section(
+            "Source Drift Query",
+            &[format!("status: partial ({error})")],
+        );
+    }
+
+    if snapshot.sources.is_empty() {
+        output.section(
+            "Source Drift",
+            &["no matching ingest sources configured".to_string()],
+        );
+        return Ok(());
+    }
+
+    let rows = snapshot
+        .sources
+        .iter()
+        .map(|source| {
+            let top_finding = source
+                .findings
+                .iter()
+                .find(|finding| {
+                    finding.severity == moraine_source_status::SourceDriftSeverity::Error
+                })
+                .or_else(|| {
+                    source.findings.iter().find(|finding| {
+                        finding.severity == moraine_source_status::SourceDriftSeverity::Warning
+                    })
+                })
+                .or_else(|| source.findings.first())
+                .map(|finding| format!("{} ({})", finding.kind.as_str(), finding.count))
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut row = vec![
+                source.name.clone(),
+                source.status.as_str().to_string(),
+                source.disk_file_count.to_string(),
+                source.raw_event_count.to_string(),
+                source.canonical_event_count.to_string(),
+                source.checkpoint_count.to_string(),
+                source.ingest_error_count.to_string(),
+                source.raw_without_canonical_file_count.to_string(),
+                source.canonical_without_raw_file_count.to_string(),
+                top_finding,
+            ];
+            if output.verbose {
+                row.push(source.missing_on_disk_file_count.to_string());
+                row.push(source.checkpoint_only_file_count.to_string());
+                row.push(source.unobserved_disk_file_count.to_string());
+                row.push(source.stale_file_count.to_string());
+                row.push(source.watch_root.clone());
+                row.push(source.glob.clone());
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if output.verbose {
+        output.table(
+            "Source Drift",
+            &[
+                "source",
+                "status",
+                "disk files",
+                "raw",
+                "events",
+                "checkpoints",
+                "errors",
+                "raw-only",
+                "event-only",
+                "top finding",
+                "missing",
+                "checkpoint-only",
+                "unobserved",
+                "stale",
+                "watch root",
+                "glob",
+            ],
+            &rows,
+        );
+    } else {
+        output.table(
+            "Source Drift",
+            &[
+                "source",
+                "status",
+                "disk files",
+                "raw",
+                "events",
+                "checkpoints",
+                "errors",
+                "raw-only",
+                "event-only",
+                "top finding",
+            ],
+            &rows,
+        );
+    }
+
+    let finding_rows = snapshot
+        .sources
+        .iter()
+        .flat_map(|source| {
+            source.findings.iter().map(|finding| {
+                vec![
+                    source.name.clone(),
+                    finding.severity.as_str().to_string(),
+                    finding.kind.as_str().to_string(),
+                    finding.count.to_string(),
+                    finding.summary.clone(),
+                    if finding.examples.is_empty() {
+                        "-".to_string()
+                    } else {
+                        finding.examples.join(", ")
+                    },
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if finding_rows.is_empty() {
+        output.section("Source Drift Findings", &["no drift findings".to_string()]);
+    } else {
+        output.table(
+            "Source Drift Findings",
+            &["source", "severity", "kind", "count", "summary", "examples"],
+            &finding_rows,
+        );
+    }
+
     Ok(())
 }
 
@@ -5096,6 +5258,11 @@ async fn main() -> Result<ExitCode> {
                     render_sources_errors(&output, &snapshot)?;
                     Ok(ExitCode::SUCCESS)
                 }
+                SourcesCommand::Drift(drift) => {
+                    let snapshot = cmd_sources_drift(&cfg, drift.include_disabled).await?;
+                    render_sources_drift(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
             }
         }
         CliCommand::Import(args) => {
@@ -5579,6 +5746,17 @@ mod tests {
                 assert_eq!(errors.limit, 10);
             }
             _ => panic!("expected sources errors command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_sources_drift_command() {
+        let cli = Cli::parse_from(["moraine", "sources", "drift", "--include-disabled"]);
+        match cli.command {
+            CliCommand::Sources(SourcesArgs {
+                command: SourcesCommand::Drift(drift),
+            }) => assert!(drift.include_disabled),
+            _ => panic!("expected sources drift command"),
         }
     }
 

@@ -151,6 +151,9 @@ bin/moraine db doctor --output json
 - Required table presence.
 - With `--deep`, derived object health and corpus integrity findings such as orphan
   rows, missing `raw_events` backing rows, session time drift, and search index drift.
+- For source-specific drift, use `moraine sources drift`; it compares configured
+  sources, matched files, checkpoints, `raw_events`, normalized `events`, and
+  ingest errors without mutating the corpus.
 
 Current compatibility policy is explicit and small on purpose:
 

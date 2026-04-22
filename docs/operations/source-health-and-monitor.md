@@ -14,12 +14,16 @@ Use:
 moraine sources status
 moraine sources status --include-disabled
 moraine --output json sources status --include-disabled
+moraine sources drift
+moraine sources drift --include-disabled
+moraine --output json sources drift
 ```
 
 The command reads `[[ingest.sources]]` from the resolved config and joins that configured inventory with ClickHouse state from:
 
 - `ingest_checkpoints` for checkpoint count and latest checkpoint timestamp.
 - `raw_events` for raw ingested row count.
+- `events` for normalized canonical event count in file/drift diagnostics.
 - `ingest_errors` for error count plus latest error timestamp, kind, and text.
 
 The JSON output is the most stable integration surface for scripts. It returns:
@@ -49,6 +53,18 @@ The JSON output is the most stable integration surface for scripts. It returns:
 ```
 
 `--include-disabled` keeps disabled configured sources in the response. Without it, disabled sources are omitted from CLI output. The monitor always includes disabled sources because dashboard inventory should reflect all configured sources.
+
+`moraine sources drift` is the deeper consistency check. It compares each configured source against local files matched by the source glob, checkpoint state, raw rows, normalized `events`, and ingest errors. The command is read-only and reports categories such as:
+
+- `expected_idle`: no files currently match and no ingest state exists.
+- `missing_on_disk`: ClickHouse still has source state for files that no longer exist locally.
+- `unobserved_disk_files`: files match the glob but have no checkpoint/raw/canonical/error state yet.
+- `checkpoint_only_files`: checkpoints exist without raw rows, canonical events, or errors.
+- `raw_without_canonical`: raw rows exist but no normalized events were emitted.
+- `canonical_without_raw`: normalized events exist without raw backing rows.
+- `ingest_errors`: one or more ingest errors are recorded.
+
+The JSON shape is intended for automation. Human output summarizes source-level counts and then lists typed findings with example paths.
 
 ## Monitor API
 
@@ -144,6 +160,7 @@ Each file row is additive and can now include:
 - `on_disk` plus `modified_at` and `modified_age_seconds`, so a file that still has checkpoints/raw rows but no longer exists on disk is obvious.
 - `checkpoint_updated_at` and `checkpoint_age_seconds`, so operators can tell when a file last advanced its checkpoint.
 - `latest_raw_event_at` and `latest_raw_event_age_seconds`, so operators can see when the file last produced raw rows.
+- `canonical_event_count`, so raw rows that failed to produce normalized events are visible without writing a custom SQL query.
 - `latest_error_at`, `latest_error_age_seconds`, `latest_error_kind`, and `latest_error_text`, so recent parse/schema failures stay attached to the exact file that produced them.
 - `issues`, a small additive classification list that can flag `missing_on_disk`, `stale`, `erroring`, `sqlite_wal_present`, and `sqlite_shm_present`.
 - `stale_reason`, which explains the heuristic when a file appears behind its on-disk writes.
@@ -205,6 +222,7 @@ When `query_error` is present:
 2. Verify migrations have created `raw_events`, `ingest_errors`, and `ingest_checkpoints`.
 3. Check ClickHouse availability and credentials in config.
 4. Rerun `moraine --output json sources status` to see the same shared snapshot outside the monitor server.
+5. Run `moraine --output json sources drift` if the source count surface looks healthy but file-level raw/canonical/checkpoint state appears inconsistent.
 
 When `runtime_query_error` is present:
 

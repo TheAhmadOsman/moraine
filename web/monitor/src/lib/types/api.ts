@@ -153,6 +153,7 @@ export interface SourceFileRow {
   checkpoint_updated_at: string | null;
   checkpoint_age_seconds: number | null;
   raw_event_count: number;
+  canonical_event_count: number;
   latest_raw_event_at: string | null;
   latest_raw_event_age_seconds: number | null;
   latest_error_at: string | null;

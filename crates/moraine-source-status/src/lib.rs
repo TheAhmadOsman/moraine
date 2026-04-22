@@ -177,6 +177,7 @@ pub struct SourceFileRow {
     pub checkpoint_updated_at: Option<String>,
     pub checkpoint_age_seconds: Option<u64>,
     pub raw_event_count: u64,
+    pub canonical_event_count: u64,
     pub latest_raw_event_at: Option<String>,
     pub latest_raw_event_age_seconds: Option<u64>,
     pub latest_error_at: Option<String>,
@@ -229,6 +230,12 @@ struct FileRawStatsRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct FileCanonicalStatsRow {
+    source_file: String,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct FileLatestErrorRow {
     source_file: String,
     latest_error_at: String,
@@ -256,6 +263,132 @@ pub struct SourceErrorRow {
 pub struct SourceErrorsSnapshot {
     pub source_name: String,
     pub errors: Vec<SourceErrorRow>,
+    pub query_error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Source drift diagnostics — source/file consistency view
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDriftStatus {
+    Disabled,
+    Ok,
+    Info,
+    Warning,
+    Error,
+    Unknown,
+}
+
+impl SourceDriftStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Ok => "ok",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDriftSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl SourceDriftSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDriftFindingKind {
+    ExpectedIdle,
+    PartialQuery,
+    FilesystemError,
+    MissingOnDisk,
+    UnobservedDiskFiles,
+    StaleFiles,
+    CheckpointOnlyFiles,
+    RawWithoutCanonical,
+    CanonicalWithoutRaw,
+    IngestErrors,
+    SqliteSidecars,
+}
+
+impl SourceDriftFindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExpectedIdle => "expected_idle",
+            Self::PartialQuery => "partial_query",
+            Self::FilesystemError => "filesystem_error",
+            Self::MissingOnDisk => "missing_on_disk",
+            Self::UnobservedDiskFiles => "unobserved_disk_files",
+            Self::StaleFiles => "stale_files",
+            Self::CheckpointOnlyFiles => "checkpoint_only_files",
+            Self::RawWithoutCanonical => "raw_without_canonical",
+            Self::CanonicalWithoutRaw => "canonical_without_raw",
+            Self::IngestErrors => "ingest_errors",
+            Self::SqliteSidecars => "sqlite_sidecars",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDriftFinding {
+    pub kind: SourceDriftFindingKind,
+    pub severity: SourceDriftSeverity,
+    pub count: u64,
+    pub summary: String,
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDriftRow {
+    pub name: String,
+    pub harness: String,
+    pub format: String,
+    pub enabled: bool,
+    pub glob: String,
+    pub watch_root: String,
+    pub status: SourceDriftStatus,
+    pub disk_file_count: u64,
+    pub checkpoint_file_count: u64,
+    pub raw_file_count: u64,
+    pub canonical_file_count: u64,
+    pub ingest_error_file_count: u64,
+    pub missing_on_disk_file_count: u64,
+    pub unobserved_disk_file_count: u64,
+    pub stale_file_count: u64,
+    pub checkpoint_only_file_count: u64,
+    pub raw_without_canonical_file_count: u64,
+    pub canonical_without_raw_file_count: u64,
+    pub sqlite_sidecar_file_count: u64,
+    pub checkpoint_count: u64,
+    pub raw_event_count: u64,
+    pub canonical_event_count: u64,
+    pub ingest_error_count: u64,
+    pub findings: Vec<SourceDriftFinding>,
+    pub fs_error: Option<String>,
+    pub query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDriftSnapshot {
+    pub generated_unix_seconds: u64,
+    pub sources: Vec<SourceDriftRow>,
     pub query_error: Option<String>,
 }
 
@@ -787,14 +920,22 @@ async fn query_file_checkpoint_stats(
     let query = format!(
         "SELECT \
             source_file, \
-            toUInt64(argMax(last_offset, updated_at)) AS last_offset, \
-            toUInt64(argMax(last_line_no, updated_at)) AS last_line_no, \
-            argMax(status, updated_at) AS status, \
-            toString(max(updated_at)) AS updated_at, \
-            toUInt64(greatest(dateDiff('second', max(updated_at), now()), 0)) AS updated_age_seconds \
-         FROM {db}.ingest_checkpoints FINAL \
-         WHERE source_name = '{}' \
-         GROUP BY source_file",
+            last_offset, \
+            last_line_no, \
+            status, \
+            toString(checkpoint_updated_at) AS updated_at, \
+            toUInt64(greatest(dateDiff('second', checkpoint_updated_at, now()), 0)) AS updated_age_seconds \
+         FROM ( \
+            SELECT \
+                source_file, \
+                toUInt64(argMax(last_offset, updated_at)) AS last_offset, \
+                toUInt64(argMax(last_line_no, updated_at)) AS last_line_no, \
+                argMax(status, updated_at) AS status, \
+                max(updated_at) AS checkpoint_updated_at \
+             FROM {db}.ingest_checkpoints FINAL \
+             WHERE source_name = '{}' \
+             GROUP BY source_file \
+         )",
         escape_literal(source_name)
     );
     ch.query_rows(&query, None).await
@@ -812,6 +953,23 @@ async fn query_file_raw_stats(
             toString(max(ingested_at)) AS latest_raw_event_at, \
             toUInt64(greatest(dateDiff('second', max(ingested_at), now()), 0)) AS latest_raw_event_age_seconds \
          FROM {db}.raw_events \
+         WHERE source_name = '{}' \
+         GROUP BY source_file",
+        escape_literal(source_name)
+    );
+    ch.query_rows(&query, None).await
+}
+
+async fn query_file_canonical_stats(
+    ch: &ClickHouseClient,
+    db: &str,
+    source_name: &str,
+) -> Result<Vec<FileCanonicalStatsRow>> {
+    let query = format!(
+        "SELECT \
+            source_file, \
+            toUInt64(count()) AS count \
+         FROM {db}.events FINAL \
          WHERE source_name = '{}' \
          GROUP BY source_file",
         escape_literal(source_name)
@@ -915,6 +1073,7 @@ fn build_source_file_row(
     on_disk: bool,
     checkpoint: Option<&FileCheckpointRow>,
     raw_stats: Option<&FileRawStatsRow>,
+    canonical_stats: Option<&FileCanonicalStatsRow>,
     latest_error: Option<&FileLatestErrorRow>,
     now_unix_seconds: u64,
 ) -> SourceFileRow {
@@ -973,6 +1132,7 @@ fn build_source_file_row(
             .filter(|value| !value.is_empty()),
         checkpoint_age_seconds: checkpoint.map(|row| row.updated_age_seconds),
         raw_event_count: raw_stats.map(|row| row.count).unwrap_or(0),
+        canonical_event_count: canonical_stats.map(|row| row.count).unwrap_or(0),
         latest_raw_event_at: raw_stats
             .map(|row| row.latest_raw_event_at.clone())
             .filter(|value| !value.is_empty()),
@@ -1035,6 +1195,15 @@ pub async fn build_source_files_snapshot(
             Vec::new()
         }
     };
+    let canonical_stat_rows = match query_file_canonical_stats(&ch, &db, source_name).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            if query_error.is_none() {
+                query_error = Some(format!("canonical event count query failed: {err}"));
+            }
+            Vec::new()
+        }
+    };
     let latest_error_rows = match query_file_latest_errors(&ch, &db, source_name).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -1053,6 +1222,10 @@ pub async fn build_source_files_snapshot(
         .into_iter()
         .map(|row| (row.source_file.clone(), row))
         .collect();
+    let canonical_stats: BTreeMap<String, FileCanonicalStatsRow> = canonical_stat_rows
+        .into_iter()
+        .map(|row| (row.source_file.clone(), row))
+        .collect();
     let latest_errors: BTreeMap<String, FileLatestErrorRow> = latest_error_rows
         .into_iter()
         .map(|row| (row.source_file.clone(), row))
@@ -1061,6 +1234,7 @@ pub async fn build_source_files_snapshot(
     let mut paths = disk_path_set.clone();
     paths.extend(checkpoints.keys().cloned());
     paths.extend(raw_stats.keys().cloned());
+    paths.extend(canonical_stats.keys().cloned());
     paths.extend(latest_errors.keys().cloned());
 
     let mut files = Vec::new();
@@ -1072,6 +1246,7 @@ pub async fn build_source_files_snapshot(
             disk_path_set.contains(&path_str),
             checkpoints.get(&path_str),
             raw_stats.get(&path_str),
+            canonical_stats.get(&path_str),
             latest_errors.get(&path_str),
             now_unix_seconds,
         ));
@@ -1087,6 +1262,334 @@ pub async fn build_source_files_snapshot(
         glob_match_count,
         fs_error,
         query_error,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Deep diagnostics — drift
+// ---------------------------------------------------------------------------
+
+fn source_has_checkpoint(file: &SourceFileRow) -> bool {
+    file.checkpoint_offset.is_some()
+        || file.checkpoint_line_no.is_some()
+        || file.checkpoint_status.is_some()
+        || file.checkpoint_updated_at.is_some()
+}
+
+fn source_file_examples(
+    files: &[SourceFileRow],
+    predicate: impl Fn(&SourceFileRow) -> bool,
+) -> Vec<String> {
+    files
+        .iter()
+        .filter(|file| predicate(file))
+        .take(3)
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn source_file_count(files: &[SourceFileRow], predicate: impl Fn(&SourceFileRow) -> bool) -> u64 {
+    files.iter().filter(|file| predicate(file)).count() as u64
+}
+
+fn push_drift_finding(
+    findings: &mut Vec<SourceDriftFinding>,
+    kind: SourceDriftFindingKind,
+    severity: SourceDriftSeverity,
+    count: u64,
+    summary: impl Into<String>,
+    examples: Vec<String>,
+) {
+    if count == 0 {
+        return;
+    }
+
+    findings.push(SourceDriftFinding {
+        kind,
+        severity,
+        count,
+        summary: summary.into(),
+        examples,
+    });
+}
+
+fn drift_status(
+    enabled: bool,
+    findings: &[SourceDriftFinding],
+    query_error: Option<&str>,
+) -> SourceDriftStatus {
+    if !enabled {
+        SourceDriftStatus::Disabled
+    } else if query_error.is_some() {
+        SourceDriftStatus::Unknown
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == SourceDriftSeverity::Error)
+    {
+        SourceDriftStatus::Error
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == SourceDriftSeverity::Warning)
+    {
+        SourceDriftStatus::Warning
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == SourceDriftSeverity::Info)
+    {
+        SourceDriftStatus::Info
+    } else {
+        SourceDriftStatus::Ok
+    }
+}
+
+fn build_source_drift_row(
+    source: &IngestSource,
+    status: Option<&SourceStatusRow>,
+    status_query_error: Option<&str>,
+    files_snapshot: SourceFilesSnapshot,
+) -> SourceDriftRow {
+    let query_error = files_snapshot
+        .query_error
+        .clone()
+        .or_else(|| status_query_error.map(str::to_string));
+    let files = files_snapshot.files;
+
+    let disk_file_count = source_file_count(&files, |file| file.on_disk);
+    let checkpoint_file_count = source_file_count(&files, source_has_checkpoint);
+    let raw_file_count = source_file_count(&files, |file| file.raw_event_count > 0);
+    let canonical_file_count = source_file_count(&files, |file| file.canonical_event_count > 0);
+    let ingest_error_file_count = source_file_count(&files, |file| file.latest_error_at.is_some());
+    let missing_on_disk_file_count = source_file_count(&files, |file| {
+        file.issues.contains(&SourceFileIssue::MissingOnDisk)
+    });
+    let unobserved_disk_file_count = source_file_count(&files, |file| {
+        file.on_disk
+            && !source_has_checkpoint(file)
+            && file.raw_event_count == 0
+            && file.canonical_event_count == 0
+            && file.latest_error_at.is_none()
+    });
+    let stale_file_count =
+        source_file_count(&files, |file| file.issues.contains(&SourceFileIssue::Stale));
+    let checkpoint_only_file_count = source_file_count(&files, |file| {
+        source_has_checkpoint(file)
+            && file.raw_event_count == 0
+            && file.canonical_event_count == 0
+            && file.latest_error_at.is_none()
+    });
+    let raw_without_canonical_file_count = source_file_count(&files, |file| {
+        file.raw_event_count > 0 && file.canonical_event_count == 0
+    });
+    let canonical_without_raw_file_count = source_file_count(&files, |file| {
+        file.canonical_event_count > 0 && file.raw_event_count == 0
+    });
+    let sqlite_sidecar_file_count = source_file_count(&files, |file| {
+        file.sqlite_wal_present == Some(true) || file.sqlite_shm_present == Some(true)
+    });
+
+    let raw_event_count = status
+        .map(|row| row.raw_event_count)
+        .unwrap_or_else(|| files.iter().map(|file| file.raw_event_count).sum());
+    let canonical_event_count = files.iter().map(|file| file.canonical_event_count).sum();
+    let checkpoint_count = status
+        .map(|row| row.checkpoint_count)
+        .unwrap_or(checkpoint_file_count);
+    let ingest_error_count = status
+        .map(|row| row.ingest_error_count)
+        .unwrap_or(ingest_error_file_count);
+
+    let mut findings = Vec::new();
+    if let Some(error) = &query_error {
+        push_drift_finding(
+            &mut findings,
+            SourceDriftFindingKind::PartialQuery,
+            SourceDriftSeverity::Warning,
+            1,
+            format!("ClickHouse source drift query returned partial results: {error}"),
+            Vec::new(),
+        );
+    }
+    if let Some(error) = &files_snapshot.fs_error {
+        push_drift_finding(
+            &mut findings,
+            SourceDriftFindingKind::FilesystemError,
+            SourceDriftSeverity::Warning,
+            1,
+            format!("Configured source glob could not be fully scanned: {error}"),
+            Vec::new(),
+        );
+    }
+
+    if source.enabled
+        && disk_file_count == 0
+        && checkpoint_count == 0
+        && raw_event_count == 0
+        && canonical_event_count == 0
+        && ingest_error_count == 0
+        && query_error.is_none()
+        && files_snapshot.fs_error.is_none()
+    {
+        push_drift_finding(
+            &mut findings,
+            SourceDriftFindingKind::ExpectedIdle,
+            SourceDriftSeverity::Info,
+            1,
+            "No files currently match this source and no ingest state has been recorded.",
+            Vec::new(),
+        );
+    }
+
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::MissingOnDisk,
+        SourceDriftSeverity::Warning,
+        missing_on_disk_file_count,
+        "Files have checkpoint/raw/canonical/error state but no longer exist on disk.",
+        source_file_examples(&files, |file| {
+            file.issues.contains(&SourceFileIssue::MissingOnDisk)
+        }),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::UnobservedDiskFiles,
+        SourceDriftSeverity::Info,
+        unobserved_disk_file_count,
+        "Files match the configured glob but have no checkpoint, raw rows, canonical events, or ingest errors yet.",
+        source_file_examples(&files, |file| {
+            file.on_disk
+                && !source_has_checkpoint(file)
+                && file.raw_event_count == 0
+                && file.canonical_event_count == 0
+                && file.latest_error_at.is_none()
+        }),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::StaleFiles,
+        SourceDriftSeverity::Warning,
+        stale_file_count,
+        "Files appear newer on disk than the latest observed ingest progress.",
+        source_file_examples(&files, |file| file.issues.contains(&SourceFileIssue::Stale)),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::CheckpointOnlyFiles,
+        SourceDriftSeverity::Warning,
+        checkpoint_only_file_count,
+        "Files have checkpoint state but no raw rows, canonical events, or ingest errors.",
+        source_file_examples(&files, |file| {
+            source_has_checkpoint(file)
+                && file.raw_event_count == 0
+                && file.canonical_event_count == 0
+                && file.latest_error_at.is_none()
+        }),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::RawWithoutCanonical,
+        SourceDriftSeverity::Error,
+        raw_without_canonical_file_count,
+        "Files have raw rows but no canonical events, indicating unnormalized raw input.",
+        source_file_examples(&files, |file| {
+            file.raw_event_count > 0 && file.canonical_event_count == 0
+        }),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::CanonicalWithoutRaw,
+        SourceDriftSeverity::Error,
+        canonical_without_raw_file_count,
+        "Files have canonical events but no raw rows, indicating missing raw backing rows.",
+        source_file_examples(&files, |file| {
+            file.canonical_event_count > 0 && file.raw_event_count == 0
+        }),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::IngestErrors,
+        if raw_event_count == 0 && canonical_event_count == 0 {
+            SourceDriftSeverity::Error
+        } else {
+            SourceDriftSeverity::Warning
+        },
+        ingest_error_count,
+        "Ingest errors are recorded for this source.",
+        source_file_examples(&files, |file| file.latest_error_at.is_some()),
+    );
+    push_drift_finding(
+        &mut findings,
+        SourceDriftFindingKind::SqliteSidecars,
+        SourceDriftSeverity::Info,
+        sqlite_sidecar_file_count,
+        "SQLite WAL/SHM sidecars are visible next to this source database.",
+        source_file_examples(&files, |file| {
+            file.sqlite_wal_present == Some(true) || file.sqlite_shm_present == Some(true)
+        }),
+    );
+
+    SourceDriftRow {
+        name: source.name.clone(),
+        harness: source.harness.clone(),
+        format: source.format.clone(),
+        enabled: source.enabled,
+        glob: source.glob.clone(),
+        watch_root: source.watch_root.clone(),
+        status: drift_status(source.enabled, &findings, query_error.as_deref()),
+        disk_file_count,
+        checkpoint_file_count,
+        raw_file_count,
+        canonical_file_count,
+        ingest_error_file_count,
+        missing_on_disk_file_count,
+        unobserved_disk_file_count,
+        stale_file_count,
+        checkpoint_only_file_count,
+        raw_without_canonical_file_count,
+        canonical_without_raw_file_count,
+        sqlite_sidecar_file_count,
+        checkpoint_count,
+        raw_event_count,
+        canonical_event_count,
+        ingest_error_count,
+        findings,
+        fs_error: files_snapshot.fs_error,
+        query_error,
+    }
+}
+
+/// Build a drift snapshot that compares configured sources against on-disk files
+/// and ClickHouse ingest/canonical state.
+pub async fn build_source_drift_snapshot(
+    cfg: &AppConfig,
+    include_disabled: bool,
+) -> Result<SourceDriftSnapshot> {
+    let status_snapshot = build_source_status_snapshot(cfg, true).await?;
+    let status_query_error = status_snapshot.query_error.clone();
+    let status_rows: BTreeMap<String, SourceStatusRow> = status_snapshot
+        .sources
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect();
+
+    let mut rows = Vec::new();
+    for source in &cfg.ingest.sources {
+        if !source.enabled && !include_disabled {
+            continue;
+        }
+
+        let files_snapshot = build_source_files_snapshot(cfg, &source.name).await?;
+        rows.push(build_source_drift_row(
+            source,
+            status_rows.get(&source.name),
+            status_query_error.as_deref(),
+            files_snapshot,
+        ));
+    }
+
+    Ok(SourceDriftSnapshot {
+        generated_unix_seconds: now_unix_seconds(),
+        sources: rows,
+        query_error: status_query_error,
     })
 }
 
@@ -1226,6 +1729,172 @@ mod tests {
         assert_eq!(escape_literal("it's"), "it\\'s");
     }
 
+    fn test_source_file(
+        path: &str,
+        on_disk: bool,
+        checkpoint: bool,
+        raw_event_count: u64,
+        canonical_event_count: u64,
+        error: bool,
+        issues: Vec<SourceFileIssue>,
+    ) -> SourceFileRow {
+        SourceFileRow {
+            path: path.to_string(),
+            on_disk,
+            size_bytes: if on_disk { 42 } else { 0 },
+            modified_at: if on_disk { Some("1".to_string()) } else { None },
+            modified_age_seconds: if on_disk { Some(1) } else { None },
+            checkpoint_offset: checkpoint.then_some(10),
+            checkpoint_line_no: checkpoint.then_some(2),
+            checkpoint_status: checkpoint.then(|| "ok".to_string()),
+            checkpoint_updated_at: checkpoint.then(|| "2".to_string()),
+            checkpoint_age_seconds: checkpoint.then_some(2),
+            raw_event_count,
+            canonical_event_count,
+            latest_raw_event_at: (raw_event_count > 0).then(|| "3".to_string()),
+            latest_raw_event_age_seconds: (raw_event_count > 0).then_some(3),
+            latest_error_at: error.then(|| "4".to_string()),
+            latest_error_age_seconds: error.then_some(4),
+            latest_error_kind: error.then(|| "parse".to_string()),
+            latest_error_text: error.then(|| "bad row".to_string()),
+            stale_reason: issues
+                .contains(&SourceFileIssue::Stale)
+                .then(|| "stale".to_string()),
+            sqlite_wal_present: None,
+            sqlite_shm_present: None,
+            issues,
+        }
+    }
+
+    fn test_source(name: &str, enabled: bool) -> IngestSource {
+        IngestSource {
+            name: name.to_string(),
+            harness: "codex".to_string(),
+            enabled,
+            glob: "/tmp/codex/**/*.jsonl".to_string(),
+            watch_root: "/tmp/codex".to_string(),
+            format: "jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_source_drift_row_classifies_file_state_mismatches() {
+        let source = test_source("codex", true);
+        let status = SourceStatusRow {
+            name: source.name.clone(),
+            harness: source.harness.clone(),
+            format: source.format.clone(),
+            enabled: true,
+            glob: source.glob.clone(),
+            watch_root: source.watch_root.clone(),
+            status: SourceHealthStatus::Warning,
+            checkpoint_count: 4,
+            latest_checkpoint_at: Some("2026-04-20 10:15:00".to_string()),
+            latest_checkpoint_age_seconds: Some(30),
+            raw_event_count: 3,
+            ingest_error_count: 1,
+            latest_error_at: Some("2026-04-20 10:16:00".to_string()),
+            latest_error_kind: Some("parse".to_string()),
+            latest_error_text: Some("bad row".to_string()),
+        };
+        let snapshot = SourceFilesSnapshot {
+            source_name: "codex".to_string(),
+            watch_root: source.watch_root.clone(),
+            glob: source.glob.clone(),
+            files: vec![
+                test_source_file(
+                    "/tmp/codex/raw-only.jsonl",
+                    true,
+                    true,
+                    3,
+                    0,
+                    false,
+                    Vec::new(),
+                ),
+                test_source_file(
+                    "/tmp/codex/canonical-only.jsonl",
+                    true,
+                    true,
+                    0,
+                    2,
+                    false,
+                    Vec::new(),
+                ),
+                test_source_file(
+                    "/tmp/codex/checkpoint-only.jsonl",
+                    true,
+                    true,
+                    0,
+                    0,
+                    false,
+                    Vec::new(),
+                ),
+                test_source_file(
+                    "/tmp/codex/missing.jsonl",
+                    false,
+                    true,
+                    1,
+                    1,
+                    false,
+                    vec![SourceFileIssue::MissingOnDisk],
+                ),
+                test_source_file(
+                    "/tmp/codex/error.jsonl",
+                    true,
+                    false,
+                    0,
+                    0,
+                    true,
+                    vec![SourceFileIssue::Erroring],
+                ),
+            ],
+            glob_match_count: 4,
+            fs_error: None,
+            query_error: None,
+        };
+
+        let row = build_source_drift_row(&source, Some(&status), None, snapshot);
+
+        assert_eq!(row.status, SourceDriftStatus::Error);
+        assert_eq!(row.raw_without_canonical_file_count, 1);
+        assert_eq!(row.canonical_without_raw_file_count, 1);
+        assert_eq!(row.checkpoint_only_file_count, 1);
+        assert_eq!(row.missing_on_disk_file_count, 1);
+        assert_eq!(row.ingest_error_count, 1);
+        assert!(row
+            .findings
+            .iter()
+            .any(|finding| finding.kind == SourceDriftFindingKind::RawWithoutCanonical));
+        assert!(row
+            .findings
+            .iter()
+            .any(|finding| finding.kind == SourceDriftFindingKind::CanonicalWithoutRaw));
+        assert!(row
+            .findings
+            .iter()
+            .any(|finding| finding.kind == SourceDriftFindingKind::IngestErrors));
+    }
+
+    #[test]
+    fn build_source_drift_row_marks_expected_idle() {
+        let source = test_source("idle", true);
+        let snapshot = SourceFilesSnapshot {
+            source_name: "idle".to_string(),
+            watch_root: source.watch_root.clone(),
+            glob: source.glob.clone(),
+            files: Vec::new(),
+            glob_match_count: 0,
+            fs_error: None,
+            query_error: None,
+        };
+
+        let row = build_source_drift_row(&source, None, None, snapshot);
+
+        assert_eq!(row.status, SourceDriftStatus::Info);
+        assert_eq!(row.findings.len(), 1);
+        assert_eq!(row.findings[0].kind, SourceDriftFindingKind::ExpectedIdle);
+    }
+
     #[test]
     fn build_source_file_row_marks_missing_erroring_and_sqlite_sidecars() {
         let mut cfg = moraine_config::AppConfig::default();
@@ -1266,6 +1935,7 @@ mod tests {
             true,
             None,
             None,
+            None,
             Some(&latest_error),
             now_unix_seconds(),
         );
@@ -1296,6 +1966,10 @@ mod tests {
                 latest_raw_event_at: "2026-04-20 10:19:10".to_string(),
                 latest_raw_event_age_seconds: 8,
             }),
+            Some(&FileCanonicalStatsRow {
+                source_file: "/tmp/missing-opencode.db".to_string(),
+                count: 24,
+            }),
             None,
             now_unix_seconds(),
         );
@@ -1303,6 +1977,7 @@ mod tests {
         assert!(!missing_row.on_disk);
         assert!(missing_row.issues.contains(&SourceFileIssue::MissingOnDisk));
         assert_eq!(missing_row.raw_event_count, 12);
+        assert_eq!(missing_row.canonical_event_count, 24);
 
         let _ = std::fs::remove_dir_all(root);
     }
