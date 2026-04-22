@@ -5,9 +5,36 @@ followed the April 20, 2026 feature roadmap. It records what landed, what was
 intentionally postponed, which branches are stale duplicates, and which slices
 should be picked next.
 
-Implementation status is current through `60c7bf6 feat(sources): add ingest
-error quarantine`. Later documentation-only commits may update this page
+Implementation status is current through `3d04d34 docs(roadmap): consolidate
+implementation waves`. Later documentation-only commits may update this page
 without changing product behavior.
+
+## Current State - April 22, 2026
+
+`main` is clean, pushed, and synchronized with `origin/main` at `3d04d34`.
+The local runtime is healthy. Source drift is clean except for expected
+informational findings:
+
+- `opencode` reports `sqlite_sidecars` because `.db-wal` and `.db-shm` siblings
+  are visible next to the OpenCode SQLite database.
+- `hermes` reports `expected_idle` because the local Hermes source currently
+  has no matching files and no recorded ingest state.
+
+A brief `codex` `stale_files` warning appeared while the active Codex session
+file was still being appended. It cleared after the live ingest service
+processed the new rows, so it does not require a quarantine or code change.
+
+Use this command sequence to confirm the same state after later changes:
+
+```sh
+git status --short --branch
+moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+  sources drift --include-disabled
+```
+
+The locally managed services are expected to show MCP as stopped in
+`moraine status` because this workstation uses client-owned stdio MCP
+processes, not a persistent `local.moraine.mcp` launchd service.
 
 ## Status Vocabulary
 
@@ -91,6 +118,98 @@ Both live-analytics branches include the old combined `f882f30` Kimi/OpenCode
 line. Port only the monitor analytics commits onto current `main` if the feature
 is still wanted.
 
+## Immediate Remaining Work
+
+Handle the remaining work in this order.
+
+### 1. Clean Branches
+
+Delete merged and superseded branches after one final branch-list check:
+
+```sh
+git branch --format='%(refname:short) %(upstream:short) %(objectname:short) %(subject)' | sort
+git branch -r --merged main --format='%(refname:short)' | sort
+```
+
+Remote branches already merged into `main` and safe to delete if they are not
+needed as bookmarks:
+
+- `origin/feat/import-mirror-manifests`
+- `origin/feat/opencode-sqlite-ingest-review`
+- `origin/feat/reindex-clean-resume`
+- `origin/feat/restore-execution-staging`
+- `origin/feat/source-drift-diagnostics`
+- `origin/impl/roadmap-foundations-2026-04-20`
+- `origin/test/operational-safety-e2e`
+
+Local branches that are patch-equivalent to accepted work:
+
+- `privacy-redaction-foundation`
+- `search-eval-harness`
+
+Old Kimi/OpenCode branches that are superseded by the reviewed split work and
+should not be merged:
+
+- `feat/kimi-cli-ingest`
+- `feat/kimi-opencode-ingest`
+- `feat/kimi-opencode-sources`
+- `feat/opencode-sqlite-ingest`
+
+### 2. Decide On Live Analytics
+
+Do not merge these branches as-is:
+
+- `feature/live-analytics-long-ranges`
+- `fix/live-analytics-range-meta`
+
+They include the old combined `f882f30` Kimi/OpenCode implementation line. If
+the monitor analytics UX is still wanted, create a fresh branch from current
+`main` and port only the monitor analytics commits.
+
+### 3. Run Operational Refresh
+
+After branch cleanup or any config/runtime change, refresh mirrors and verify
+the corpus:
+
+```sh
+/Users/xmasterrrr/Scratch/agents/moraine/sync-imports apply all
+moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+  sources drift --include-disabled
+moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+  db doctor --deep
+```
+
+Expected drift after a healthy refresh:
+
+- all active JSONL/session sources report `ok`;
+- `opencode` may keep an informational `sqlite_sidecars` finding;
+- idle local `hermes` may keep an informational `expected_idle` finding.
+
+### 4. Start The Next Product Slice
+
+The best next product slice is C07/C08 search quality:
+
+1. Curate qrels from real Moraine retrieval use cases.
+2. Establish baseline metrics with `scripts/bench/search_quality_eval.py`.
+3. Add a repeatable report artifact for local and CI runs.
+4. Implement field weighting.
+5. Add phrase and proximity search experiments behind measurable comparisons.
+
+Ranking changes should not land until the evaluation harness shows whether they
+improve or regress the baseline.
+
+### 5. Keep Larger Roadmap Items Queued
+
+These are still important, but they should follow the branch cleanup,
+operational refresh, and search-quality baseline:
+
+- active restore replacement;
+- full raw-source replay;
+- disk-backed ingest retry spool;
+- privacy key audit/decrypt/export;
+- monitor session explorer;
+- summaries, graph memory, policy engine, and other P2/P3 product layers.
+
 ## Parked Or Rejected Work
 
 The following artifacts are preserved for reference, but they are not the
@@ -118,15 +237,16 @@ tasks:
 ## Recommended Next Implementation Order
 
 1. Clean stale local/remote branches listed above.
-2. Port live analytics onto a fresh branch only if the monitor analytics UX is
-   still a priority.
-3. Build C07/C08 search quality work on top of the landed evaluation harness:
+2. Decide whether to port live analytics onto a fresh branch.
+3. Run the operational refresh sequence: import sync, source drift, and deep
+   doctor.
+4. Build C07/C08 search quality work on top of the landed evaluation harness:
    curate qrels, establish baselines, then tune field weights/phrase/proximity.
-4. Start C05 monitor session explorer after search quality has a measurable
+5. Start C05 monitor session explorer after search quality has a measurable
    baseline.
-5. Return to R06 disk-backed ingest retry spool with a small design doc and a
+6. Return to R06 disk-backed ingest retry spool with a small design doc and a
    narrow first slice.
-6. Continue R09/R10 privacy operations with key audit/decrypt/export tooling
+7. Continue R09/R10 privacy operations with key audit/decrypt/export tooling
    only after backup/restore confidence is sufficient.
 
 ## Documentation Source Of Truth
