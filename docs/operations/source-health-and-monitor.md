@@ -64,6 +64,8 @@ The JSON output is the most stable integration surface for scripts. It returns:
 - `canonical_without_raw`: normalized events exist without raw backing rows.
 - `ingest_errors`: one or more ingest errors are recorded.
 
+Zero-byte Kimi CLI `.jsonl` files are treated as intentionally skipped when they have no checkpoint, raw, canonical, or error state. This keeps widened Kimi globs such as `~/.kimi/sessions/**/*.jsonl` from reporting stale or unobserved drift for placeholder sidecars, while non-empty Kimi sidecars and empty files from other harnesses still surface normally.
+
 The JSON shape is intended for automation. Human output summarizes source-level counts and then lists typed findings with example paths.
 
 ## Monitor API
@@ -166,6 +168,8 @@ Each file row is additive and can now include:
 - `stale_reason`, which explains the heuristic when a file appears behind its on-disk writes.
 - `sqlite_wal_present` and `sqlite_shm_present` for `opencode_sqlite` sources only. These fields are intentionally heuristic: they report whether sibling `*.db-wal` and `*.db-shm` files are currently visible next to a base `.db` path, not whether every SQLite-based source format necessarily uses sidecars.
 
+For Kimi CLI sources, zero-byte `.jsonl` files with no ingest state are left out of `stale` and `unobserved_disk_files` classification. They still appear in disk/glob counts and file listings, which makes the skip auditable without turning known-empty sidecars into warnings.
+
 Partial failures stay localized to the affected query surface and are shown as `query_error` or `runtime_query_error` warnings in the panel instead of collapsing the whole view.
 
 The warning chips in the detail panel are intentionally typed:
@@ -234,7 +238,7 @@ When `runtime_query_error` is present:
 
 Codex and Claude Code are append-oriented JSONL sources and should usually show checkpoint and raw row growth shortly after a session writes.
 
-Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Kimi `context.jsonl` can be indexed when explicitly configured, but many context rows do not carry real timestamps. Moraine assigns deterministic synthetic timestamps for untimestamped Kimi rows and downstream latency statistics skip those synthetic timestamps so append-to-visible metrics are not polluted.
+Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Kimi `context.jsonl` can be indexed when explicitly configured, but many context rows do not carry real timestamps. Moraine assigns deterministic synthetic timestamps for untimestamped Kimi rows and downstream latency statistics skip those synthetic timestamps so append-to-visible metrics are not polluted. Operators may widen the Kimi glob to include sidecar JSONL files; empty sidecars are considered no-op files for drift purposes, but non-empty sidecars are expected to produce checkpoint/raw/event/error state like any other configured source file.
 
 OpenCode uses `format = "opencode_sqlite"` and is read through a defensive read-only SQLite connection. The watcher maps `opencode.db-wal` and `opencode.db-shm` sibling notifications back to the configured base database path, so live WAL writes do not wait for the periodic reconcile loop. The dispatcher validates expected tables and includes `PRAGMA user_version` in schema drift errors.
 

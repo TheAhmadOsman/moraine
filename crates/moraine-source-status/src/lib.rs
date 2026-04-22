@@ -1042,6 +1042,34 @@ fn sqlite_sidecar_flags(source: &IngestSource, path: &str) -> (Option<bool>, Opt
     (Some(wal), Some(shm))
 }
 
+fn is_empty_kimi_jsonl_sidecar(
+    source: &IngestSource,
+    path: &str,
+    on_disk: bool,
+    size_bytes: u64,
+) -> bool {
+    if !on_disk || size_bytes != 0 || source.harness != "kimi-cli" {
+        return false;
+    }
+
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+}
+
+fn source_file_is_observation_free(file: &SourceFileRow) -> bool {
+    !source_has_checkpoint(file)
+        && file.raw_event_count == 0
+        && file.canonical_event_count == 0
+        && file.latest_error_at.is_none()
+}
+
+fn source_file_is_intentionally_skipped(source: &IngestSource, file: &SourceFileRow) -> bool {
+    is_empty_kimi_jsonl_sidecar(source, &file.path, file.on_disk, file.size_bytes)
+        && source_file_is_observation_free(file)
+}
+
 fn stale_reason(
     modified_age_seconds: Option<u64>,
     observed_progress_unix: Option<u64>,
@@ -1091,12 +1119,22 @@ fn build_source_file_row(
     };
     let observed_progress_unix =
         latest_observed_progress_unix(now_unix_seconds, checkpoint, raw_stats, latest_error);
-    let stale_reason = stale_reason(
-        modified_age_seconds,
-        observed_progress_unix,
-        now_unix_seconds,
-        stale_threshold_seconds(cfg),
-    );
+    let observation_free = checkpoint.is_none()
+        && raw_stats.is_none()
+        && canonical_stats.is_none()
+        && latest_error.is_none();
+    let intentionally_skipped =
+        is_empty_kimi_jsonl_sidecar(source, path_str, on_disk, size_bytes) && observation_free;
+    let stale_reason = if intentionally_skipped {
+        None
+    } else {
+        stale_reason(
+            modified_age_seconds,
+            observed_progress_unix,
+            now_unix_seconds,
+            stale_threshold_seconds(cfg),
+        )
+    };
     let (sqlite_wal_present, sqlite_shm_present) = sqlite_sidecar_flags(source, path_str);
 
     let mut issues = Vec::new();
@@ -1364,13 +1402,13 @@ fn build_source_drift_row(
     });
     let unobserved_disk_file_count = source_file_count(&files, |file| {
         file.on_disk
-            && !source_has_checkpoint(file)
-            && file.raw_event_count == 0
-            && file.canonical_event_count == 0
-            && file.latest_error_at.is_none()
+            && source_file_is_observation_free(file)
+            && !source_file_is_intentionally_skipped(source, file)
     });
-    let stale_file_count =
-        source_file_count(&files, |file| file.issues.contains(&SourceFileIssue::Stale));
+    let stale_file_count = source_file_count(&files, |file| {
+        file.issues.contains(&SourceFileIssue::Stale)
+            && !source_file_is_intentionally_skipped(source, file)
+    });
     let checkpoint_only_file_count = source_file_count(&files, |file| {
         source_has_checkpoint(file)
             && file.raw_event_count == 0
@@ -1457,10 +1495,8 @@ fn build_source_drift_row(
         "Files match the configured glob but have no checkpoint, raw rows, canonical events, or ingest errors yet.",
         source_file_examples(&files, |file| {
             file.on_disk
-                && !source_has_checkpoint(file)
-                && file.raw_event_count == 0
-                && file.canonical_event_count == 0
-                && file.latest_error_at.is_none()
+                && source_file_is_observation_free(file)
+                && !source_file_is_intentionally_skipped(source, file)
         }),
     );
     push_drift_finding(
@@ -1469,7 +1505,10 @@ fn build_source_drift_row(
         SourceDriftSeverity::Warning,
         stale_file_count,
         "Files appear newer on disk than the latest observed ingest progress.",
-        source_file_examples(&files, |file| file.issues.contains(&SourceFileIssue::Stale)),
+        source_file_examples(&files, |file| {
+            file.issues.contains(&SourceFileIssue::Stale)
+                && !source_file_is_intentionally_skipped(source, file)
+        }),
     );
     push_drift_finding(
         &mut findings,
@@ -1738,10 +1777,32 @@ mod tests {
         error: bool,
         issues: Vec<SourceFileIssue>,
     ) -> SourceFileRow {
+        test_source_file_with_size(
+            path,
+            on_disk,
+            42,
+            checkpoint,
+            raw_event_count,
+            canonical_event_count,
+            error,
+            issues,
+        )
+    }
+
+    fn test_source_file_with_size(
+        path: &str,
+        on_disk: bool,
+        size_bytes: u64,
+        checkpoint: bool,
+        raw_event_count: u64,
+        canonical_event_count: u64,
+        error: bool,
+        issues: Vec<SourceFileIssue>,
+    ) -> SourceFileRow {
         SourceFileRow {
             path: path.to_string(),
             on_disk,
-            size_bytes: if on_disk { 42 } else { 0 },
+            size_bytes: if on_disk { size_bytes } else { 0 },
             modified_at: if on_disk { Some("1".to_string()) } else { None },
             modified_age_seconds: if on_disk { Some(1) } else { None },
             checkpoint_offset: checkpoint.then_some(10),
@@ -1893,6 +1954,81 @@ mod tests {
         assert_eq!(row.status, SourceDriftStatus::Info);
         assert_eq!(row.findings.len(), 1);
         assert_eq!(row.findings[0].kind, SourceDriftFindingKind::ExpectedIdle);
+    }
+
+    #[test]
+    fn build_source_drift_row_skips_empty_kimi_jsonl_sidecars() {
+        let source = IngestSource {
+            name: "kimi-cli".to_string(),
+            harness: "kimi-cli".to_string(),
+            enabled: true,
+            glob: "/tmp/kimi/**/*.jsonl".to_string(),
+            watch_root: "/tmp/kimi".to_string(),
+            format: "jsonl".to_string(),
+        };
+        let snapshot = SourceFilesSnapshot {
+            source_name: source.name.clone(),
+            watch_root: source.watch_root.clone(),
+            glob: source.glob.clone(),
+            files: vec![test_source_file_with_size(
+                "/tmp/kimi/work/session/context.jsonl",
+                true,
+                0,
+                false,
+                0,
+                0,
+                false,
+                vec![SourceFileIssue::Stale],
+            )],
+            glob_match_count: 1,
+            fs_error: None,
+            query_error: None,
+        };
+
+        let row = build_source_drift_row(&source, None, None, snapshot);
+
+        assert_eq!(row.status, SourceDriftStatus::Ok);
+        assert_eq!(row.disk_file_count, 1);
+        assert_eq!(row.unobserved_disk_file_count, 0);
+        assert_eq!(row.stale_file_count, 0);
+        assert!(row.findings.is_empty());
+    }
+
+    #[test]
+    fn build_source_drift_row_keeps_non_kimi_empty_jsonl_visible() {
+        let source = test_source("codex", true);
+        let snapshot = SourceFilesSnapshot {
+            source_name: source.name.clone(),
+            watch_root: source.watch_root.clone(),
+            glob: source.glob.clone(),
+            files: vec![test_source_file_with_size(
+                "/tmp/codex/empty.jsonl",
+                true,
+                0,
+                false,
+                0,
+                0,
+                false,
+                vec![SourceFileIssue::Stale],
+            )],
+            glob_match_count: 1,
+            fs_error: None,
+            query_error: None,
+        };
+
+        let row = build_source_drift_row(&source, None, None, snapshot);
+
+        assert_eq!(row.status, SourceDriftStatus::Warning);
+        assert_eq!(row.unobserved_disk_file_count, 1);
+        assert_eq!(row.stale_file_count, 1);
+        assert!(row
+            .findings
+            .iter()
+            .any(|finding| finding.kind == SourceDriftFindingKind::UnobservedDiskFiles));
+        assert!(row
+            .findings
+            .iter()
+            .any(|finding| finding.kind == SourceDriftFindingKind::StaleFiles));
     }
 
     #[test]
