@@ -28,7 +28,7 @@ Use this command sequence to confirm the same state after later changes:
 
 ```sh
 git status --short --branch
-moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+moraine --config /Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/moraine.toml \
   sources drift --include-disabled
 ```
 
@@ -172,10 +172,10 @@ After branch cleanup or any config/runtime change, refresh mirrors and verify
 the corpus:
 
 ```sh
-/Users/xmasterrrr/Scratch/agents/moraine/sync-imports apply all
-moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/sync-imports apply all
+moraine --config /Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/moraine.toml \
   sources drift --include-disabled
-moraine --config /Users/xmasterrrr/Scratch/agents/moraine/moraine.toml \
+moraine --config /Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/moraine.toml \
   db doctor --deep
 ```
 

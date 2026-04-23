@@ -108,14 +108,14 @@ check out a fresh worktree with an appropriate name for your work to prevent mul
 
 ## Operator Settings Sync
 For this workstation's live Moraine deployment, an update is not complete until
-the external settings bundle at `/Users/xmasterrrr/Scratch/agents/moraine/` has
+the external settings bundle at `/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/` has
 been reviewed and updated to match the current CLI, config surface, and runtime
 behavior.
 
 Operator-specific paths and hosts live in
-[`/Users/xmasterrrr/Scratch/agents/moraine/.env`](/Users/xmasterrrr/Scratch/agents/moraine/.env)
+[`/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/.env`](/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/.env)
 and
-[`/Users/xmasterrrr/Scratch/agents/moraine/.env.example`](/Users/xmasterrrr/Scratch/agents/moraine/.env.example).
+[`/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/.env.example`](/Users/xmasterrrr/Obsidian/NAS-Workbooks/configs/moraine/.env.example).
 Do not duplicate or edit those values inline in this file; update the env files
 and the settings bundle docs/scripts instead.
 
