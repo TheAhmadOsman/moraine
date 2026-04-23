@@ -39,6 +39,7 @@
 
   let analyticsPayload: AnalyticsResponse | null = null;
   let analyticsError: string | null = null;
+  let analyticsDeferred = true;
 
   let sourcesData: SourcesResponse | null = null;
   let sourcesError: string | null = null;
@@ -97,8 +98,10 @@
     try {
       analyticsPayload = await fetchAnalytics(get(analyticsRangeStore));
       analyticsError = null;
+      analyticsDeferred = false;
     } catch (error) {
       analyticsError = `Analytics unavailable: ${errorMessage(error)}`;
+      analyticsDeferred = false;
     }
   }
 
@@ -135,7 +138,26 @@
 
   async function handleRangeChange(event: CustomEvent<AnalyticsRangeKey>): Promise<void> {
     analyticsRangeStore.set(event.detail);
+    analyticsDeferred = false;
     await loadAnalytics();
+  }
+
+  async function handleAnalyticsLoadRequested(): Promise<void> {
+    analyticsDeferred = false;
+    await loadAnalytics();
+  }
+
+  function scheduleInitialAnalyticsLoad(): void {
+    const runner = () => {
+      void loadAnalytics();
+    };
+
+    if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+      window.requestIdleCallback(runner, { timeout: 5_000 });
+      return;
+    }
+
+    globalThis.setTimeout(runner, 250);
   }
 
   function handleSetTheme(event: CustomEvent<ThemeMode>): void {
@@ -154,14 +176,19 @@
     initializeTheme();
 
     void hydrateFast();
-    void hydrateSlow();
+    window.setTimeout(() => {
+      void loadSessions();
+    }, 0);
+    scheduleInitialAnalyticsLoad();
 
     const fastInterval = window.setInterval(() => {
       void hydrateFast();
     }, FAST_POLL_INTERVAL_MS);
 
     const slowInterval = window.setInterval(() => {
-      void loadAnalytics();
+      if (!analyticsDeferred) {
+        void loadAnalytics();
+      }
     }, SLOW_POLL_INTERVAL_MS);
 
     const sessionsInterval = window.setInterval(() => {
@@ -195,8 +222,10 @@
       payload={analyticsPayload}
       selectedRange={$analyticsRangeStore}
       errorMessage={analyticsError}
+      deferred={analyticsDeferred}
       theme={$themeStore}
       on:rangeChange={handleRangeChange}
+      on:loadRequested={handleAnalyticsLoadRequested}
     />
 
     <SessionsPanel

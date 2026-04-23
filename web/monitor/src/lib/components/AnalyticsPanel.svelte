@@ -12,9 +12,11 @@
   export let selectedRange: AnalyticsRangeKey = '24h';
   export let errorMessage: string | null = null;
   export let theme: ThemeMode = 'light';
+  export let deferred = false;
 
   const dispatch = createEventDispatcher<{
     rangeChange: AnalyticsRangeKey;
+    loadRequested: void;
   }>();
 
   let tokensCanvas: HTMLCanvasElement;
@@ -90,7 +92,7 @@
     } else {
       resetCharts();
       chartView = null;
-      metaText = errorMessage || DEFAULT_ANALYTICS_META;
+      metaText = deferred ? 'Analytics ready to load.' : errorMessage || DEFAULT_ANALYTICS_META;
     }
   }
 
@@ -121,7 +123,18 @@
   </div>
   <p id="analyticsMeta" class="muted">{metaText}</p>
 
-  <div class="chart-grid">
+  {#if deferred}
+    <div class="analytics-deferred">
+      <p class="muted">
+        Analytics load after the dashboard shell so status, sources, and sessions render first.
+      </p>
+      <button type="button" class="analytics-load-button" on:click={() => dispatch('loadRequested')}>
+        Load Analytics Now
+      </button>
+    </div>
+  {/if}
+
+  <div class="chart-grid" class:hidden={deferred}>
     <article class="chart-card">
       <h3>Generation Tokens Per Model</h3>
       <div class="chart-wrap">
@@ -144,3 +157,32 @@
     </article>
   </div>
 </section>
+
+<style>
+  .analytics-deferred {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0 0 1rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.03);
+  }
+
+  .analytics-load-button {
+    border: 1px solid rgba(59, 130, 246, 0.4);
+    border-radius: 8px;
+    background: rgba(59, 130, 246, 0.12);
+    color: inherit;
+    padding: 0.55rem 0.85rem;
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .hidden {
+    display: none;
+  }
+</style>
