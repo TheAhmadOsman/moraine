@@ -14,6 +14,9 @@
   export let deferred = true;
   export let meta: SessionsMeta | null = null;
   export let selectedLimit = 25;
+  export let pageNumber = 1;
+  export let canGoPrevious = false;
+  export let canGoNext = false;
 
   const limitOptions = [25, 50, 100, 200];
 
@@ -21,6 +24,8 @@
     filterChange: SessionsFilter;
     loadRequested: void;
     limitChange: number;
+    previousPage: void;
+    nextPage: void;
   }>();
 
   function handleFilter(next: SessionsFilter): void {
@@ -90,16 +95,34 @@
     <div class="mv-empty">Loading sessions…</div>
   {:else}
     {#if meta}
-      <div class="mv-sessions-meta mono">
-        Loaded {meta.loadedCount} session{meta.loadedCount === 1 ? '' : 's'}
-        {#if meta.hasMore}
-          of at least {meta.loadedCount + 1}
-        {/if}
-        · page limit {meta.effectiveLimit}
-        · window {formatSince(meta.sinceSeconds)}
-        {#if meta.hasMore}
-          · more available
-        {/if}
+      <div class="mv-sessions-meta-row">
+        <div class="mv-sessions-meta mono">
+          Page {pageNumber}
+          · loaded {meta.loadedCount} session{meta.loadedCount === 1 ? '' : 's'}
+          {#if meta.hasMore}
+            · more available
+          {/if}
+          · page limit {meta.effectiveLimit}
+          · window {formatSince(meta.sinceSeconds)}
+        </div>
+        <div class="mv-page-nav">
+          <button
+            class="mv-button"
+            type="button"
+            disabled={loading || !canGoPrevious}
+            on:click={() => dispatch('previousPage')}
+          >
+            Previous Page
+          </button>
+          <button
+            class="mv-button"
+            type="button"
+            disabled={loading || !canGoNext}
+            on:click={() => dispatch('nextPage')}
+          >
+            Next Page
+          </button>
+        </div>
       </div>
     {/if}
     <V1Library sessions={filtered} />

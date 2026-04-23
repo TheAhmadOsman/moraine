@@ -88,6 +88,7 @@ export interface SessionsMeta {
   loadedCount: number;
   hasMore: boolean;
   sinceSeconds: number;
+  nextCursor: string | null;
 }
 
 export interface SessionsResponse {
@@ -99,6 +100,7 @@ export interface SessionsResponse {
     loaded_count?: number;
     has_more?: boolean;
     since_seconds?: number;
+    next_cursor?: string | null;
   };
   models?: string[];
   harnesses?: Harness[];

@@ -51,7 +51,7 @@ Core runtime endpoints used by the dashboard:
 | `/api/status` | `StatusStrip` | Table counts and ingest heartbeat status. |
 | `/api/sources` | `SourcesStrip` | Configured ingest sources, health labels, counts, checkpoints, and latest errors. |
 | `/api/analytics` | `AnalyticsPanel` | Time-series dashboard metrics. Loaded after initial render so status/sources paint first, with a manual load control in the panel. |
-| `/api/sessions` | `SessionsPanel` | Session explorer data. Deferred by default in the UI, with explicit load/refresh and page-limit control because centralized corpora can make this query materially slower than the status shell. |
+| `/api/sessions` | `SessionsPanel` | Session explorer data. Deferred by default in the UI, with explicit load/refresh, page-limit control, and cursor-based next-page pagination because centralized corpora can make this query materially slower than the status shell. |
 
 `/api/sources` can return `ok=true` with a `query_error` string when ClickHouse source-health queries are partial. The UI should render the configured source inventory plus a warning instead of treating this as a hard dashboard failure.
 

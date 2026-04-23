@@ -5,6 +5,7 @@ export interface FetchSessionsOptions {
   allowMock?: boolean;
   limit?: number;
   since?: SessionsSinceKey;
+  cursor?: string | null;
 }
 
 export interface FetchSessionsResult {
@@ -22,11 +23,12 @@ function normalizeMeta(data: SessionsResponse, sessions: Session[]): SessionsMet
     loadedCount: Number(data.meta.loaded_count ?? sessions.length),
     hasMore: Boolean(data.meta.has_more),
     sinceSeconds: Number(data.meta.since_seconds ?? 0),
+    nextCursor: data.meta.next_cursor ?? null,
   };
 }
 
 export async function fetchSessions(options: FetchSessionsOptions = {}): Promise<FetchSessionsResult> {
-  const { allowMock = true, limit, since } = options;
+  const { allowMock = true, limit, since, cursor } = options;
 
   try {
     const query = new URLSearchParams();
@@ -35,6 +37,9 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
     }
     if (since) {
       query.set('since', since);
+    }
+    if (cursor) {
+      query.set('cursor', cursor);
     }
     const url = query.size > 0 ? `/api/sessions?${query.toString()}` : '/api/sessions';
     const response = await fetch(url, {
@@ -67,6 +72,7 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
       loadedCount: sessions.length,
       hasMore: false,
       sinceSeconds: 0,
+      nextCursor: null,
     },
   };
 }

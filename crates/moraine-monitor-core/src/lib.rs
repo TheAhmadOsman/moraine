@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -675,6 +676,28 @@ async fn api_analytics(
 struct SessionsQuery {
     limit: Option<u32>,
     since: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionsCursor {
+    since_seconds: u64,
+    ended_at_ms: i64,
+    session_id: String,
+}
+
+fn encode_sessions_cursor(cursor: &SessionsCursor) -> Result<String> {
+    let json = serde_json::to_vec(cursor)
+        .map_err(|err| anyhow!("failed to serialize sessions cursor: {err}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_sessions_cursor(token: &str) -> Result<SessionsCursor> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|err| anyhow!("invalid cursor: invalid base64: {err}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow!("invalid cursor: invalid payload: {err}"))
 }
 
 async fn api_sessions(
@@ -695,12 +718,22 @@ async fn api_sessions(
         _ => 30 * 24 * 60 * 60,
     };
 
-    match build_sessions_payload(&state, limit, since_seconds).await {
+    let cursor = match params.cursor.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(token) => Some(token),
+    };
+
+    match build_sessions_payload(&state, limit, since_seconds, cursor).await {
         Ok(payload) => json_response(payload, StatusCode::OK),
-        Err(error) => json_response(
-            json!({"ok": false, "error": format!("sessions query failed: {error}")}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => {
+            let message = format!("sessions query failed: {error}");
+            let status = if message.contains("invalid cursor:") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(json!({"ok": false, "error": message}), status)
+        }
     }
 }
 
@@ -833,13 +866,34 @@ struct SessionEventRow {
     tool_args_json: String,
 }
 
-async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64) -> Result<Value> {
+async fn build_sessions_payload(
+    state: &AppState,
+    limit: u32,
+    since_seconds: u64,
+    cursor_token: Option<&str>,
+) -> Result<Value> {
     let database = &state.clickhouse.config().database;
     let events_table = format!(
         "{}.{}",
         escape_identifier(database),
         escape_identifier("events")
     );
+
+    let cursor = match cursor_token {
+        Some(token) => {
+            let cursor = decode_sessions_cursor(token)?;
+            if cursor.since_seconds != since_seconds {
+                return Err(anyhow!(
+                    "invalid cursor: cursor does not match requested sessions window"
+                ));
+            }
+            if cursor.session_id.trim().is_empty() {
+                return Err(anyhow!("invalid cursor: missing session_id"));
+            }
+            Some(cursor)
+        }
+        None => None,
+    };
 
     let recency_filter = if since_seconds == 0 {
         String::new()
@@ -848,7 +902,7 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
     };
 
     let limit_plus = limit.saturating_add(1);
-    let summary_query = format!(
+    let summary_subquery = format!(
         "SELECT \
             session_id, \
             any(harness) AS harness, \
@@ -867,8 +921,29 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
             ) AS first_user_text \
          FROM {events_table} \
          WHERE length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter} \
-         GROUP BY session_id \
-         ORDER BY ended_at_ms DESC \
+         GROUP BY session_id"
+    );
+    let cursor_filter = if let Some(cursor) = &cursor {
+        format!(
+            " WHERE (ended_at_ms < {ended_at_ms}) OR (ended_at_ms = {ended_at_ms} AND session_id < '{session_id}')",
+            ended_at_ms = cursor.ended_at_ms,
+            session_id = escape_literal(&cursor.session_id),
+        )
+    } else {
+        String::new()
+    };
+    let summary_query = format!(
+        "SELECT \
+            session_id, \
+            harness, \
+            source_name, \
+            started_at_ms, \
+            ended_at_ms, \
+            models_blob, \
+            trace_id, \
+            first_user_text \
+         FROM ({summary_subquery}) AS summaries{cursor_filter} \
+         ORDER BY ended_at_ms DESC, session_id DESC \
          LIMIT {limit_plus}"
     );
 
@@ -882,6 +957,21 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
         summary_rows.truncate(limit as usize);
     }
 
+    let next_cursor = if has_more {
+        summary_rows
+            .last()
+            .map(|summary| {
+                encode_sessions_cursor(&SessionsCursor {
+                    since_seconds,
+                    ended_at_ms: summary.ended_at_ms,
+                    session_id: summary.session_id.clone(),
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
     if summary_rows.is_empty() {
         return Ok(json!({
             "ok": true,
@@ -892,6 +982,7 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
                 "loaded_count": 0,
                 "has_more": false,
                 "since_seconds": since_seconds,
+                "next_cursor": Value::Null,
             }
         }));
     }
@@ -964,6 +1055,7 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
             "loaded_count": sessions.len(),
             "has_more": has_more,
             "since_seconds": since_seconds,
+            "next_cursor": next_cursor,
         }
     }))
 }

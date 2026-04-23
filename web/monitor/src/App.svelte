@@ -48,6 +48,8 @@
   let sessionsDeferred = true;
   let sessionsLimit = 25;
   let sessionsSince: SessionsSinceKey = '30d';
+  let sessionsCursor: string | null = null;
+  let sessionsCursorHistory: Array<string | null> = [];
 
   $: sessions = $sessionsStore;
   $: filteredSessions = $filteredSessionsStore;
@@ -120,16 +122,24 @@
     }
   }
 
-  async function loadSessions(): Promise<void> {
+  function resetSessionsPagination(): void {
+    sessionsCursor = null;
+    sessionsCursorHistory = [];
+  }
+
+  async function loadSessions(targetCursor: string | null = sessionsCursor): Promise<boolean> {
     sessionsLoadingStore.set(true);
     try {
-      const result = await fetchSessions({ limit: sessionsLimit, since: sessionsSince });
+      const result = await fetchSessions({ limit: sessionsLimit, since: sessionsSince, cursor: targetCursor });
       sessionsStore.set(result.sessions);
       sessionsMetaStore.set(result.meta);
       sessionsErrorStore.set(null);
+      sessionsCursor = targetCursor;
       sessionsDeferred = false;
+      return true;
     } catch (error) {
       sessionsErrorStore.set(`Sessions unavailable: ${errorMessage(error)}`);
+      return false;
     } finally {
       sessionsLoadingStore.set(false);
     }
@@ -157,8 +167,27 @@
 
   async function handleSessionsLimitChange(event: CustomEvent<number>): Promise<void> {
     sessionsLimit = event.detail;
+    resetSessionsPagination();
     if (!sessionsDeferred) {
       await loadSessions();
+    }
+  }
+
+  async function handleSessionsPreviousPage(): Promise<void> {
+    if (sessionsLoading || sessionsCursorHistory.length === 0) return;
+    const nextHistory = [...sessionsCursorHistory];
+    const previousCursor = nextHistory.pop() ?? null;
+    if (await loadSessions(previousCursor)) {
+      sessionsCursorHistory = nextHistory;
+    }
+  }
+
+  async function handleSessionsNextPage(): Promise<void> {
+    const nextCursor = sessionsMeta?.nextCursor ?? null;
+    if (sessionsLoading || !nextCursor) return;
+    const currentCursor = sessionsCursor;
+    if (await loadSessions(nextCursor)) {
+      sessionsCursorHistory = [...sessionsCursorHistory, currentCursor];
     }
   }
 
@@ -253,9 +282,14 @@
       deferred={sessionsDeferred}
       meta={sessionsMeta}
       selectedLimit={sessionsLimit}
+      pageNumber={sessionsCursorHistory.length + 1}
+      canGoPrevious={sessionsCursorHistory.length > 0}
+      canGoNext={Boolean(sessionsMeta?.nextCursor)}
       on:filterChange={handleFilterChange}
       on:loadRequested={handleSessionsLoadRequested}
       on:limitChange={handleSessionsLimitChange}
+      on:previousPage={handleSessionsPreviousPage}
+      on:nextPage={handleSessionsNextPage}
     />
   </main>
 </div>
