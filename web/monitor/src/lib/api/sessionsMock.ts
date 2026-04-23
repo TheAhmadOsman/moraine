@@ -232,6 +232,7 @@ function makeGenerator(seed: number) {
     const lastTurn = turns[turns.length - 1];
     const endedAt = lastTurn.endedAt;
     const durationMs = endedAt - sessionStart;
+    const firstPrompt = turns[0]?.steps.find((step) => step.kind === 'user');
 
     const nonCompleted: SessionStatus[] = ['active', 'cancelled', 'error'];
     const status: SessionStatus = rng() < 0.78 ? 'completed' : pick(nonCompleted);
@@ -239,17 +240,20 @@ function makeGenerator(seed: number) {
     return {
       id: 'sess_' + Math.floor(rng() * 1e12).toString(16).padStart(10, '0'),
       title: TITLES[i % TITLES.length],
+      previewText: firstPrompt?.kind === 'user' ? firstPrompt.text : TITLES[i % TITLES.length],
       harness,
       startedAt: sessionStart,
       endedAt,
       durationMs,
       status,
       models: modelSet,
+      turnCount: turns.length,
       turns,
       totalTokens,
       totalToolCalls,
       tags: [...tagSet],
       traceId: 'tr_' + Math.floor(rng() * 1e14).toString(16).padStart(12, '0'),
+      hasDetail: true,
     };
   }
 

@@ -74,6 +74,7 @@ pub async fn run_server(
         .route("/api/web-searches", get(api_web_searches))
         .route("/api/tables/:table", get(api_table_rows))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/:session_id", get(api_session_detail))
         .route("/api/sources", get(api_sources))
         .route("/api/sources/:source", get(api_source_detail))
         .route("/api/sources/:source/files", get(api_source_files))
@@ -737,6 +738,20 @@ async fn api_sessions(
     }
 }
 
+async fn api_session_detail(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+    match build_session_detail_payload(&state, &session_id).await {
+        Ok(Some(payload)) => json_response(json!({"ok": true, "session": payload}), StatusCode::OK),
+        Ok(None) => json_response(
+            json!({"ok": false, "error": "session not found"}),
+            StatusCode::NOT_FOUND,
+        ),
+        Err(error) => json_response(
+            json!({"ok": false, "error": format!("session detail query failed: {error}")}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    }
+}
+
 async fn api_sources(State(state): State<AppState>) -> Response {
     match build_source_status_snapshot(&state.cfg, true).await {
         Ok(snapshot) => json_response(
@@ -843,11 +858,13 @@ struct SessionSummaryRow {
     models_blob: String,
     trace_id: String,
     first_user_text: String,
+    total_tokens: u64,
+    total_tool_calls: u64,
+    turn_count: u64,
 }
 
 #[derive(serde::Deserialize)]
 struct SessionEventRow {
-    session_id: String,
     event_ts_ms: i64,
     event_kind: String,
     actor_kind: String,
@@ -909,6 +926,9 @@ async fn build_sessions_payload(
             any(source_name) AS source_name, \
             toInt64(toUnixTimestamp64Milli(min(event_ts))) AS started_at_ms, \
             toInt64(toUnixTimestamp64Milli(max(event_ts))) AS ended_at_ms, \
+            toUInt64(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens)) AS total_tokens, \
+            toUInt64(countIf(event_kind = 'tool_call')) AS total_tool_calls, \
+            toUInt64(countIf(event_kind = 'message' AND actor_kind = 'user')) AS turn_count, \
             arrayStringConcat( \
                 arrayFilter(m -> length(m) > 0, \
                     groupUniqArray(lowerUTF8(trim(BOTH ' ' FROM model)))), \
@@ -939,6 +959,9 @@ async fn build_sessions_payload(
             source_name, \
             started_at_ms, \
             ended_at_ms, \
+            total_tokens, \
+            total_tool_calls, \
+            turn_count, \
             models_blob, \
             trace_id, \
             first_user_text \
@@ -987,16 +1010,74 @@ async fn build_sessions_payload(
         }));
     }
 
-    let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
-    let id_list = session_ids
-        .iter()
-        .map(|id| format!("'{}'", escape_literal(id)))
-        .collect::<Vec<_>>()
-        .join(",");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let sessions: Vec<Value> = summary_rows
+        .into_iter()
+        .map(|summary| build_session_summary_json(summary, now_ms))
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "sessions": sessions,
+        "meta": {
+            "requested_limit": limit,
+            "effective_limit": limit,
+            "loaded_count": sessions.len(),
+            "has_more": has_more,
+            "since_seconds": since_seconds,
+            "next_cursor": next_cursor,
+        }
+    }))
+}
+
+async fn build_session_detail_payload(state: &AppState, session_id: &str) -> Result<Option<Value>> {
+    let database = &state.clickhouse.config().database;
+    let events_table = format!(
+        "{}.{}",
+        escape_identifier(database),
+        escape_identifier("events")
+    );
+    let quoted_session_id = escape_literal(session_id);
+    let summary_query = format!(
+        "SELECT \
+            session_id, \
+            any(harness) AS harness, \
+            any(source_name) AS source_name, \
+            toInt64(toUnixTimestamp64Milli(min(event_ts))) AS started_at_ms, \
+            toInt64(toUnixTimestamp64Milli(max(event_ts))) AS ended_at_ms, \
+            toUInt64(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens)) AS total_tokens, \
+            toUInt64(countIf(event_kind = 'tool_call')) AS total_tool_calls, \
+            toUInt64(countIf(event_kind = 'message' AND actor_kind = 'user')) AS turn_count, \
+            arrayStringConcat( \
+                arrayFilter(m -> length(m) > 0, \
+                    groupUniqArray(lowerUTF8(trim(BOTH ' ' FROM model)))), \
+                '\u{1f}' \
+            ) AS models_blob, \
+            any(if(length(trim(BOTH ' ' FROM trace_id)) > 0, trace_id, '')) AS trace_id, \
+            argMin( \
+                if(length(text_content) > 0, substring(text_content, 1, 400), substring(text_preview, 1, 400)), \
+                if(event_kind = 'message' AND actor_kind = 'user', event_ts, toDateTime64('2099-01-01', 3)) \
+            ) AS first_user_text \
+         FROM {events_table} \
+         WHERE session_id = '{quoted_session_id}' \
+         GROUP BY session_id"
+    );
+
+    let mut summary_rows = state
+        .clickhouse
+        .query_rows::<SessionSummaryRow>(&summary_query, None)
+        .await?;
+
+    let Some(summary) = summary_rows.pop() else {
+        return Ok(None);
+    };
 
     let events_query = format!(
         "SELECT \
-            session_id, \
             toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
             event_kind, \
             actor_kind, \
@@ -1014,7 +1095,7 @@ async fn build_sessions_payload(
             substring(text_content, 1, 2000) AS text_content, \
             if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
          FROM {events_table} \
-         WHERE session_id IN ({id_list}) \
+         WHERE session_id = '{quoted_session_id}' \
          ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no"
     );
 
@@ -1023,41 +1104,55 @@ async fn build_sessions_payload(
         .query_rows::<SessionEventRow>(&events_query, None)
         .await?;
 
-    let mut events_by_session: HashMap<String, Vec<SessionEventRow>> = HashMap::new();
-    for row in event_rows {
-        events_by_session
-            .entry(row.session_id.clone())
-            .or_default()
-            .push(row);
-    }
-
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let sessions: Vec<Value> = summary_rows
-        .into_iter()
-        .map(|summary| {
-            let events = events_by_session
-                .remove(&summary.session_id)
-                .unwrap_or_default();
-            build_session_json(summary, events, now_ms)
-        })
-        .collect();
+    Ok(Some(build_session_json(summary, event_rows, now_ms)))
+}
 
-    Ok(json!({
-        "ok": true,
-        "sessions": sessions,
-        "meta": {
-            "requested_limit": limit,
-            "effective_limit": limit,
-            "loaded_count": sessions.len(),
-            "has_more": has_more,
-            "since_seconds": since_seconds,
-            "next_cursor": next_cursor,
-        }
-    }))
+fn build_session_summary_json(summary: SessionSummaryRow, now_ms: i64) -> Value {
+    let duration_ms = (summary.ended_at_ms - summary.started_at_ms).max(0);
+    let status = if now_ms - summary.ended_at_ms < 60_000 {
+        "active"
+    } else {
+        "completed"
+    };
+
+    let models: Vec<String> = if summary.models_blob.is_empty() {
+        Vec::new()
+    } else {
+        summary
+            .models_blob
+            .split('\u{1f}')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    };
+
+    let harness = harness_descriptor(&summary.harness, &summary.source_name);
+    let title = derive_title(&summary.first_user_text);
+    let preview_text = summary.first_user_text.trim().to_string();
+
+    json!({
+        "id": summary.session_id,
+        "title": title,
+        "previewText": preview_text,
+        "harness": harness,
+        "startedAt": summary.started_at_ms,
+        "endedAt": summary.ended_at_ms,
+        "durationMs": duration_ms,
+        "status": status,
+        "models": models,
+        "turnCount": summary.turn_count,
+        "turns": [],
+        "totalTokens": summary.total_tokens,
+        "totalToolCalls": summary.total_tool_calls,
+        "tags": Vec::<String>::new(),
+        "traceId": summary.trace_id,
+        "hasDetail": false,
+    })
 }
 
 fn build_session_json(
@@ -1101,17 +1196,20 @@ fn build_session_json(
     json!({
         "id": summary.session_id,
         "title": title,
+        "previewText": summary.first_user_text.trim(),
         "harness": harness,
         "startedAt": summary.started_at_ms,
         "endedAt": summary.ended_at_ms,
         "durationMs": duration_ms,
         "status": status,
         "models": models,
+        "turnCount": turns.len(),
         "turns": turns,
         "totalTokens": total_tokens,
         "totalToolCalls": total_tool_calls,
         "tags": Vec::<String>::new(),
         "traceId": summary.trace_id,
+        "hasDetail": true,
     })
 }
 

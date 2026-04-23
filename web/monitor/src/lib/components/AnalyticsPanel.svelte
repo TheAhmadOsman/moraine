@@ -13,6 +13,7 @@
   export let errorMessage: string | null = null;
   export let theme: ThemeMode = 'light';
   export let deferred = false;
+  export let loading = false;
 
   const dispatch = createEventDispatcher<{
     rangeChange: AnalyticsRangeKey;
@@ -92,7 +93,11 @@
     } else {
       resetCharts();
       chartView = null;
-      metaText = deferred ? 'Analytics ready to load.' : errorMessage || DEFAULT_ANALYTICS_META;
+      if (deferred && loading) {
+        metaText = 'Loading analytics…';
+      } else {
+        metaText = deferred ? 'Analytics ready to load.' : errorMessage || DEFAULT_ANALYTICS_META;
+      }
     }
   }
 
@@ -128,8 +133,12 @@
       <p class="muted">
         Analytics load after the dashboard shell so status, sources, and sessions render first.
       </p>
-      <button type="button" class="analytics-load-button" on:click={() => dispatch('loadRequested')}>
-        Load Analytics Now
+      <button type="button" class="mv-button" on:click={() => dispatch('loadRequested')} disabled={loading}>
+        {#if loading}
+          Loading…
+        {:else}
+          Load Analytics
+        {/if}
       </button>
     </div>
   {/if}
@@ -170,18 +179,6 @@
     border-radius: 8px;
     background: rgba(15, 23, 42, 0.03);
   }
-
-  .analytics-load-button {
-    border: 1px solid rgba(59, 130, 246, 0.4);
-    border-radius: 8px;
-    background: rgba(59, 130, 246, 0.12);
-    color: inherit;
-    padding: 0.55rem 0.85rem;
-    font: inherit;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
   .hidden {
     display: none;
   }

@@ -67,17 +67,20 @@ export interface Turn {
 export interface Session {
   id: string;
   title: string;
+  previewText: string;
   harness: Harness;
   startedAt: number;
   endedAt: number;
   durationMs: number;
   status: SessionStatus;
   models: string[];
+  turnCount: number;
   turns: Turn[];
   totalTokens: number;
   totalToolCalls: number;
   tags: string[];
   traceId: string;
+  hasDetail: boolean;
 }
 
 export type SessionsSinceKey = '1h' | '6h' | '24h' | '7d' | '30d' | '90d' | 'all';

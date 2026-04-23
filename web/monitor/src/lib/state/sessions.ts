@@ -23,6 +23,7 @@ export function filterSessions(sessions: Session[], filter: SessionsFilter): Ses
     if (filter.harness !== 'all' && s.harness.id !== filter.harness) return false;
     if (!q) return true;
     if (s.title.toLowerCase().includes(q)) return true;
+    if (s.previewText && s.previewText.toLowerCase().includes(q)) return true;
     if (s.id.toLowerCase().includes(q)) return true;
     if (s.harness.label.toLowerCase().includes(q)) return true;
     if (s.tags.some((tag) => tag.toLowerCase().includes(q))) return true;

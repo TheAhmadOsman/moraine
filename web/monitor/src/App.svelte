@@ -41,6 +41,7 @@
   let analyticsPayload: AnalyticsResponse | null = null;
   let analyticsError: string | null = null;
   let analyticsDeferred = true;
+  let analyticsLoading = false;
 
   let sourcesData: SourcesResponse | null = null;
   let sourcesError: string | null = null;
@@ -102,12 +103,17 @@
   }
 
   async function loadAnalytics(): Promise<void> {
+    if (analyticsLoading) {
+      return;
+    }
+    analyticsLoading = true;
+    analyticsError = null;
     try {
       analyticsPayload = await fetchAnalytics(get(analyticsRangeStore));
-      analyticsError = null;
-      analyticsDeferred = false;
     } catch (error) {
       analyticsError = `Analytics unavailable: ${errorMessage(error)}`;
+    } finally {
+      analyticsLoading = false;
       analyticsDeferred = false;
     }
   }
@@ -128,9 +134,18 @@
   }
 
   async function loadSessions(targetCursor: string | null = sessionsCursor): Promise<boolean> {
+    if (get(sessionsLoadingStore)) {
+      return false;
+    }
     sessionsLoadingStore.set(true);
+    sessionsErrorStore.set(null);
     try {
-      const result = await fetchSessions({ limit: sessionsLimit, since: sessionsSince, cursor: targetCursor });
+      const result = await fetchSessions({
+        allowMock: false,
+        limit: sessionsLimit,
+        since: sessionsSince,
+        cursor: targetCursor,
+      });
       sessionsStore.set(result.sessions);
       sessionsMetaStore.set(result.meta);
       sessionsErrorStore.set(null);
@@ -150,17 +165,22 @@
   }
 
   async function handleRangeChange(event: CustomEvent<AnalyticsRangeKey>): Promise<void> {
+    if (analyticsLoading) {
+      return;
+    }
     analyticsRangeStore.set(event.detail);
     analyticsDeferred = false;
     await loadAnalytics();
   }
 
   async function handleAnalyticsLoadRequested(): Promise<void> {
-    analyticsDeferred = false;
     await loadAnalytics();
   }
 
   async function handleSessionsLoadRequested(): Promise<void> {
+    if (sessionsLoading) {
+      return;
+    }
     sessionsDeferred = false;
     await loadSessions();
   }
@@ -168,7 +188,7 @@
   async function handleSessionsLimitChange(event: CustomEvent<number>): Promise<void> {
     sessionsLimit = event.detail;
     resetSessionsPagination();
-    if (!sessionsDeferred) {
+    if (!sessionsDeferred && !sessionsLoading) {
       await loadSessions();
     }
   }
@@ -266,6 +286,7 @@
       selectedRange={$analyticsRangeStore}
       errorMessage={analyticsError}
       deferred={analyticsDeferred}
+      loading={analyticsLoading}
       theme={$themeStore}
       on:rangeChange={handleRangeChange}
       on:loadRequested={handleAnalyticsLoadRequested}

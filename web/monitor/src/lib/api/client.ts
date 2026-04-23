@@ -13,12 +13,35 @@ interface ErrorPayload {
   error?: string;
 }
 
-async function requestJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, {
-    headers: {
-      Accept: 'application/json',
-    },
-  });
+export interface JsonRequestOptions {
+  timeoutMs?: number;
+}
+
+export async function requestJson<T>(path: string, options: JsonRequestOptions = {}): Promise<T> {
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const timeoutId =
+    controller && options.timeoutMs
+      ? globalThis.setTimeout(() => controller.abort(), options.timeoutMs)
+      : null;
+
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      headers: {
+        Accept: 'application/json',
+      },
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error('request timed out');
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      globalThis.clearTimeout(timeoutId);
+    }
+  }
 
   if (!response.ok) {
     let errorMessage: string | undefined;
@@ -48,7 +71,9 @@ export function fetchStatus(): Promise<StatusResponse> {
 }
 
 export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsResponse> {
-  return requestJson<AnalyticsResponse>(`/api/analytics?range=${encodeURIComponent(range)}`);
+  return requestJson<AnalyticsResponse>(`/api/analytics?range=${encodeURIComponent(range)}`, {
+    timeoutMs: 15_000,
+  });
 }
 
 export function fetchSources(): Promise<SourcesResponse> {

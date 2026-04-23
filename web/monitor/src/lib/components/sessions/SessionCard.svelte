@@ -15,6 +15,7 @@
   $: firstPrompt = findFirstPrompt(session);
 
   function findFirstPrompt(s: Session): string {
+    if (s.previewText) return s.previewText;
     const firstTurn = s.turns[0];
     if (!firstTurn) return '';
     const userStep = firstTurn.steps.find((step) => step.kind === 'user');
@@ -42,7 +43,7 @@
       {session.harness.label}
     </span>
     <span class="mv-meta-sep">·</span>
-    <span class="mv-meta-item mono">{session.turns.length} turns</span>
+    <span class="mv-meta-item mono">{session.turnCount} turns</span>
     <span class="mv-meta-sep">·</span>
     <span class="mv-meta-item mono">{fmtTokens(session.totalTokens)} tok</span>
     <span class="mv-meta-sep">·</span>
