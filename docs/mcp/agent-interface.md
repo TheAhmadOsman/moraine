@@ -4,6 +4,14 @@
 
 `moraine-mcp` is a local, stateless [Model Context Protocol](https://modelcontextprotocol.io/) server that sits on top of ClickHouse-backed Moraine tables. It accepts newline-delimited JSON-RPC over stdio, executes bounded retrieval reads through `moraine-conversations`, and returns either agent-readable prose or full structured JSON. It does not own ingestion, index construction, background maintenance, or long-lived in-process corpus state. [src: crates/moraine-mcp-core/src/lib.rs, crates/moraine-conversations/src/repo.rs]
 
+Factory Droid can consume the same stdio server:
+
+```bash
+droid mcp add moraine "moraine run mcp"
+```
+
+The server does not need Droid-specific tools. Droid sessions land in the shared corpus through the `factory-droid` ingest source and are retrieved by the existing MCP tools.
+
 The server exposes six tools:
 
 | Tool | Primary use |

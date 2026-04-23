@@ -2,13 +2,14 @@
 
 ## Runtime Responsibility
 
-`moraine-ingest` is the sole writer that transforms configured agent traces into canonical event rows. It tails append-oriented JSONL sources, handles rewritten Hermes session JSON snapshots, reads OpenCode SQLite databases, records non-fatal errors, advances checkpoints, and emits ingest heartbeats. Retrieval and monitor surfaces depend on this service for stable event identity, source provenance, and freshness. [src: apps/moraine-ingest, crates/moraine-ingest-core]
+`moraine-ingest` is the sole writer that transforms configured agent traces into canonical event rows. It tails append-oriented JSONL sources, pairs Factory Droid sessions with their settings sidecars, handles rewritten Hermes session JSON snapshots, reads OpenCode SQLite databases, records non-fatal errors, advances checkpoints, and emits ingest heartbeats. Retrieval and monitor surfaces depend on this service for stable event identity, source provenance, and freshness. [src: apps/moraine-ingest, crates/moraine-ingest-core]
 
 Supported configured source formats are:
 
 | Format | Typical sources | Processing model |
 |---|---|---|
 | `jsonl` | Codex, Claude Code, Kimi wire logs, Hermes trajectories | Resume by byte offset and line number. |
+| `factory_droid_jsonl` | Factory Droid local sessions | Resume by JSONL byte offset and line number; read sibling `.settings.json` when the session advances. |
 | `session_json` | Hermes live sessions | Read whole rewritten JSON document and emit newly appeared messages. |
 | `opencode_sqlite` | OpenCode local database | Open read-only SQLite, validate schema, page rows by strict watermark. |
 
@@ -75,6 +76,12 @@ If Kimi `context.jsonl` is explicitly configured, Moraine supports role-based re
 OpenCode uses `format = "opencode_sqlite"` against `~/.local/share/opencode/opencode.db`. The dispatcher opens SQLite with defensive read-only flags, validates expected `session`, `message`, and `part` tables, includes `PRAGMA user_version` and observed table/column lists in schema drift errors, and pages rows in strict watermark order with limits. [src: crates/moraine-ingest-core/src/dispatch.rs]
 
 OpenCode `part` rows are the primary searchable content. Text parts become user/assistant messages, reasoning parts become reasoning rows, tool parts become tool I/O rows, and step-finish rows preserve token usage.
+
+### Factory Droid
+
+Factory Droid defaults to `~/.factory/sessions/**/*.jsonl` with `format = "factory_droid_jsonl"`. The dispatcher tails the JSONL file and, whenever that file advances, reads the sibling `<session>.settings.json` sidecar for model, provider, autonomy, and aggregate token metadata. The raw JSONL row is preserved in `raw_events.raw_json`; missing JSONL timestamps such as `session_start` use the first timestamped session record, sidecar timestamp, or file modification time for canonical ordering.
+
+`session_start` rows become `session_meta` with session title and working directory. `message` rows map user/assistant text, thinking blocks, tool calls, and tool results into canonical message/reasoning/tool rows. `compaction_state` rows become summaries and keep anchor-message links. The sidecar is represented as a synthetic `session_settings` raw row and a stable `session_meta` event so settings updates replace the prior canonical settings event while exact sidecar content remains auditable in raw rows.
 
 ### Hermes
 

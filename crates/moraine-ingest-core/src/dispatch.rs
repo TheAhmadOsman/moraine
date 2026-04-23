@@ -1,9 +1,13 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
-use crate::normalize::{apply_privacy_redaction, normalize_record};
+use crate::normalize::{apply_privacy_redaction, normalize_record, raw_hash};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{anyhow, Context, Result};
-use moraine_config::{AppConfig, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON};
+use chrono::{DateTime, SecondsFormat, Utc};
+use moraine_config::{
+    AppConfig, SOURCE_FORMAT_FACTORY_DROID_JSONL, SOURCE_FORMAT_OPENCODE_SQLITE,
+    SOURCE_FORMAT_SESSION_JSON,
+};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -40,6 +44,8 @@ fn work_extension(work: &WorkItem) -> &'static str {
         "json"
     } else if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
         "db"
+    } else if work.format == SOURCE_FORMAT_FACTORY_DROID_JSONL {
+        "jsonl"
     } else {
         "jsonl"
     }
@@ -336,6 +342,9 @@ pub(crate) async fn process_file(
     if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
         return process_opencode_sqlite_file(config, work, checkpoints, sink_tx, metrics).await;
     }
+    if work.format == SOURCE_FORMAT_FACTORY_DROID_JSONL {
+        return process_factory_droid_jsonl_file(config, work, checkpoints, sink_tx, metrics).await;
+    }
 
     let source_file = &work.path;
 
@@ -542,6 +551,436 @@ pub(crate) async fn process_file(
     if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
         debug!(
             "{}:{} caught up at offset {}",
+            work.source_name, source_file, offset
+        );
+    }
+
+    Ok(())
+}
+
+fn system_time_rfc3339(value: std::time::SystemTime) -> String {
+    let dt: DateTime<Utc> = value.into();
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn metadata_modified_rfc3339(meta: &std::fs::Metadata) -> String {
+    meta.modified()
+        .map(system_time_rfc3339)
+        .unwrap_or_else(|_| system_time_rfc3339(std::time::SystemTime::now()))
+}
+
+fn factory_droid_sidecar_path(source_file: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(source_file);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    path.with_file_name(format!("{stem}.settings.json"))
+}
+
+fn value_timestamp(value: &Value) -> String {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn or_nonempty(value: String, fallback: impl FnOnce() -> String) -> String {
+    if value.trim().is_empty() {
+        fallback()
+    } else {
+        value
+    }
+}
+
+fn factory_droid_settings_timestamp(settings: &Value) -> String {
+    or_nonempty(value_timestamp(settings), || {
+        settings
+            .get("providerLockTimestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+fn factory_droid_model_hint(settings: Option<&Value>) -> String {
+    let Some(settings) = settings else {
+        return String::new();
+    };
+    let model = settings
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if model.is_empty() {
+        return String::new();
+    }
+    let provider = settings
+        .get("providerLock")
+        .or_else(|| settings.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if provider.is_empty() || model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    }
+}
+
+fn factory_droid_session_id_from_file(source_file: &str) -> String {
+    std::path::Path::new(source_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn override_normalized_raw_row(normalized: &mut crate::model::NormalizedRecord, raw_json: &str) {
+    if let Some(obj) = normalized.raw_row.as_object_mut() {
+        obj.insert("raw_json".to_string(), json!(truncate(raw_json, 200_000)));
+        obj.insert("raw_json_hash".to_string(), json!(raw_hash(raw_json)));
+    }
+}
+
+async fn process_factory_droid_jsonl_file(
+    config: &AppConfig,
+    work: &WorkItem,
+    checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    sink_tx: mpsc::Sender<SinkMessage>,
+    metrics: &Arc<Metrics>,
+) -> Result<()> {
+    let source_file = &work.path;
+
+    let meta = match std::fs::metadata(source_file) {
+        Ok(meta) => meta,
+        Err(exc) => {
+            debug!("metadata missing for {}: {}", source_file, exc);
+            return Ok(());
+        }
+    };
+
+    let inode = source_inode_for_file(source_file, &meta);
+    let file_size = meta.len();
+    let cp_key = checkpoint_key(&work.source_name, source_file);
+    let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+
+    let mut checkpoint = committed.unwrap_or(Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: inode,
+        source_generation: 1,
+        last_offset: 0,
+        last_line_no: 0,
+        status: "active".to_string(),
+    });
+
+    let mut generation_changed = false;
+    if checkpoint.source_inode != inode || file_size < checkpoint.last_offset {
+        checkpoint.source_inode = inode;
+        checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
+        checkpoint.status = "active".to_string();
+        generation_changed = true;
+    }
+
+    if file_size == checkpoint.last_offset && !generation_changed {
+        return Ok(());
+    }
+
+    let settings_path = factory_droid_sidecar_path(source_file);
+    let mut settings_value: Option<Value> = None;
+    let mut settings_raw_json = String::new();
+    let mut settings_inode = 0u64;
+    let mut settings_timestamp = String::new();
+    let mut prelude_errors = Vec::<Value>::new();
+
+    if settings_path.exists() {
+        match std::fs::read_to_string(&settings_path) {
+            Ok(body) => match serde_json::from_str::<Value>(&body) {
+                Ok(value) if value.is_object() => {
+                    settings_raw_json =
+                        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                    settings_timestamp = factory_droid_settings_timestamp(&value);
+                    if let Ok(meta) = std::fs::metadata(&settings_path) {
+                        let settings_path_string = settings_path.to_string_lossy().to_string();
+                        settings_inode = source_inode_for_file(&settings_path_string, &meta);
+                    }
+                    settings_value = Some(value);
+                }
+                Ok(_) => prelude_errors.push(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": settings_path.to_string_lossy(),
+                    "source_inode": 0u64,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": 0u64,
+                    "source_offset": 0u64,
+                    "error_kind": "json_parse_error",
+                    "error_text": "Expected JSON object",
+                    "raw_fragment": truncate(&body, 20_000),
+                })),
+                Err(exc) => prelude_errors.push(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": settings_path.to_string_lossy(),
+                    "source_inode": 0u64,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": 0u64,
+                    "source_offset": 0u64,
+                    "error_kind": "json_parse_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&body, 20_000),
+                })),
+            },
+            Err(exc) => debug!(
+                "factory-droid settings sidecar read skipped {}: {}",
+                settings_path.display(),
+                exc
+            ),
+        }
+    }
+
+    let mut file = std::fs::File::open(source_file)
+        .with_context(|| format!("failed to open {}", source_file))?;
+    file.seek(SeekFrom::Start(checkpoint.last_offset))
+        .with_context(|| format!("failed to seek {}", source_file))?;
+
+    let mut reader = BufReader::new(file);
+    let mut offset = checkpoint.last_offset;
+    let mut line_no = checkpoint.last_line_no;
+    let mut parsed_records = Vec::<(u64, u64, String, Value)>::new();
+    let mut parse_errors = Vec::<Value>::new();
+
+    loop {
+        let start_offset = offset;
+        let mut buf = Vec::<u8>::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut buf)
+            .with_context(|| format!("failed reading {}", source_file))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        offset = offset.saturating_add(bytes_read as u64);
+        line_no = line_no.saturating_add(1);
+
+        let mut text = String::from_utf8_lossy(&buf).to_string();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<Value>(&text) {
+            Ok(value) if value.is_object() => {
+                let raw_json = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                parsed_records.push((line_no, start_offset, raw_json, value));
+            }
+            Ok(_) => parse_errors.push(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": line_no,
+                "source_offset": start_offset,
+                "error_kind": "json_parse_error",
+                "error_text": "Expected JSON object",
+                "raw_fragment": truncate(&text, 20_000),
+            })),
+            Err(exc) => parse_errors.push(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": line_no,
+                "source_offset": start_offset,
+                "error_kind": "json_parse_error",
+                "error_text": exc.to_string(),
+                "raw_fragment": truncate(&text, 20_000),
+            })),
+        }
+    }
+
+    let first_record_timestamp = parsed_records
+        .iter()
+        .find_map(|(_, _, _, record)| {
+            let ts = value_timestamp(record);
+            if ts.is_empty() {
+                None
+            } else {
+                Some(ts)
+            }
+        })
+        .unwrap_or_default();
+    let fallback_timestamp = or_nonempty(
+        or_nonempty(first_record_timestamp, || settings_timestamp.clone()),
+        || metadata_modified_rfc3339(&meta),
+    );
+
+    let mut batch = RowBatch::default();
+    batch.error_rows.extend(prelude_errors);
+    batch.error_rows.extend(parse_errors);
+
+    let mut session_hint = factory_droid_session_id_from_file(source_file);
+    let mut model_hint = factory_droid_model_hint(settings_value.as_ref());
+
+    if let Some(settings) = settings_value.as_ref() {
+        let record = json!({
+            "type": "session_settings",
+            "timestamp": if settings_timestamp.is_empty() { fallback_timestamp.clone() } else { settings_timestamp.clone() },
+            "session_id": session_hint.clone(),
+            "settings": settings,
+        });
+        let settings_source_file = settings_path.to_string_lossy().to_string();
+        let raw_json = if settings_raw_json.is_empty() {
+            serde_json::to_string(settings).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            settings_raw_json.clone()
+        };
+        match normalize_record(
+            &record,
+            &work.source_name,
+            &work.harness,
+            &settings_source_file,
+            settings_inode,
+            checkpoint.source_generation,
+            0,
+            0,
+            &session_hint,
+            &model_hint,
+        ) {
+            Ok(mut normalized) => {
+                override_normalized_raw_row(&mut normalized, &raw_json);
+                apply_privacy_redaction(&mut normalized, &config.privacy)?;
+                session_hint = normalized.session_hint;
+                model_hint = normalized.model_hint;
+                batch.raw_rows.push(normalized.raw_row);
+                batch.event_rows.extend(normalized.event_rows);
+                batch.link_rows.extend(normalized.link_rows);
+                batch.tool_rows.extend(normalized.tool_rows);
+                batch.error_rows.extend(normalized.error_rows);
+                batch.lines_processed = batch.lines_processed.saturating_add(1);
+            }
+            Err(exc) => batch.error_rows.push(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": settings_source_file,
+                "source_inode": settings_inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": 0u64,
+                "source_offset": 0u64,
+                "error_kind": "normalize_error",
+                "error_text": exc.to_string(),
+                "raw_fragment": truncate(&raw_json, 20_000),
+            })),
+        }
+    }
+
+    for (record_line_no, start_offset, raw_json, parsed) in parsed_records {
+        let mut normalization_record = parsed.clone();
+        if value_timestamp(&normalization_record).is_empty() {
+            if let Some(obj) = normalization_record.as_object_mut() {
+                obj.insert("timestamp".to_string(), json!(fallback_timestamp.clone()));
+            }
+        }
+
+        let mut normalized = match normalize_record(
+            &normalization_record,
+            &work.source_name,
+            &work.harness,
+            source_file,
+            inode,
+            checkpoint.source_generation,
+            record_line_no,
+            start_offset,
+            &session_hint,
+            &model_hint,
+        ) {
+            Ok(normalized) => normalized,
+            Err(exc) => {
+                batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": record_line_no,
+                    "source_offset": start_offset,
+                    "error_kind": "normalize_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&raw_json, 20_000),
+                }));
+                continue;
+            }
+        };
+
+        override_normalized_raw_row(&mut normalized, &raw_json);
+        apply_privacy_redaction(&mut normalized, &config.privacy)?;
+
+        session_hint = normalized.session_hint;
+        model_hint = normalized.model_hint;
+        batch.raw_rows.push(normalized.raw_row);
+        batch.event_rows.extend(normalized.event_rows);
+        batch.link_rows.extend(normalized.link_rows);
+        batch.tool_rows.extend(normalized.tool_rows);
+        batch.error_rows.extend(normalized.error_rows);
+        batch.lines_processed = batch.lines_processed.saturating_add(1);
+
+        if batch.row_count() >= config.ingest.batch_size {
+            let mut chunk = RowBatch::default();
+            chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
+            chunk.event_rows = std::mem::take(&mut batch.event_rows);
+            chunk.link_rows = std::mem::take(&mut batch.link_rows);
+            chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
+            chunk.error_rows = std::mem::take(&mut batch.error_rows);
+            chunk.lines_processed = batch.lines_processed;
+            batch.lines_processed = 0;
+            chunk.checkpoint = Some(Checkpoint {
+                source_name: work.source_name.clone(),
+                source_file: source_file.to_string(),
+                source_inode: inode,
+                source_generation: checkpoint.source_generation,
+                last_offset: offset,
+                last_line_no: line_no,
+                status: "active".to_string(),
+            });
+
+            sink_tx
+                .send(SinkMessage::Batch(chunk))
+                .await
+                .context("sink channel closed while sending factory-droid chunk")?;
+        }
+    }
+
+    let final_checkpoint = Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode: inode,
+        source_generation: checkpoint.source_generation,
+        last_offset: offset,
+        last_line_no: line_no,
+        status: "active".to_string(),
+    };
+
+    if batch.row_count() > 0 || generation_changed || offset != checkpoint.last_offset {
+        batch.checkpoint = Some(final_checkpoint);
+        sink_tx
+            .send(SinkMessage::Batch(batch))
+            .await
+            .context("sink channel closed while sending final factory-droid batch")?;
+    }
+
+    if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
+        debug!(
+            "{}:{} factory_droid_jsonl caught up at offset {}",
             work.source_name, source_file, offset
         );
     }
@@ -1295,9 +1734,10 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enrich_claude_model_latency,
-        infer_vendor_from_base_url, path_matches_extension, process_opencode_sqlite_file,
-        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
-        SessionCursor, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        infer_vendor_from_base_url, path_matches_extension, process_factory_droid_jsonl_file,
+        process_opencode_sqlite_file, process_session_json_file, run_work_item,
+        source_inode_for_file, work_extension, SessionCursor, SESSION_JSON_GENERATION,
+        SESSION_JSON_INODE,
     };
     use crate::checkpoint::checkpoint_key;
     use crate::model::Checkpoint;
@@ -1946,6 +2386,118 @@ mod tests {
             out.push(batch);
         }
         out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_factory_droid_jsonl_reads_sidecar_and_preserves_raw_jsonl() {
+        let path = unique_test_file("factory-droid");
+        let source_file = path.to_string_lossy().to_string();
+        let settings_path = path.with_file_name(format!(
+            "{}.settings.json",
+            path.file_stem().and_then(|s| s.to_str()).unwrap()
+        ));
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_start\",\"id\":\"65082ccf-d3b7-46ac-916e-e3b1cedac604\",\"title\":\"hi\",\"sessionTitle\":\"Greeting\",\"owner\":\"user\",\"version\":2,\"cwd\":\"/tmp/project\"}\n",
+                "{\"type\":\"message\",\"id\":\"user-1\",\"timestamp\":\"2026-04-22T08:17:40.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"assistant-1\",\"parentId\":\"user-1\",\"timestamp\":\"2026-04-22T08:17:41.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"openaiEncryptedContent\":\"secret-ciphertext\"}}\n",
+            ),
+        )
+        .expect("write factory droid session");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "model": "claude-opus-4-7",
+                "providerLock": "anthropic",
+                "providerLockTimestamp": "2026-04-22T08:17:42.000Z",
+                "tokenUsage": {
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                    "cacheReadTokens": 3,
+                    "cacheCreationTokens": 4
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write factory droid settings");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let work = WorkItem {
+            source_name: "factory-droid".to_string(),
+            harness: "factory-droid".to_string(),
+            format: "factory_droid_jsonl".to_string(),
+            path: source_file.clone(),
+        };
+
+        process_factory_droid_jsonl_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("process factory droid jsonl");
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 4);
+        assert_eq!(batch.event_rows.len(), 4);
+        assert!(batch
+            .error_rows
+            .iter()
+            .all(|row| row.get("error_kind").and_then(Value::as_str)
+                != Some("timestamp_parse_error")));
+
+        let settings_raw = batch
+            .raw_rows
+            .iter()
+            .find(|row| {
+                row.get("source_file")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.ends_with(".settings.json"))
+            })
+            .expect("settings raw row");
+        let settings_raw_json = settings_raw
+            .get("raw_json")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(settings_raw_json.contains("\"providerLock\":\"anthropic\""));
+        assert!(!settings_raw_json.contains("session_settings"));
+
+        let session_start_raw = batch
+            .raw_rows
+            .iter()
+            .find(|row| row.get("top_type").and_then(Value::as_str) == Some("session_start"))
+            .expect("session_start raw row");
+        let session_start_raw_json = session_start_raw
+            .get("raw_json")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(!session_start_raw_json.contains("\"timestamp\""));
+
+        let assistant_event = batch
+            .event_rows
+            .iter()
+            .find(|row| row.get("text_content").and_then(Value::as_str) == Some("hello"))
+            .expect("assistant event");
+        assert_eq!(
+            assistant_event.get("model").and_then(Value::as_str),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            assistant_event
+                .get("inference_provider")
+                .and_then(Value::as_str),
+            Some("anthropic")
+        );
+        assert!(!assistant_event
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("secret-ciphertext"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&settings_path);
     }
 
     #[tokio::test(flavor = "multi_thread")]

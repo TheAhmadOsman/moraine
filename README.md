@@ -2,7 +2,7 @@
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes all of your agent harness traces (Claude Code, Codex, Kimi CLI, OpenCode, Hermes Agent, ...) in realtime into a searchable, unified database.
+Moraine indexes all of your agent harness traces (Claude Code, Codex, Factory Droid, Kimi CLI, OpenCode, Hermes Agent, ...) in realtime into a searchable, unified database.
 
 🤖 **Your Agents Get**: a searchable long-term memory.
 
@@ -87,6 +87,12 @@ Or add to Codex:
 codex mcp add conversation-search -- moraine run mcp
 ```
 
+Or add to Factory Droid:
+
+```
+droid mcp add moraine "moraine run mcp"
+```
+
 For the full tool contract and integration guidance, see `docs/mcp/agent-interface.md`.
 
 ## Query the Database Directly
@@ -130,6 +136,7 @@ By default, Moraine watches:
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Kimi CLI | `~/.kimi/sessions/**/wire.jsonl` |
 | OpenCode | `~/.local/share/opencode/opencode.db` |
+| Factory Droid | `~/.factory/sessions/**/*.jsonl` |
 | Hermes (live sessions) | `~/.hermes/sessions/session_*.json` |
 | Hermes (trajectories) | user-defined, opt-in |
 

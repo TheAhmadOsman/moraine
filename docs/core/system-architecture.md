@@ -2,7 +2,7 @@
 
 ## System Objective
 
-Moraine converts local agent traces into a queryable corpus that supports operational inspection, faithful trace reconstruction, and agent self-retrieval. Default sources include Codex JSONL, Claude Code JSONL, Kimi CLI wire logs, OpenCode SQLite, Hermes live session snapshots, and optional Hermes trajectory exports. The system is single-node by design: ClickHouse binds locally, runtime state lives under `~/.moraine`, and lifecycle is managed through the `moraine` binary. [src: config/moraine.toml, crates/moraine-config/src/lib.rs]
+Moraine converts local agent traces into a queryable corpus that supports operational inspection, faithful trace reconstruction, and agent self-retrieval. Default sources include Codex JSONL, Claude Code JSONL, Factory Droid JSONL plus settings sidecars, Kimi CLI wire logs, OpenCode SQLite, Hermes live session snapshots, and optional Hermes trajectory exports. The system is single-node by design: ClickHouse binds locally, runtime state lives under `~/.moraine`, and lifecycle is managed through the `moraine` binary. [src: config/moraine.toml, crates/moraine-config/src/lib.rs]
 
 The design priorities are:
 
@@ -32,13 +32,14 @@ The control-plane layer is `moraine`. It resolves config, supervises local servi
 
 ## End-to-End Causal Flow
 
-A typical append path begins when an agent writes a JSONL line, rewrites a Hermes session snapshot, or commits OpenCode rows to SQLite. Watchers and reconcile logic turn those source changes into work items. Reconcile remains mandatory because filesystem watchers can drop events; watcher events are an optimization for latency, not the only correctness path. [src: crates/moraine-ingest-core/src/watch.rs, crates/moraine-ingest-core/src/reconcile.rs]
+A typical append path begins when an agent writes a JSONL line, updates a Factory Droid session plus settings sidecar, rewrites a Hermes session snapshot, or commits OpenCode rows to SQLite. Watchers and reconcile logic turn those source changes into work items. Reconcile remains mandatory because filesystem watchers can drop events; watcher events are an optimization for latency, not the only correctness path. [src: crates/moraine-ingest-core/src/watch.rs, crates/moraine-ingest-core/src/reconcile.rs]
 
 Dispatch chooses the processor by source format:
 
 - `jsonl` tails append-oriented logs.
 - `session_json` reads whole rewritten session snapshots and emits only newly appeared messages.
 - `opencode_sqlite` opens the OpenCode database read-only, validates expected tables, and pages rows by strict watermark.
+- `factory_droid_jsonl` tails Factory Droid JSONL and reads the sibling `.settings.json` sidecar when the session file advances, preserving exact source JSON in raw rows while normalizing model, provider, token, compaction, and parent-link metadata.
 
 Each processor emits raw rows, canonical event rows, optional link/tool rows, errors, and checkpoint updates. The sink flushes data before checkpoints so failed writes retry without skipping unseen data. [src: crates/moraine-ingest-core/src/dispatch.rs, crates/moraine-ingest-core/src/sink.rs]
 

@@ -67,6 +67,7 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
 enum Harness {
     Codex,
     ClaudeCode,
+    FactoryDroid,
     Hermes,
     KimiCli,
     OpenCode,
@@ -77,11 +78,12 @@ impl Harness {
         match raw.trim().to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude-code" => Ok(Self::ClaudeCode),
+            "factory-droid" => Ok(Self::FactoryDroid),
             "hermes" => Ok(Self::Hermes),
             "kimi-cli" => Ok(Self::KimiCli),
             "opencode" => Ok(Self::OpenCode),
             _ => Err(anyhow!(
-                "unsupported harness `{}`; expected one of: codex, claude-code, hermes, kimi-cli, opencode",
+                "unsupported harness `{}`; expected one of: codex, claude-code, factory-droid, hermes, kimi-cli, opencode",
                 raw.trim()
             )),
         }
@@ -91,6 +93,7 @@ impl Harness {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::FactoryDroid => "factory-droid",
             Self::Hermes => "hermes",
             Self::KimiCli => "kimi-cli",
             Self::OpenCode => "opencode",
@@ -104,6 +107,7 @@ impl Harness {
         match self {
             Self::Codex => "openai",
             Self::ClaudeCode => "anthropic",
+            Self::FactoryDroid => "",
             Self::Hermes => "",
             Self::KimiCli => "moonshot",
             Self::OpenCode => "",
@@ -265,6 +269,126 @@ fn opencode_provider_model(record: &Value) -> (String, String) {
         .or_else_nonempty(|| to_str(part.get("model").and_then(|m| m.get("modelID"))));
 
     (provider, canonicalize_model("opencode", &model))
+}
+
+fn split_provider_model_hint(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    match trimmed.split_once('/') {
+        Some((provider, model)) => (
+            provider.trim().to_ascii_lowercase(),
+            canonicalize_model("factory-droid", model),
+        ),
+        None => (String::new(), canonicalize_model("factory-droid", trimmed)),
+    }
+}
+
+fn infer_factory_droid_provider(explicit_provider: &str, model: &str) -> String {
+    let provider = explicit_provider.trim().to_ascii_lowercase();
+    if !provider.is_empty() {
+        return provider;
+    }
+
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("claude-") || model.contains("/claude-") {
+        "anthropic".to_string()
+    } else if model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.contains("openai")
+    {
+        "openai".to_string()
+    } else if model.starts_with("gemini-") {
+        "google".to_string()
+    } else if model.starts_with("glm-") {
+        "zai".to_string()
+    } else if model.starts_with("kimi-") {
+        "moonshot".to_string()
+    } else if model.starts_with("minimax-") {
+        "minimax".to_string()
+    } else if model == "droid-core" {
+        "factory".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn factory_droid_provider_model(record: &Value, model_hint: &str) -> (String, String) {
+    let settings = record.get("settings").unwrap_or(record);
+    let explicit_provider = to_str(record.get("providerLock"))
+        .or_else_nonempty(|| to_str(record.get("provider")))
+        .or_else_nonempty(|| to_str(record.get("inference_provider")))
+        .or_else_nonempty(|| to_str(settings.get("providerLock")))
+        .or_else_nonempty(|| to_str(settings.get("provider")))
+        .or_else_nonempty(|| to_str(settings.get("inference_provider")));
+    let explicit_model = to_str(record.get("model"))
+        .or_else_nonempty(|| to_str(settings.get("model")))
+        .or_else_nonempty(|| to_str(record.get("modelId")))
+        .or_else_nonempty(|| to_str(settings.get("modelId")));
+    let (hint_provider, hint_model) = split_provider_model_hint(model_hint);
+    let model = if explicit_model.trim().is_empty() {
+        hint_model
+    } else {
+        canonicalize_model("factory-droid", &explicit_model)
+    };
+    let provider = infer_factory_droid_provider(
+        &explicit_provider.or_else_nonempty(|| hint_provider),
+        &model,
+    );
+    (provider, model)
+}
+
+fn factory_droid_session_id(source_file: &str, session_hint: &str, record: &Value) -> String {
+    let explicit = to_str(record.get("session_id"))
+        .or_else_nonempty(|| to_str(record.get("sessionId")))
+        .or_else_nonempty(|| to_str(record.get("id")));
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    if !session_hint.is_empty() {
+        return session_hint.to_string();
+    }
+    infer_session_id_from_file(source_file)
+}
+
+fn pruned_factory_droid_payload(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => {
+            Value::Array(items.iter().map(pruned_factory_droid_payload).collect())
+        }
+        Value::Object(map) => {
+            let mut out = Map::<String, Value>::new();
+            for (key, val) in map {
+                match key.as_str() {
+                    "openaiEncryptedContent" => {
+                        out.insert(
+                            key.clone(),
+                            Value::String("[omitted:encrypted_content]".to_string()),
+                        );
+                    }
+                    "systemInfo" => {
+                        out.insert(
+                            "systemInfo_omitted".to_string(),
+                            Value::String("[omitted:large_environment_snapshot]".to_string()),
+                        );
+                    }
+                    _ => {
+                        out.insert(key.clone(), pruned_factory_droid_payload(val));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn factory_droid_payload_json(value: &Value) -> String {
+    compact_json(&pruned_factory_droid_payload(value))
 }
 
 fn update_string_field(row: &mut Value, key: &str, value: &str) {
@@ -480,7 +604,7 @@ fn event_version() -> u64 {
     now as u64
 }
 
-fn raw_hash(raw_json: &str) -> u64 {
+pub(crate) fn raw_hash(raw_json: &str) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(raw_json.as_bytes());
     let digest = hasher.finalize();
@@ -1667,6 +1791,576 @@ fn normalize_hermes_session_message(
             hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
             events.push(row);
             sub_event_index += 1;
+        }
+    }
+
+    (events, links, tools)
+}
+
+fn factory_droid_stamp_common(
+    row: &mut Map<String, Value>,
+    record: &Value,
+    message: Option<&Value>,
+    model: &str,
+) {
+    let message = message.unwrap_or(&Value::Null);
+    row.insert("item_id".to_string(), json!(to_str(record.get("id"))));
+    row.insert(
+        "request_id".to_string(),
+        json!(to_str(message.get("openaiMessageId"))),
+    );
+    row.insert(
+        "trace_id".to_string(),
+        json!(to_str(message.get("openaiReasoningId"))),
+    );
+    row.insert(
+        "op_status".to_string(),
+        json!(to_str(message.get("openaiPhase"))),
+    );
+    if !model.is_empty() {
+        row.insert("model".to_string(), json!(model));
+    }
+}
+
+fn factory_droid_push_parent_link(
+    links: &mut Vec<Value>,
+    ctx: &RecordContext<'_>,
+    event_uid: &str,
+    record: &Value,
+) {
+    let parent_id =
+        to_str(record.get("parentId")).or_else_nonempty(|| to_str(record.get("parent_id")));
+    if parent_id.is_empty() {
+        return;
+    }
+    links.push(build_external_link_row(
+        ctx,
+        event_uid,
+        &parent_id,
+        "parent_event",
+        "{}",
+    ));
+}
+
+fn factory_droid_tool_call_id(block: &Value, fallback: &str) -> String {
+    to_str(block.get("id"))
+        .or_else_nonempty(|| to_str(block.get("tool_call_id")))
+        .or_else_nonempty(|| to_str(block.get("call_id")))
+        .or_else_nonempty(|| fallback.to_string())
+}
+
+fn normalize_factory_droid_event(
+    record: &Value,
+    ctx: &RecordContext<'_>,
+    top_type: &str,
+    base_uid: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let mut events = Vec::<Value>::new();
+    let mut links = Vec::<Value>::new();
+    let mut tools = Vec::<Value>::new();
+    let payload_json = factory_droid_payload_json(record);
+
+    match top_type {
+        "session_settings" => {
+            let settings = record.get("settings").unwrap_or(record);
+            let token_usage = settings.get("tokenUsage").cloned().unwrap_or(Value::Null);
+            let settings_uid = event_uid(
+                ctx.source_file,
+                ctx.source_generation,
+                0,
+                0,
+                ctx.session_id,
+                "factory_droid:settings",
+            );
+            let mut row = base_event_obj(
+                ctx,
+                &settings_uid,
+                "session_meta",
+                "session_meta",
+                "system",
+                "",
+                &payload_json,
+            );
+            row.insert("item_id".to_string(), json!(ctx.session_id));
+            row.insert("agent_label".to_string(), json!("Factory Droid"));
+            if !model.is_empty() {
+                row.insert("model".to_string(), json!(model));
+            }
+            row.insert(
+                "input_tokens".to_string(),
+                json!(to_u32(token_usage.get("inputTokens"))),
+            );
+            row.insert(
+                "output_tokens".to_string(),
+                json!(to_u32(token_usage.get("outputTokens"))),
+            );
+            row.insert(
+                "cache_read_tokens".to_string(),
+                json!(to_u32(token_usage.get("cacheReadTokens"))),
+            );
+            row.insert(
+                "cache_write_tokens".to_string(),
+                json!(to_u32(token_usage.get("cacheCreationTokens"))),
+            );
+            row.insert(
+                "latency_ms".to_string(),
+                json!(to_u32(settings.get("assistantActiveTimeMs"))),
+            );
+            if !token_usage.is_null() {
+                row.insert(
+                    "token_usage_json".to_string(),
+                    json!(compact_json(&token_usage)),
+                );
+            }
+            events.push(Value::Object(row));
+        }
+        "session_start" => {
+            let title =
+                to_str(record.get("sessionTitle")).or_else_nonempty(|| to_str(record.get("title")));
+            let cwd = to_str(record.get("cwd"));
+            let text = [title.as_str(), cwd.as_str()]
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "session_meta",
+                "session_meta",
+                "system",
+                &text,
+                &payload_json,
+            );
+            let session_id = to_str(record.get("id"));
+            row.insert("item_id".to_string(), json!(session_id.clone()));
+            row.insert("agent_run_id".to_string(), json!(session_id));
+            row.insert("agent_label".to_string(), json!("Factory Droid"));
+            row.insert("coord_group_label".to_string(), json!(cwd));
+            if !model.is_empty() {
+                row.insert("model".to_string(), json!(model));
+            }
+            events.push(Value::Object(row));
+        }
+        "message" => {
+            let message = record.get("message").unwrap_or(&Value::Null);
+            let role = to_str(message.get("role"));
+            let actor = match role.as_str() {
+                "assistant" => "assistant",
+                "tool" => "tool",
+                "system" => "system",
+                _ => "user",
+            };
+            let content = message.get("content").cloned().unwrap_or(Value::Null);
+            let turn_index = ctx.source_line_no.min(u32::MAX as u64) as u32;
+            let base_message_payload = pruned_factory_droid_payload(message);
+            let mut sub_index = 0usize;
+
+            let reasoning = to_str(message.get("chatCompletionReasoningContent"))
+                .or_else_nonempty(|| to_str(message.get("reasoning")));
+            if !reasoning.trim().is_empty() {
+                let uid = event_uid(
+                    ctx.source_file,
+                    ctx.source_generation,
+                    ctx.source_line_no,
+                    ctx.source_offset,
+                    &payload_json,
+                    "factory_droid:message:reasoning",
+                );
+                let mut row = base_event_obj(
+                    ctx,
+                    &uid,
+                    "reasoning",
+                    "thinking",
+                    "assistant",
+                    &reasoning,
+                    &factory_droid_payload_json(&json!({
+                        "role": "assistant",
+                        "chatCompletionReasoningField": message.get("chatCompletionReasoningField").cloned().unwrap_or(Value::Null),
+                        "chatCompletionReasoningContent": reasoning,
+                    })),
+                );
+                row.insert("has_reasoning".to_string(), json!(1u8));
+                row.insert("content_types".to_string(), json!(["thinking"]));
+                row.insert("turn_index".to_string(), json!(turn_index));
+                factory_droid_stamp_common(&mut row, record, Some(message), model);
+                events.push(Value::Object(row));
+                if let Some(uid) = events
+                    .last()
+                    .and_then(|v| v.get("event_uid"))
+                    .and_then(Value::as_str)
+                {
+                    factory_droid_push_parent_link(&mut links, ctx, uid, record);
+                }
+                sub_index += 1;
+            }
+
+            match content {
+                Value::Array(items) if !items.is_empty() => {
+                    for (idx, item) in items.iter().enumerate() {
+                        let block_type = to_str(item.get("type"));
+                        let uid = event_uid(
+                            ctx.source_file,
+                            ctx.source_generation,
+                            ctx.source_line_no,
+                            ctx.source_offset,
+                            &factory_droid_payload_json(item),
+                            &format!("factory_droid:message:block:{idx}"),
+                        );
+                        let mut row = match block_type.as_str() {
+                            "thinking" => {
+                                let mut r = base_event_obj(
+                                    ctx,
+                                    &uid,
+                                    "reasoning",
+                                    "thinking",
+                                    "assistant",
+                                    &extract_message_text(item),
+                                    &factory_droid_payload_json(item),
+                                );
+                                r.insert("has_reasoning".to_string(), json!(1u8));
+                                r.insert("content_types".to_string(), json!(["thinking"]));
+                                r
+                            }
+                            "tool_use" | "tool_call" | "function_call" => {
+                                let fallback_id =
+                                    format!("factory-droid-call-{}-{idx}", ctx.source_line_no);
+                                let tool_call_id = factory_droid_tool_call_id(item, &fallback_id);
+                                let tool_name = to_str(item.get("name")).or_else_nonempty(|| {
+                                    to_str(item.get("function").and_then(|f| f.get("name")))
+                                });
+                                let input = item
+                                    .get("input")
+                                    .or_else(|| item.get("arguments"))
+                                    .or_else(|| {
+                                        item.get("function").and_then(|f| f.get("arguments"))
+                                    })
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                let parsed_input = match input {
+                                    Value::String(ref raw) => parse_json_string(raw)
+                                        .unwrap_or_else(|| json!({ "raw": raw })),
+                                    other => other,
+                                };
+                                let input_json = compact_json(&parsed_input);
+                                let input_text = {
+                                    let extracted = extract_message_text(&parsed_input);
+                                    if extracted.is_empty() {
+                                        input_json.clone()
+                                    } else {
+                                        extracted
+                                    }
+                                };
+                                let mut r = base_event_obj(
+                                    ctx,
+                                    &uid,
+                                    "tool_call",
+                                    "tool_use",
+                                    "assistant",
+                                    &input_text,
+                                    &factory_droid_payload_json(item),
+                                );
+                                r.insert("content_types".to_string(), json!(["tool_use"]));
+                                r.insert("tool_call_id".to_string(), json!(tool_call_id.clone()));
+                                r.insert("tool_name".to_string(), json!(tool_name.clone()));
+                                tools.push(build_tool_row(
+                                    ctx,
+                                    &uid,
+                                    &tool_call_id,
+                                    "",
+                                    &tool_name,
+                                    "request",
+                                    0,
+                                    &input_json,
+                                    "",
+                                    "",
+                                ));
+                                r
+                            }
+                            "tool_result" | "function_call_output" => {
+                                let tool_call_id = to_str(item.get("tool_use_id"))
+                                    .or_else_nonempty(|| to_str(item.get("tool_call_id")))
+                                    .or_else_nonempty(|| to_str(item.get("call_id")));
+                                let content = item
+                                    .get("content")
+                                    .or_else(|| item.get("output"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                let output_json = compact_json(&content);
+                                let output_text = {
+                                    let extracted = extract_message_text(&content);
+                                    if extracted.is_empty() {
+                                        output_json.clone()
+                                    } else {
+                                        extracted
+                                    }
+                                };
+                                let tool_error = to_u8_bool(item.get("is_error"));
+                                let mut r = base_event_obj(
+                                    ctx,
+                                    &uid,
+                                    "tool_result",
+                                    "tool_result",
+                                    "tool",
+                                    &output_text,
+                                    &factory_droid_payload_json(item),
+                                );
+                                r.insert("content_types".to_string(), json!(["tool_result"]));
+                                r.insert("tool_call_id".to_string(), json!(tool_call_id.clone()));
+                                r.insert("tool_error".to_string(), json!(tool_error));
+                                tools.push(build_tool_row(
+                                    ctx,
+                                    &uid,
+                                    &tool_call_id,
+                                    "",
+                                    "",
+                                    "response",
+                                    tool_error,
+                                    "",
+                                    &output_json,
+                                    &output_text,
+                                ));
+                                r
+                            }
+                            _ => {
+                                let mut r = base_event_obj(
+                                    ctx,
+                                    &uid,
+                                    if actor == "tool" {
+                                        "tool_result"
+                                    } else {
+                                        "message"
+                                    },
+                                    if block_type.is_empty() {
+                                        if actor == "assistant" {
+                                            "agent_message"
+                                        } else if actor == "user" {
+                                            "user_message"
+                                        } else {
+                                            "text"
+                                        }
+                                    } else {
+                                        block_type.as_str()
+                                    },
+                                    actor,
+                                    &extract_message_text(item),
+                                    &factory_droid_payload_json(item),
+                                );
+                                if !block_type.is_empty() {
+                                    r.insert("content_types".to_string(), json!([block_type]));
+                                }
+                                r
+                            }
+                        };
+                        row.insert("turn_index".to_string(), json!(turn_index));
+                        factory_droid_stamp_common(&mut row, record, Some(message), model);
+                        events.push(Value::Object(row));
+                        if let Some(uid) = events
+                            .last()
+                            .and_then(|v| v.get("event_uid"))
+                            .and_then(Value::as_str)
+                        {
+                            factory_droid_push_parent_link(&mut links, ctx, uid, record);
+                        }
+                    }
+                }
+                _ => {
+                    let text = extract_message_text(&base_message_payload);
+                    let uid = event_uid(
+                        ctx.source_file,
+                        ctx.source_generation,
+                        ctx.source_line_no,
+                        ctx.source_offset,
+                        &payload_json,
+                        &format!("factory_droid:message:{sub_index}"),
+                    );
+                    let mut row = base_event_obj(
+                        ctx,
+                        &uid,
+                        if actor == "tool" {
+                            "tool_result"
+                        } else {
+                            "message"
+                        },
+                        if actor == "assistant" {
+                            "agent_message"
+                        } else if actor == "user" {
+                            "user_message"
+                        } else if actor == "system" {
+                            "system"
+                        } else {
+                            "tool_result"
+                        },
+                        actor,
+                        &text,
+                        &factory_droid_payload_json(&base_message_payload),
+                    );
+                    row.insert("turn_index".to_string(), json!(turn_index));
+                    row.insert(
+                        "content_types".to_string(),
+                        json!(extract_content_types(
+                            message.get("content").unwrap_or(&Value::Null)
+                        )),
+                    );
+                    factory_droid_stamp_common(&mut row, record, Some(message), model);
+                    events.push(Value::Object(row));
+                    if let Some(uid) = events
+                        .last()
+                        .and_then(|v| v.get("event_uid"))
+                        .and_then(Value::as_str)
+                    {
+                        factory_droid_push_parent_link(&mut links, ctx, uid, record);
+                    }
+                }
+            }
+
+            if let Some(tool_calls) = message
+                .get("tool_calls")
+                .or_else(|| message.get("toolCalls"))
+                .and_then(Value::as_array)
+            {
+                for (call_idx, call) in tool_calls.iter().enumerate() {
+                    let uid = event_uid(
+                        ctx.source_file,
+                        ctx.source_generation,
+                        ctx.source_line_no,
+                        ctx.source_offset,
+                        &factory_droid_payload_json(call),
+                        &format!("factory_droid:message:tool_call:{call_idx}"),
+                    );
+                    let fallback_id =
+                        format!("factory-droid-call-{}-{call_idx}", ctx.source_line_no);
+                    let tool_call_id = factory_droid_tool_call_id(call, &fallback_id);
+                    let function = call.get("function").unwrap_or(&Value::Null);
+                    let tool_name =
+                        to_str(call.get("name")).or_else_nonempty(|| to_str(function.get("name")));
+                    let arguments_raw = to_str(function.get("arguments"))
+                        .or_else_nonempty(|| to_str(call.get("arguments")));
+                    let arguments = parse_json_string(&arguments_raw).unwrap_or_else(|| {
+                        if arguments_raw.is_empty() {
+                            Value::Object(Map::new())
+                        } else {
+                            json!({ "raw": arguments_raw })
+                        }
+                    });
+                    let input_json = compact_json(&arguments);
+                    let input_text = {
+                        let extracted = extract_message_text(&arguments);
+                        if extracted.is_empty() {
+                            input_json.clone()
+                        } else {
+                            extracted
+                        }
+                    };
+                    let mut row = base_event_obj(
+                        ctx,
+                        &uid,
+                        "tool_call",
+                        "tool_use",
+                        "assistant",
+                        &input_text,
+                        &factory_droid_payload_json(call),
+                    );
+                    row.insert("turn_index".to_string(), json!(turn_index));
+                    row.insert("content_types".to_string(), json!(["tool_use"]));
+                    row.insert("tool_call_id".to_string(), json!(tool_call_id.clone()));
+                    row.insert("tool_name".to_string(), json!(tool_name.clone()));
+                    factory_droid_stamp_common(&mut row, record, Some(message), model);
+                    events.push(Value::Object(row));
+                    tools.push(build_tool_row(
+                        ctx,
+                        &uid,
+                        &tool_call_id,
+                        "",
+                        &tool_name,
+                        "request",
+                        0,
+                        &input_json,
+                        "",
+                        "",
+                    ));
+                    if let Some(uid) = events
+                        .last()
+                        .and_then(|v| v.get("event_uid"))
+                        .and_then(Value::as_str)
+                    {
+                        factory_droid_push_parent_link(&mut links, ctx, uid, record);
+                    }
+                }
+            }
+        }
+        "compaction_state" => {
+            let summary = to_str(record.get("summaryText"));
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "summary",
+                "summary",
+                "system",
+                &summary,
+                &payload_json,
+            );
+            row.insert("item_id".to_string(), json!(to_str(record.get("id"))));
+            row.insert("agent_label".to_string(), json!("Factory Droid"));
+            row.insert(
+                "origin_event_id".to_string(),
+                json!(to_str(
+                    record.get("anchorMessage").and_then(|a| a.get("id"))
+                )),
+            );
+            row.insert(
+                "turn_index".to_string(),
+                json!(to_u32(
+                    record.get("anchorMessage").and_then(|a| a.get("index"))
+                )),
+            );
+            if !model.is_empty() {
+                row.insert("model".to_string(), json!(model));
+            }
+            let summary_tokens = to_u32(record.get("summaryTokens"));
+            if summary_tokens > 0 {
+                row.insert(
+                    "token_usage_json".to_string(),
+                    json!(compact_json(&json!({ "summaryTokens": summary_tokens }))),
+                );
+            }
+            events.push(Value::Object(row));
+            if let Some(uid) = events
+                .last()
+                .and_then(|v| v.get("event_uid"))
+                .and_then(Value::as_str)
+            {
+                let anchor_id = to_str(record.get("anchorMessage").and_then(|a| a.get("id")));
+                if !anchor_id.is_empty() {
+                    links.push(build_external_link_row(
+                        ctx,
+                        uid,
+                        &anchor_id,
+                        "parent_event",
+                        &compact_json(record.get("anchorMessage").unwrap_or(&Value::Null)),
+                    ));
+                }
+            }
+        }
+        _ => {
+            let mut row = base_event_obj(
+                ctx,
+                base_uid,
+                "unknown",
+                if top_type.is_empty() {
+                    "unknown"
+                } else {
+                    top_type
+                },
+                "system",
+                &extract_message_text(record),
+                &payload_json,
+            );
+            if !model.is_empty() {
+                row.insert("model".to_string(), json!(model));
+            }
+            events.push(Value::Object(row));
         }
     }
 
@@ -3383,19 +4077,24 @@ pub fn normalize_record(
     // harness. Hermes is different: the vendor is encoded inside the record's
     // `model` field as `vendor/model`, so we parse it here and use the parsed
     // value throughout the context.
-    let (inference_provider, hermes_model, opencode_model) = if harness == Harness::Hermes {
-        let (vendor, model) = split_hermes_vendor_model(&to_str(record.get("model")));
-        (vendor, model, String::new())
-    } else if harness == Harness::OpenCode {
-        let (provider, model) = opencode_provider_model(record);
-        (provider, String::new(), model)
-    } else {
-        (
-            harness.inference_provider().to_string(),
-            String::new(),
-            String::new(),
-        )
-    };
+    let (inference_provider, hermes_model, opencode_model, factory_droid_model) =
+        if harness == Harness::Hermes {
+            let (vendor, model) = split_hermes_vendor_model(&to_str(record.get("model")));
+            (vendor, model, String::new(), String::new())
+        } else if harness == Harness::OpenCode {
+            let (provider, model) = opencode_provider_model(record);
+            (provider, String::new(), model, String::new())
+        } else if harness == Harness::FactoryDroid {
+            let (provider, model) = factory_droid_provider_model(record, model_hint);
+            (provider, String::new(), String::new(), model)
+        } else {
+            (
+                harness.inference_provider().to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        };
 
     let (record_ts, event_ts, event_ts_parse_failed) = if harness == Harness::KimiCli {
         parse_kimi_timestamp(record, source_line_no)
@@ -3429,6 +4128,8 @@ pub fn normalize_record(
 
     let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
+    } else if harness == Harness::FactoryDroid {
+        factory_droid_session_id(source_file, session_hint, record)
     } else if harness == Harness::KimiCli {
         kimi_session_id(source_file, session_hint)
     } else {
@@ -3440,7 +4141,11 @@ pub fn normalize_record(
             session_id = format!("opencode:{explicit}");
         }
     }
-    if session_id.is_empty() && harness != Harness::Hermes && harness != Harness::KimiCli {
+    if session_id.is_empty()
+        && harness != Harness::Hermes
+        && harness != Harness::KimiCli
+        && harness != Harness::FactoryDroid
+    {
         session_id = if session_hint.is_empty() {
             infer_session_id_from_file(source_file)
         } else {
@@ -3554,6 +4259,9 @@ pub fn normalize_record(
             _ => normalize_hermes_trajectory(record, &ctx, &base_uid, &hermes_model),
         },
         Harness::Codex => normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint),
+        Harness::FactoryDroid => {
+            normalize_factory_droid_event(record, &ctx, &top_type, &base_uid, &factory_droid_model)
+        }
         Harness::KimiCli => normalize_kimi_cli_event(record, &ctx, &top_type, &base_uid),
         Harness::OpenCode => {
             normalize_opencode_event(record, &ctx, &top_type, &base_uid, &opencode_model)
@@ -3567,6 +4275,8 @@ pub fn normalize_record(
         hermes_model.as_str()
     } else if harness == Harness::OpenCode {
         opencode_model.as_str()
+    } else if harness == Harness::FactoryDroid {
+        factory_droid_model.as_str()
     } else {
         model_hint
     };
@@ -4092,6 +4802,199 @@ mod tests {
             "anthropic"
         );
         assert!(out.error_rows.is_empty());
+    }
+
+    #[test]
+    fn factory_droid_settings_promote_provider_model_and_tokens() {
+        let record = json!({
+            "type": "session_settings",
+            "timestamp": "2026-04-22T08:18:41.713Z",
+            "session_id": "65082ccf-d3b7-46ac-916e-e3b1cedac604",
+            "settings": {
+                "model": "claude-opus-4-7",
+                "providerLock": "anthropic",
+                "assistantActiveTimeMs": 11833,
+                "tokenUsage": {
+                    "inputTokens": 18189,
+                    "outputTokens": 90,
+                    "cacheCreationTokens": 12,
+                    "cacheReadTokens": 34,
+                    "thinkingTokens": 76
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "factory-droid",
+            "factory-droid",
+            "/Users/eric/.factory/sessions/project/65082ccf-d3b7-46ac-916e-e3b1cedac604.settings.json",
+            1,
+            1,
+            0,
+            0,
+            "",
+            "anthropic/claude-opus-4-7",
+        )
+        .expect("factory droid settings should normalize");
+
+        assert_eq!(out.event_rows.len(), 1);
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            row.get("event_kind").and_then(Value::as_str),
+            Some("session_meta")
+        );
+        assert_eq!(
+            row.get("inference_provider").and_then(Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            row.get("model").and_then(Value::as_str),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(18189));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(90));
+        assert_eq!(
+            row.get("cache_read_tokens").and_then(Value::as_u64),
+            Some(34)
+        );
+        assert_eq!(
+            row.get("cache_write_tokens").and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(row.get("latency_ms").and_then(Value::as_u64), Some(11833));
+        assert_eq!(out.session_hint, "65082ccf-d3b7-46ac-916e-e3b1cedac604");
+        assert_eq!(out.model_hint, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn factory_droid_message_prunes_encrypted_payload_and_links_parent() {
+        let record = json!({
+            "type": "message",
+            "id": "assistant-1",
+            "parentId": "user-1",
+            "timestamp": "2026-04-22T08:17:47.786Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "short thought"},
+                    {"type": "text", "text": "Done"}
+                ],
+                "openaiMessageId": "msg_123",
+                "openaiReasoningId": "rs_123",
+                "openaiPhase": "final_answer",
+                "openaiEncryptedContent": "encrypted-noise"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "factory-droid",
+            "factory-droid",
+            "/Users/eric/.factory/sessions/project/65082ccf-d3b7-46ac-916e-e3b1cedac604.jsonl",
+            1,
+            1,
+            3,
+            200,
+            "65082ccf-d3b7-46ac-916e-e3b1cedac604",
+            "anthropic/claude-opus-4-7",
+        )
+        .expect("factory droid message should normalize");
+
+        assert_eq!(out.event_rows.len(), 2);
+        assert_eq!(out.link_rows.len(), 2);
+        let reasoning = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            reasoning.get("event_kind").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(
+            reasoning.get("has_reasoning").and_then(Value::as_u64),
+            Some(1)
+        );
+        let text = out.event_rows[1].as_object().unwrap();
+        assert_eq!(
+            text.get("event_kind").and_then(Value::as_str),
+            Some("message")
+        );
+        assert_eq!(
+            text.get("actor_kind").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            text.get("text_content").and_then(Value::as_str),
+            Some("Done")
+        );
+        assert_eq!(
+            text.get("request_id").and_then(Value::as_str),
+            Some("msg_123")
+        );
+        assert_eq!(text.get("trace_id").and_then(Value::as_str), Some("rs_123"));
+        let payload = text.get("payload_json").and_then(Value::as_str).unwrap();
+        assert!(!payload.contains("encrypted-noise"));
+        let link = out.link_rows[0].as_object().unwrap();
+        assert_eq!(
+            link.get("linked_external_id").and_then(Value::as_str),
+            Some("user-1")
+        );
+    }
+
+    #[test]
+    fn factory_droid_tool_blocks_emit_tool_io() {
+        let record = json!({
+            "type": "message",
+            "id": "assistant-tool",
+            "timestamp": "2026-04-22T08:17:48.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"path": "README.md"}
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "contents"}]
+                    }
+                ]
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "factory-droid",
+            "factory-droid",
+            "/Users/eric/.factory/sessions/project/65082ccf-d3b7-46ac-916e-e3b1cedac604.jsonl",
+            1,
+            1,
+            4,
+            300,
+            "65082ccf-d3b7-46ac-916e-e3b1cedac604",
+            "anthropic/claude-opus-4-7",
+        )
+        .expect("factory droid tool blocks should normalize");
+
+        assert_eq!(out.event_rows.len(), 2);
+        assert_eq!(out.tool_rows.len(), 2);
+        assert_eq!(
+            out.event_rows[0].get("event_kind").and_then(Value::as_str),
+            Some("tool_call")
+        );
+        assert_eq!(
+            out.event_rows[1].get("event_kind").and_then(Value::as_str),
+            Some("tool_result")
+        );
+        assert_eq!(
+            out.tool_rows[0].get("tool_phase").and_then(Value::as_str),
+            Some("request")
+        );
+        assert_eq!(
+            out.tool_rows[1].get("tool_phase").and_then(Value::as_str),
+            Some("response")
+        );
     }
 
     #[test]

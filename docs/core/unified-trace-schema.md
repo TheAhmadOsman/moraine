@@ -1,6 +1,6 @@
 # Unified Trace Schema Mapping
 
-This page maps raw trace fields into the unified `moraine.events` table so you can move directly from source data to canonical columns when querying ClickHouse. Codex, Claude Code, Kimi CLI, OpenCode, and Hermes normalize into the same table, with format-specific notes after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs]
+This page maps raw trace fields into the unified `moraine.events` table so you can move directly from source data to canonical columns when querying ClickHouse. Codex, Claude Code, Factory Droid, Kimi CLI, OpenCode, and Hermes normalize into the same table, with format-specific notes after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs]
 
 ## Field Mapping Table
 
@@ -93,6 +93,21 @@ Live Hermes CLI / gateway sessions land at `~/.hermes/sessions/session_<ts>_<id>
 Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Wire records with `message.type=TurnBegin` or `SteerInput` become `message` / `user_message` rows. `ContentPart` with `type=text` becomes an assistant message, while `type=think` becomes a `reasoning` / `thinking` row. `ToolCall` and `ToolResult` map to `tool_call` and `tool_result` plus `tool_io` rows keyed by the Kimi tool call id. `StatusUpdate.token_usage` maps input, output, and cache token counters. Session ids are derived from the parent session directory and namespaced as `kimi-cli:<session-id>`.
 
 Kimi `context.jsonl` can be configured explicitly for role-based replay. It lacks per-line timestamps, so Moraine assigns deterministic synthetic timestamps to preserve stable ordering without producing timestamp parse errors.
+
+## Factory Droid Mapping
+
+Factory Droid defaults to `~/.factory/sessions/**/*.jsonl` with `format = "factory_droid_jsonl"`. Each session has an append-oriented JSONL file plus a sibling `<session>.settings.json` file. Moraine checkpoints the JSONL by byte offset and line number, and reads the sidecar whenever the JSONL advances.
+
+- `session_id` is Droid's native session UUID from `session_start.id`, falling back to the JSONL filename stem. It is not prefixed, so it can be used directly with Droid session-resume commands.
+- The sidecar is emitted as a synthetic `type="session_settings"` raw row using the sidecar path as `source_file`. Its canonical event uses a stable settings event UID per session, so canonical settings rows replace as the sidecar changes; raw rows still preserve exact sidecar snapshots.
+- `providerLock` and `model` from the sidecar populate `inference_provider` and `model`. When the provider is absent, Moraine infers common providers from model prefixes such as `claude-*`, `gpt-*`, `gemini-*`, `glm-*`, `kimi-*`, and `minimax-*`.
+- `tokenUsage.inputTokens`, `outputTokens`, `cacheReadTokens`, and `cacheCreationTokens` populate the canonical token columns on the settings event; the full sidecar token object is also stored in `token_usage_json`.
+- `session_start` becomes `event_kind=session_meta`; `text_content` contains the visible session title and `cwd`, and `agent_run_id` stores the native Droid session id.
+- `message.message.content[]` text blocks become `message` rows, `thinking` blocks and chat-completion reasoning fields become `reasoning` rows, and Anthropic/OpenAI-style tool call/result blocks become `tool_call` / `tool_result` rows plus `tool_io`.
+- `message.parentId` becomes an external `parent_event` link so fork/parent chains remain navigable even when the linked row was compacted or belongs to a hidden Droid branch.
+- `compaction_state` becomes `event_kind=summary` with the summary text as searchable content and an external link to `anchorMessage.id`.
+- Droid `session_start` rows do not always carry timestamps. For canonical ordering, the dispatcher assigns the first timestamped row in the session, then sidecar timestamp, then source-file modification time as fallback. The exact original JSON remains in `raw_events.raw_json`.
+- Event payload JSON prunes high-noise encrypted blobs (`openaiEncryptedContent`) and large environment snapshots (`systemInfo`) while raw rows preserve the exact source data for audit and reindex.
 
 ## OpenCode Mapping
 

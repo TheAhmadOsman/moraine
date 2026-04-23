@@ -18,10 +18,13 @@ pub struct IngestSource {
     /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
     /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
     /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
-    /// place via atomic rename — used by live Hermes agent sessions), or
-    /// `"opencode_sqlite"` (OpenCode's local SQLite session database). Empty
-    /// means "infer": hermes + `*.json` glob → `session_json`, opencode +
-    /// `*.db` glob → `opencode_sqlite`, otherwise `jsonl`.
+    /// place via atomic rename — used by live Hermes agent sessions),
+    /// `"opencode_sqlite"` (OpenCode's local SQLite session database), or
+    /// `"factory_droid_jsonl"` (Factory Droid's session JSONL plus sibling
+    /// `.settings.json` sidecar). Empty means "infer": hermes + `*.json` glob
+    /// → `session_json`, opencode + `*.db` glob → `opencode_sqlite`,
+    /// factory-droid + `*.jsonl` glob → `factory_droid_jsonl`, otherwise
+    /// `jsonl`.
     #[serde(default)]
     pub format: String,
 }
@@ -403,12 +406,21 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.local/share/opencode".to_string(),
             format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
         },
+        IngestSource {
+            name: "factory-droid".to_string(),
+            harness: "factory-droid".to_string(),
+            enabled: true,
+            glob: "~/.factory/sessions/**/*.jsonl".to_string(),
+            watch_root: "~/.factory/sessions".to_string(),
+            format: SOURCE_FORMAT_FACTORY_DROID_JSONL.to_string(),
+        },
     ]
 }
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
 pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
+pub const SOURCE_FORMAT_FACTORY_DROID_JSONL: &str = "factory_droid_jsonl";
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
@@ -418,6 +430,8 @@ fn infer_source_format(harness: &str, glob: &str) -> &'static str {
         SOURCE_FORMAT_SESSION_JSON
     } else if harness == "opencode" && glob_lower.ends_with(".db") {
         SOURCE_FORMAT_OPENCODE_SQLITE
+    } else if harness == "factory-droid" && glob_lower.ends_with(".jsonl") {
+        SOURCE_FORMAT_FACTORY_DROID_JSONL
     } else {
         SOURCE_FORMAT_JSONL
     }
@@ -437,11 +451,12 @@ fn normalize_source_format(
         trimmed
     };
     match resolved.as_str() {
-        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_OPENCODE_SQLITE => {
-            Ok(resolved)
-        }
+        SOURCE_FORMAT_JSONL
+        | SOURCE_FORMAT_SESSION_JSON
+        | SOURCE_FORMAT_OPENCODE_SQLITE
+        | SOURCE_FORMAT_FACTORY_DROID_JSONL => Ok(resolved),
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_OPENCODE_SQLITE}, {SOURCE_FORMAT_FACTORY_DROID_JSONL}",
             format.trim(),
             source_name
         )),
@@ -455,6 +470,7 @@ impl IngestSource {
         match self.format.as_str() {
             SOURCE_FORMAT_SESSION_JSON => "json",
             SOURCE_FORMAT_OPENCODE_SQLITE => "db",
+            SOURCE_FORMAT_FACTORY_DROID_JSONL => "jsonl",
             _ => "jsonl",
         }
     }
@@ -740,6 +756,7 @@ fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Res
     let normalized = harness.trim().to_ascii_lowercase();
     if normalized == "codex"
         || normalized == "claude-code"
+        || normalized == "factory-droid"
         || normalized == "hermes"
         || normalized == "kimi-cli"
         || normalized == "opencode"
@@ -748,7 +765,7 @@ fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Res
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, kimi-cli, opencode",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, factory-droid, hermes, kimi-cli, opencode",
         harness.trim(),
         source_name
     ))
@@ -853,6 +870,16 @@ pub fn discover_sources() -> Vec<DiscoveredSource> {
             exists: std::path::Path::new(&hermes_root).is_dir(),
         });
 
+        let factory_droid_root = format!("{home}/.factory/sessions");
+        candidates.push(DiscoveredSource {
+            name: "factory-droid".to_string(),
+            harness: "factory-droid".to_string(),
+            glob: format!("{factory_droid_root}/**/*.jsonl"),
+            watch_root: factory_droid_root.clone(),
+            format: SOURCE_FORMAT_FACTORY_DROID_JSONL.to_string(),
+            exists: std::path::Path::new(&factory_droid_root).is_dir(),
+        });
+
         let opencode_path = format!("{home}/.local/share/opencode/opencode.db");
         let opencode_root = format!("{home}/.local/share/opencode");
         candidates.push(DiscoveredSource {
@@ -908,6 +935,7 @@ pub fn validate_sources(sources: &[IngestSource]) -> Vec<SourceValidationIssue> 
             && fmt != SOURCE_FORMAT_JSONL
             && fmt != SOURCE_FORMAT_SESSION_JSON
             && fmt != SOURCE_FORMAT_OPENCODE_SQLITE
+            && fmt != SOURCE_FORMAT_FACTORY_DROID_JSONL
         {
             issues.push(SourceValidationIssue::UnknownFormat {
                 source: source.name.clone(),
@@ -1329,8 +1357,9 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}")
-                .contains("expected one of: codex, claude-code, hermes, kimi-cli, opencode"),
+            format!("{err:#}").contains(
+                "expected one of: codex, claude-code, factory-droid, hermes, kimi-cli, opencode"
+            ),
             "unexpected error: {err:#}"
         );
     }
@@ -1351,8 +1380,9 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}")
-                .contains("expected one of: codex, claude-code, hermes, kimi-cli, opencode"),
+            format!("{err:#}").contains(
+                "expected one of: codex, claude-code, factory-droid, hermes, kimi-cli, opencode"
+            ),
             "unexpected error: {err:#}"
         );
     }
@@ -1429,6 +1459,31 @@ watch_root = "~/.kimi/sessions"
             .find(|source| source.harness == "kimi-cli")
             .expect("kimi-cli source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn load_config_accepts_factory_droid_harness_and_format() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "factory-droid"
+harness = "factory-droid"
+enabled = true
+glob = "~/.factory/sessions/**/*.jsonl"
+watch_root = "~/.factory/sessions"
+"#,
+            "factory-droid-harness",
+        );
+        let cfg = load_config(&path).expect("factory-droid harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "factory-droid")
+            .expect("factory-droid source");
+        assert_eq!(source.format, SOURCE_FORMAT_FACTORY_DROID_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 

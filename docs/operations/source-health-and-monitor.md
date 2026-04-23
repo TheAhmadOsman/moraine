@@ -252,6 +252,8 @@ Codex and Claude Code are append-oriented JSONL sources and should usually show 
 
 Kimi CLI defaults to `~/.kimi/sessions/**/wire.jsonl`. Kimi `context.jsonl` can be indexed when explicitly configured, but many context rows do not carry real timestamps. Moraine assigns deterministic synthetic timestamps for untimestamped Kimi rows and downstream latency statistics skip those synthetic timestamps so append-to-visible metrics are not polluted. Operators may widen the Kimi glob to include sidecar JSONL files; empty sidecars are considered no-op files for drift purposes, but non-empty sidecars are expected to produce checkpoint/raw/event/error state like any other configured source file.
 
+Factory Droid uses `format = "factory_droid_jsonl"` against `~/.factory/sessions/**/*.jsonl`. The checkpoint and drift surfaces track the JSONL file, while normalization also reads the sibling `.settings.json` sidecar when the JSONL advances. If a sidecar is missing, the JSONL still ingests; if a sidecar is malformed, the source records an ingest error for the sidecar path without blocking message ingestion.
+
 OpenCode uses `format = "opencode_sqlite"` and is read through a defensive read-only SQLite connection. The watcher maps `opencode.db-wal` and `opencode.db-shm` sibling notifications back to the configured base database path, so live WAL writes do not wait for the periodic reconcile loop. The dispatcher validates expected tables and includes `PRAGMA user_version` in schema drift errors.
 
 Hermes live sessions use `format = "session_json"` because the files are rewritten atomically. The dispatcher compares message count against checkpoint state and emits only newly appeared messages. Hermes trajectory exports remain JSONL.

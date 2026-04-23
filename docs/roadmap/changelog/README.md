@@ -15,6 +15,7 @@ worker prompts, archived patches, or branch archaeology.
 
 ## Source And Ingest
 
+- [Factory Droid Ingest And MCP Wiring](factory-droid-ingest.md)
 - [Import/Config/Export Usability Foundation](2026-04-20-import-config-export-slice.md)
 - [OpenCode Adapter Hardening](opencode-hardening-fixtures.md)
 - [Source Drift Diagnostics](source-drift-diagnostics.md)

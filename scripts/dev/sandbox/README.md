@@ -22,7 +22,9 @@ worktree's code. See RFC #232.
 # Bring up a fresh sandbox with a random id; prints monitor + clickhouse URLs.
 scripts/dev/sandbox/moraine-sandbox up
 
-# Optionally mount your host session archives (read-only):
+# Optionally mount your host session archives (read-only), including
+# ~/.codex/sessions, ~/.claude/projects, ~/.factory/sessions, and
+# ~/.hermes/sessions when present:
 scripts/dev/sandbox/moraine-sandbox up --mount-host-sessions
 
 # Interactive shell inside the running container.

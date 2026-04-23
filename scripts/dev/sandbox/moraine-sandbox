@@ -35,13 +35,15 @@ PROJECT_PREFIX="moraine-sandbox-"
 : "${SANDBOX_CONFIG_DIR:=/dev/null}"
 : "${SANDBOX_CODEX_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/dev/null}"
+: "${SANDBOX_FACTORY_DROID_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_HERMES_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_MONITOR_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
-export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SESSIONS_DIR
+export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_FACTORY_DROID_SESSIONS_DIR
+export SANDBOX_HERMES_SESSIONS_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
 
@@ -345,21 +347,24 @@ for proj in data:
 #   $3 mount_host_sessions (0/1)
 #   $4 codex_sessions_dir (host) — may be ""
 #   $5 claude_projects_dir (host) — may be ""
-#   $6 hermes_sessions_dir (host) — may be ""
-#   $7 clickhouse_version
+#   $6 factory_droid_sessions_dir (host) — may be ""
+#   $7 hermes_sessions_dir (host) — may be ""
+#   $8 clickhouse_version
 generate_moraine_toml() {
     local config_dir="$1"
     local id="$2"
     local mount_sessions="$3"
     local codex_dir="$4"
     local claude_dir="$5"
-    local hermes_dir="$6"
-    local ch_version="$7"
+    local factory_droid_dir="$6"
+    local hermes_dir="$7"
+    local ch_version="$8"
 
     mkdir -p "$config_dir"
 
     local codex_src_block=""
     local claude_src_block=""
+    local factory_droid_src_block=""
     local hermes_src_block=""
 
     if [[ "$mount_sessions" == "1" ]]; then
@@ -373,6 +378,11 @@ generate_moraine_toml() {
         else
             warn "host claude projects dir not found (${claude_dir}); skipping that source"
         fi
+        if [[ -n "$factory_droid_dir" && -d "$factory_droid_dir" ]]; then
+            factory_droid_src_block=$'[[ingest.sources]]\nname = "host-factory-droid"\nharness = "factory-droid"\nenabled = true\nglob = "/host/factory/sessions/**/*.jsonl"\nwatch_root = "/host/factory/sessions"\nformat = "factory_droid_jsonl"\n'
+        else
+            warn "host Factory Droid sessions dir not found (${factory_droid_dir}); skipping that source"
+        fi
         if [[ -n "$hermes_dir" && -d "$hermes_dir" ]]; then
             hermes_src_block=$'[[ingest.sources]]\nname = "host-hermes"\nharness = "hermes"\nenabled = true\nglob = "/host/hermes/sessions/session_*.json"\nwatch_root = "/host/hermes/sessions"\nformat = "session_json"\n'
         else
@@ -383,9 +393,11 @@ generate_moraine_toml() {
         # be mounted at /sandbox inside the container.
         mkdir -p "${config_dir}/fixtures/codex/sessions"
         mkdir -p "${config_dir}/fixtures/claude/projects"
+        mkdir -p "${config_dir}/fixtures/factory/sessions"
         mkdir -p "${config_dir}/fixtures/hermes/sessions"
         codex_src_block=$'[[ingest.sources]]\nname = "fixture-codex"\nharness = "codex"\nenabled = true\nglob = "/sandbox/fixtures/codex/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/codex/sessions"\n'
         claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude-code"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
+        factory_droid_src_block=$'[[ingest.sources]]\nname = "fixture-factory-droid"\nharness = "factory-droid"\nenabled = true\nglob = "/sandbox/fixtures/factory/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/factory/sessions"\nformat = "factory_droid_jsonl"\n'
         hermes_src_block=$'[[ingest.sources]]\nname = "fixture-hermes"\nharness = "hermes"\nenabled = true\nglob = "/sandbox/fixtures/hermes/sessions/session_*.json"\nwatch_root = "/sandbox/fixtures/hermes/sessions"\nformat = "session_json"\n'
     fi
 
@@ -407,6 +419,7 @@ state_dir = "/home/moraine/.moraine/ingestor"
 
 ${codex_src_block}
 ${claude_src_block}
+${factory_droid_src_block}
 ${hermes_src_block}
 [monitor]
 host = "0.0.0.0"
@@ -567,12 +580,14 @@ cmd_up() {
     [[ -z "$codex_dir" || "$codex_dir" == "/dev/null" ]] && codex_dir="${HOME}/.codex/sessions"
     local claude_dir="$SANDBOX_CLAUDE_PROJECTS_DIR"
     [[ -z "$claude_dir" || "$claude_dir" == "/dev/null" ]] && claude_dir="${HOME}/.claude/projects"
+    local factory_droid_dir="$SANDBOX_FACTORY_DROID_SESSIONS_DIR"
+    [[ -z "$factory_droid_dir" || "$factory_droid_dir" == "/dev/null" ]] && factory_droid_dir="${HOME}/.factory/sessions"
     local hermes_dir="$SANDBOX_HERMES_SESSIONS_DIR"
     [[ -z "$hermes_dir" || "$hermes_dir" == "/dev/null" ]] && hermes_dir="${HOME}/.hermes/sessions"
     local ch_version
     ch_version="$(clickhouse_version_from_default_config)"
     generate_moraine_toml "$config_dir" "$id" "$mount_sessions" \
-        "$codex_dir" "$claude_dir" "$hermes_dir" "$ch_version"
+        "$codex_dir" "$claude_dir" "$factory_droid_dir" "$hermes_dir" "$ch_version"
     local config_path="${config_dir}/moraine.toml"
 
     # Translate moraine's clickhouse_version (e.g. "v25.12.5.44-stable") to
@@ -608,6 +623,11 @@ cmd_up() {
     if [[ "$mount_sessions" == "1" ]]; then
         export SANDBOX_CODEX_SESSIONS_DIR="$codex_dir"
         export SANDBOX_CLAUDE_PROJECTS_DIR="$claude_dir"
+        if [[ -d "$factory_droid_dir" ]]; then
+            export SANDBOX_FACTORY_DROID_SESSIONS_DIR="$factory_droid_dir"
+        else
+            export SANDBOX_FACTORY_DROID_SESSIONS_DIR="/dev/null"
+        fi
         # compose.sessions.yaml requires a value even when the dir is absent;
         # fall back to a safe read-only placeholder.
         if [[ -d "$hermes_dir" ]]; then
@@ -876,6 +896,10 @@ ENVIRONMENT:
                                 --mount-host-sessions; default ~/.codex/sessions)
     SANDBOX_CLAUDE_PROJECTS_DIR override host claude projects dir (default
                                 ~/.claude/projects)
+    SANDBOX_FACTORY_DROID_SESSIONS_DIR override host Factory Droid sessions
+                                dir (default ~/.factory/sessions). Session
+                                JSONL is ingested with sibling settings
+                                sidecars via factory_droid_jsonl.
     SANDBOX_HERMES_SESSIONS_DIR override host hermes live-session dir (default
                                 ~/.hermes/sessions). Files are
                                 session_*.json rewritten in place — the

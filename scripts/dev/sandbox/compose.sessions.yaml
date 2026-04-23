@@ -8,6 +8,8 @@
 # Additional environment variables the host CLI must export:
 #   SANDBOX_CODEX_SESSIONS_DIR    host ~/.codex/sessions, read-only
 #   SANDBOX_CLAUDE_PROJECTS_DIR   host ~/.claude/projects, read-only
+#   SANDBOX_FACTORY_DROID_SESSIONS_DIR
+#                                 host ~/.factory/sessions, read-only
 #   SANDBOX_HERMES_SESSIONS_DIR   host ~/.hermes/sessions, read-only
 #                                 (live per-session JSON files the Hermes CLI
 #                                 rewrites in place; exercises the
@@ -18,4 +20,5 @@ services:
     volumes:
       - "${SANDBOX_CODEX_SESSIONS_DIR}:/host/codex/sessions:ro"
       - "${SANDBOX_CLAUDE_PROJECTS_DIR}:/host/claude/projects:ro"
+      - "${SANDBOX_FACTORY_DROID_SESSIONS_DIR}:/host/factory/sessions:ro"
       - "${SANDBOX_HERMES_SESSIONS_DIR}:/host/hermes/sessions:ro"

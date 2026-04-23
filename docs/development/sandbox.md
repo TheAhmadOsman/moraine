@@ -86,11 +86,13 @@ and removed on `down`.
 | `scripts/dev/sandbox/entrypoint.sh` | `/usr/local/bin/entrypoint.sh` | ro | so edits to the entrypoint don't require an image rebuild |
 
 `--mount-host-sessions` layers on `compose.sessions.yaml` to also
-bind-mount `~/.codex/sessions`, `~/.claude/projects`, and
-`~/.hermes/sessions` read-only. The Hermes mount points the generated
-config at `/host/hermes/sessions/session_*.json` with
-`format = "session_json"` so the sandbox exercises the
-rewrite-in-place live-session path against real host data.
+bind-mount `~/.codex/sessions`, `~/.claude/projects`,
+`~/.factory/sessions`, and `~/.hermes/sessions` read-only. The Factory
+Droid mount points the generated config at `/host/factory/sessions/**/*.jsonl`
+with `format = "factory_droid_jsonl"` so sidecar settings are exercised
+against real host data. The Hermes mount points the generated config at
+`/host/hermes/sessions/session_*.json` with `format = "session_json"` so the
+sandbox exercises the rewrite-in-place live-session path.
 
 The generated config root defaults to a user cache directory instead of
 `/tmp`. This matters on macOS/Colima because the Docker daemon runs inside a
@@ -144,7 +146,7 @@ Bring up a sandbox.
   `binaries` volume already has output from a prior boot. Exported to
   the container as `SANDBOX_REBUILD=1`.
 - `--mount-host-sessions` — layer on `compose.sessions.yaml` to mount
-  `~/.codex/sessions`, `~/.claude/projects`, and `~/.hermes/sessions`
+  `~/.codex/sessions`, `~/.claude/projects`, `~/.factory/sessions`, and `~/.hermes/sessions`
   read-only inside the container. Overridable with
   `$SANDBOX_CODEX_SESSIONS_DIR` / `$SANDBOX_CLAUDE_PROJECTS_DIR` /
   `$SANDBOX_HERMES_SESSIONS_DIR`. Without this flag, ingest sources
@@ -232,8 +234,8 @@ the right config path. Keys:
   `reconcile_interval_seconds = 5.0`, `heartbeat_interval_seconds = 2.0`,
   `flush_interval_seconds = 0.5`,
   `state_dir = "/home/moraine/.moraine/ingestor"`.
-- `[[ingest.sources]]` — either `host-codex` / `host-claude` pointing at
-  `/host/...` (with `--mount-host-sessions`) or `fixture-codex` /
+- `[[ingest.sources]]` — either `host-codex` / `host-claude` /
+  `host-factory-droid` pointing at `/host/...` (with `--mount-host-sessions`) or `fixture-codex` /
   `fixture-claude` pointing at `/sandbox/fixtures/...` (default).
 - `[monitor] host = "0.0.0.0"`, `port = 8080`.
 - `[runtime]` — `root_dir = "/home/moraine/.moraine"`, `service_bin_dir
