@@ -63,7 +63,7 @@
         {#if loading}
           Loading…
         {:else if deferred}
-          Load Sessions
+          Load Sessions Now
         {:else}
           Refresh Sessions
         {/if}
@@ -88,8 +88,9 @@
 
   {#if deferred && sessions.length === 0}
     <div class="mv-empty">
-      Sessions are deferred on initial load because central history queries can be slow.
-      Use <span class="mono">Load Sessions</span> when you want the current page.
+      The first page lazy-loads after the dashboard shell and starts with a page limit of
+      <span class="mono">{selectedLimit}</span>. Use <span class="mono">Load Sessions Now</span>
+      to fetch the current page immediately.
     </div>
   {:else if loading && sessions.length === 0}
     <div class="mv-empty">Loading sessions…</div>

@@ -15,13 +15,43 @@ interface ErrorPayload {
 
 export interface JsonRequestOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export class RequestTimeoutError extends Error {
+  constructor(message = 'request timed out') {
+    super(message);
+    this.name = 'RequestTimeoutError';
+  }
+}
+
+export class RequestAbortedError extends Error {
+  constructor(message = 'request cancelled') {
+    super(message);
+    this.name = 'RequestAbortedError';
+  }
+}
+
+export function isRequestAbortError(error: unknown): error is RequestTimeoutError | RequestAbortedError {
+  return error instanceof RequestTimeoutError || error instanceof RequestAbortedError;
 }
 
 export async function requestJson<T>(path: string, options: JsonRequestOptions = {}): Promise<T> {
-  const controller = options.timeoutMs ? new AbortController() : null;
+  const controller = options.timeoutMs || options.signal ? new AbortController() : null;
+  let timeoutTriggered = false;
+  const abortFromSignal = () => controller?.abort();
+  if (options.signal) {
+    if (options.signal.aborted) {
+      throw new RequestAbortedError();
+    }
+    options.signal.addEventListener('abort', abortFromSignal, { once: true });
+  }
   const timeoutId =
     controller && options.timeoutMs
-      ? globalThis.setTimeout(() => controller.abort(), options.timeoutMs)
+      ? globalThis.setTimeout(() => {
+          timeoutTriggered = true;
+          controller.abort();
+        }, options.timeoutMs)
       : null;
 
   let response: Response;
@@ -34,10 +64,18 @@ export async function requestJson<T>(path: string, options: JsonRequestOptions =
     });
   } catch (error) {
     if (controller?.signal.aborted) {
-      throw new Error('request timed out');
+      if (timeoutTriggered) {
+        throw new RequestTimeoutError();
+      }
+      if (options.signal?.aborted) {
+        throw new RequestAbortedError();
+      }
     }
     throw error;
   } finally {
+    if (options.signal) {
+      options.signal.removeEventListener('abort', abortFromSignal);
+    }
     if (timeoutId !== null) {
       globalThis.clearTimeout(timeoutId);
     }
@@ -70,9 +108,10 @@ export function fetchStatus(): Promise<StatusResponse> {
   return requestJson<StatusResponse>('/api/status');
 }
 
-export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsResponse> {
+export function fetchAnalytics(range: AnalyticsRangeKey, signal?: AbortSignal): Promise<AnalyticsResponse> {
   return requestJson<AnalyticsResponse>(`/api/analytics?range=${encodeURIComponent(range)}`, {
     timeoutMs: 15_000,
+    signal,
   });
 }
 

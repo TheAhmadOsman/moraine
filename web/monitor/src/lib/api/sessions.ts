@@ -1,5 +1,5 @@
 import type { Session, SessionsMeta, SessionsResponse, SessionsSinceKey } from '../types/sessions';
-import { requestJson } from './client';
+import { RequestAbortedError, RequestTimeoutError, requestJson } from './client';
 import { generateMockSessions } from './sessionsMock';
 
 export interface FetchSessionsOptions {
@@ -7,6 +7,7 @@ export interface FetchSessionsOptions {
   limit?: number;
   since?: SessionsSinceKey;
   cursor?: string | null;
+  signal?: AbortSignal;
 }
 
 export interface FetchSessionsResult {
@@ -29,7 +30,7 @@ function normalizeMeta(data: SessionsResponse, sessions: Session[]): SessionsMet
 }
 
 export async function fetchSessions(options: FetchSessionsOptions = {}): Promise<FetchSessionsResult> {
-  const { allowMock = true, limit, since, cursor } = options;
+  const { allowMock = true, limit, since, cursor, signal } = options;
 
   try {
     const query = new URLSearchParams();
@@ -43,7 +44,7 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
       query.set('cursor', cursor);
     }
     const url = query.size > 0 ? `/api/sessions?${query.toString()}` : '/api/sessions';
-    const data = await requestJson<SessionsResponse>(url, { timeoutMs: 15_000 });
+    const data = await requestJson<SessionsResponse>(url, { timeoutMs: 15_000, signal });
     if (data.ok && Array.isArray(data.sessions)) {
       return { sessions: data.sessions, meta: normalizeMeta(data, data.sessions) };
     }
@@ -71,21 +72,12 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
   };
 }
 
-export async function fetchSessionDetail(id: string): Promise<Session | null> {
-  const controller = new AbortController();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), 15_000);
+export async function fetchSessionDetail(id: string, signal?: AbortSignal): Promise<Session | null> {
   try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      if (response.status === 404) {
-        return null;
-      }
-      throw new Error(`session detail request failed (${response.status})`);
-    }
-    const data = (await response.json()) as { ok: boolean; session?: Session; error?: string };
+    const data = await requestJson<{ ok: boolean; session?: Session; error?: string }>(
+      `/api/sessions/${encodeURIComponent(id)}`,
+      { timeoutMs: 15_000, signal },
+    );
     if (data.ok && data.session) {
       return data.session;
     }
@@ -93,12 +85,13 @@ export async function fetchSessionDetail(id: string): Promise<Session | null> {
       throw new Error(data.error);
     }
   } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error('session detail request timed out');
+    if (error instanceof Error && error.message.includes('request failed (404)')) {
+      return null;
+    }
+    if (error instanceof RequestTimeoutError || error instanceof RequestAbortedError) {
+      throw error;
     }
     throw error;
-  } finally {
-    globalThis.clearTimeout(timeoutId);
   }
   return null;
 }

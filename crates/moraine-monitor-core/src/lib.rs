@@ -705,7 +705,7 @@ async fn api_sessions(
     Query(params): Query<SessionsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let limit = params.limit.unwrap_or(25).clamp(1, 200);
     let since = params.since.as_deref().unwrap_or("30d");
 
     let since_seconds: u64 = match since {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import { isRequestAbortError } from '../../../api/client';
   import { fetchSessionDetail } from '../../../api/sessions';
   import SessionCard from '../SessionCard.svelte';
   import SessionDetail from '../SessionDetail.svelte';
@@ -12,8 +13,15 @@
   let detailLoading = false;
   let detailError: string | null = null;
   let detailToken = 0;
+  let detailController: AbortController | null = null;
+
+  function clearDetailController(): void {
+    detailController?.abort();
+    detailController = null;
+  }
 
   async function handleOpen(s: Session): Promise<void> {
+    clearDetailController();
     openId = s.id;
     detailError = null;
     if (s.hasDetail) {
@@ -24,8 +32,10 @@
     open = null;
     detailLoading = true;
     const token = ++detailToken;
+    detailController = new AbortController();
+    const signal = detailController.signal;
     try {
-      const detail = await fetchSessionDetail(s.id);
+      const detail = await fetchSessionDetail(s.id, signal);
       if (token !== detailToken || openId !== s.id) return;
       if (!detail) {
         detailError = 'Session detail unavailable.';
@@ -35,16 +45,23 @@
       open = detail;
     } catch (error) {
       if (token !== detailToken || openId !== s.id) return;
+      if (isRequestAbortError(error)) {
+        return;
+      }
       detailError = error instanceof Error ? error.message : String(error);
       open = null;
     } finally {
       if (token === detailToken && openId === s.id) {
         detailLoading = false;
       }
+      if (detailController?.signal === signal) {
+        detailController = null;
+      }
     }
   }
 
   function handleClose(): void {
+    clearDetailController();
     openId = null;
     open = null;
     detailLoading = false;
@@ -64,6 +81,7 @@
   }
 
   onDestroy(() => {
+    clearDetailController();
     if (typeof window !== 'undefined') {
       window.removeEventListener('keydown', onKey);
     }
