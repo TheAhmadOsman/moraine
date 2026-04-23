@@ -105,26 +105,28 @@
           · page limit {meta.effectiveLimit}
           · window {formatSince(meta.sinceSeconds)}
         </div>
-        <div class="mv-page-nav">
-          <button
-            class="mv-button"
-            type="button"
-            disabled={loading || !canGoPrevious}
-            on:click={() => dispatch('previousPage')}
-          >
-            Previous Page
-          </button>
-          <button
-            class="mv-button"
-            type="button"
-            disabled={loading || !canGoNext}
-            on:click={() => dispatch('nextPage')}
-          >
-            Next Page
-          </button>
-        </div>
       </div>
     {/if}
     <V1Library sessions={filtered} />
+    {#if meta}
+      <div class="mv-page-nav mv-page-nav-bottom">
+        <button
+          class="mv-button"
+          type="button"
+          disabled={loading || !canGoPrevious}
+          on:click={() => dispatch('previousPage')}
+        >
+          Previous Page
+        </button>
+        <button
+          class="mv-button"
+          type="button"
+          disabled={loading || !canGoNext}
+          on:click={() => dispatch('nextPage')}
+        >
+          Next Page
+        </button>
+      </div>
+    {/if}
   {/if}
 </section>
