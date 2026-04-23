@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import AnalyticsPanel from './lib/components/AnalyticsPanel.svelte';
   import SourceDetail from './lib/components/SourceDetail.svelte';
   import SourcesStrip from './lib/components/SourcesStrip.svelte';
@@ -126,9 +126,14 @@
       typeof window !== 'undefined' &&
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const behavior: ScrollBehavior = prefersReducedMotion ? 'auto' : 'smooth';
+    const list = panel.querySelector<HTMLElement>('.mv-v1-list');
+    if (list) {
+      list.scrollTo({ top: 0, behavior });
+    }
     panel.scrollIntoView({
       block: 'start',
-      behavior: prefersReducedMotion ? 'auto' : 'smooth',
+      behavior,
     });
   }
 
@@ -266,6 +271,7 @@
     resetSessionsPagination();
     if (!sessionsDeferred && !sessionsLoading) {
       await loadSessions();
+      await tick();
       scrollSessionsToTop();
     }
   }
@@ -276,6 +282,7 @@
     const previousCursor = nextHistory.pop() ?? null;
     if (await loadSessions(previousCursor)) {
       sessionsCursorHistory = nextHistory;
+      await tick();
       scrollSessionsToTop();
     }
   }
@@ -286,6 +293,7 @@
     const currentCursor = sessionsCursor;
     if (await loadSessions(nextCursor)) {
       sessionsCursorHistory = [...sessionsCursorHistory, currentCursor];
+      await tick();
       scrollSessionsToTop();
     }
   }

@@ -51,11 +51,10 @@
         <span class="mv-filter-k">limit</span>
         <select
           class="mv-select"
-          value={String(selectedLimit)}
           on:change={(e) => dispatch('limitChange', Number(e.currentTarget.value))}
         >
           {#each limitOptions as option (option)}
-            <option value={option}>{option}</option>
+            <option value={option} selected={selectedLimit === option}>{option}</option>
           {/each}
         </select>
       </label>
