@@ -720,6 +720,17 @@ struct SessionTurnAnchorRow {
     source_line_no: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SessionDetailRenderMeta {
+    requested_turn_limit: u32,
+    loaded_turn_count: usize,
+    total_turn_count: usize,
+    has_more_turns: bool,
+    has_previous_turns: bool,
+    next_turn_cursor: Option<String>,
+    truncated_reason: Option<String>,
+}
+
 fn encode_sessions_cursor(cursor: &SessionsCursor) -> Result<String> {
     let json = serde_json::to_vec(cursor)
         .map_err(|err| anyhow!("failed to serialize sessions cursor: {err}"))?;
@@ -1310,15 +1321,15 @@ async fn build_session_detail_payload(
         summary,
         event_rows,
         now_ms,
-        Some(json!({
-            "requestedTurnLimit": turn_limit,
-            "loadedTurnCount": page_end.saturating_sub(page_start),
-            "totalTurnCount": total_turn_count,
-            "hasMoreTurns": has_older_turns,
-            "hasPreviousTurns": has_newer_turns,
-            "nextTurnCursor": next_turn_cursor,
-            "truncatedReason": truncated_reason,
-        })),
+        Some(SessionDetailRenderMeta {
+            requested_turn_limit: turn_limit,
+            loaded_turn_count: page_end.saturating_sub(page_start),
+            total_turn_count,
+            has_more_turns: has_older_turns,
+            has_previous_turns: has_newer_turns,
+            next_turn_cursor,
+            truncated_reason,
+        }),
     )))
 }
 
@@ -1369,7 +1380,7 @@ fn build_session_json(
     summary: SessionSummaryRow,
     events: Vec<SessionEventRow>,
     now_ms: i64,
-    detail_meta: Option<Value>,
+    detail_meta: Option<SessionDetailRenderMeta>,
 ) -> Value {
     let duration_ms = (summary.ended_at_ms - summary.started_at_ms).max(0);
 
@@ -1392,7 +1403,23 @@ fn build_session_json(
 
     let title = derive_title(&summary.first_user_text);
 
-    let turns = build_turns(&events);
+    let mut turns = build_turns(&events);
+    let detail_meta = detail_meta.map(|mut meta| {
+        if turns.len() > meta.loaded_turn_count {
+            let keep_from = turns.len().saturating_sub(meta.loaded_turn_count);
+            turns = turns.split_off(keep_from);
+        }
+        meta.loaded_turn_count = turns.len();
+        json!({
+            "requestedTurnLimit": meta.requested_turn_limit,
+            "loadedTurnCount": meta.loaded_turn_count,
+            "totalTurnCount": meta.total_turn_count,
+            "hasMoreTurns": meta.has_more_turns,
+            "hasPreviousTurns": meta.has_previous_turns,
+            "nextTurnCursor": meta.next_turn_cursor,
+            "truncatedReason": meta.truncated_reason,
+        })
+    });
 
     let harness = harness_descriptor(&summary.harness, &summary.source_name);
 
