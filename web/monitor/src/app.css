@@ -419,6 +419,34 @@
   color: var(--subtle);
 }
 
+.mv-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.mv-inline-control {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.mv-button {
+  border: 1px solid var(--line-strong);
+  background: var(--range-bg);
+  color: var(--text);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.8rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.mv-button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
 
 .mv-filterbar {
   display: flex;
@@ -1429,6 +1457,12 @@
   border: 1px dashed var(--line);
   border-radius: 0.75rem;
   background: var(--panel-alt);
+}
+
+.mv-sessions-meta {
+  margin-bottom: 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--subtle);
 }
 
 @media (max-width: 980px) {

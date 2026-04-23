@@ -847,6 +847,7 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
         format!(" AND event_ts >= now() - INTERVAL {} SECOND", since_seconds)
     };
 
+    let limit_plus = limit.saturating_add(1);
     let summary_query = format!(
         "SELECT \
             session_id, \
@@ -868,16 +869,31 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
          WHERE length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter} \
          GROUP BY session_id \
          ORDER BY ended_at_ms DESC \
-         LIMIT {limit}"
+         LIMIT {limit_plus}"
     );
 
-    let summary_rows = state
+    let mut summary_rows = state
         .clickhouse
         .query_rows::<SessionSummaryRow>(&summary_query, None)
         .await?;
 
+    let has_more = summary_rows.len() as u32 > limit;
+    if has_more {
+        summary_rows.truncate(limit as usize);
+    }
+
     if summary_rows.is_empty() {
-        return Ok(json!({"ok": true, "sessions": []}));
+        return Ok(json!({
+            "ok": true,
+            "sessions": [],
+            "meta": {
+                "requested_limit": limit,
+                "effective_limit": limit,
+                "loaded_count": 0,
+                "has_more": false,
+                "since_seconds": since_seconds,
+            }
+        }));
     }
 
     let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
@@ -939,7 +955,17 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
         })
         .collect();
 
-    Ok(json!({"ok": true, "sessions": sessions}))
+    Ok(json!({
+        "ok": true,
+        "sessions": sessions,
+        "meta": {
+            "requested_limit": limit,
+            "effective_limit": limit,
+            "loaded_count": sessions.len(),
+            "has_more": has_more,
+            "since_seconds": since_seconds,
+        }
+    }))
 }
 
 fn build_session_json(

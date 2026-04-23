@@ -1,9 +1,10 @@
 import { derived, writable } from 'svelte/store';
-import type { Session, SessionsFilter } from '../types/sessions';
+import type { Session, SessionsFilter, SessionsMeta } from '../types/sessions';
 
 export const sessionsStore = writable<Session[]>([]);
 export const sessionsLoadingStore = writable<boolean>(false);
 export const sessionsErrorStore = writable<string | null>(null);
+export const sessionsMetaStore = writable<SessionsMeta | null>(null);
 
 export const sessionsFilterStore = writable<SessionsFilter>({
   query: '',

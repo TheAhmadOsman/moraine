@@ -16,6 +16,7 @@
     sessionsErrorStore,
     sessionsFilterStore,
     sessionsLoadingStore,
+    sessionsMetaStore,
     sessionsStore,
   } from './lib/state/sessions';
   import { initializeTheme, setTheme, themeStore } from './lib/state/theme';
@@ -26,7 +27,7 @@
     SourcesResponse,
     StatusResponse,
   } from './lib/types/api';
-  import type { Harness, Session, SessionsFilter } from './lib/types/sessions';
+  import type { Harness, Session, SessionsFilter, SessionsSinceKey } from './lib/types/sessions';
   import type { ThemeMode } from './lib/types/ui';
 
   const SESSIONS_POLL_INTERVAL_MS = 30_000;
@@ -44,12 +45,16 @@
   let sourcesData: SourcesResponse | null = null;
   let sourcesError: string | null = null;
   let selectedSource: string | null = null;
+  let sessionsDeferred = true;
+  let sessionsLimit = 25;
+  let sessionsSince: SessionsSinceKey = '30d';
 
   $: sessions = $sessionsStore;
   $: filteredSessions = $filteredSessionsStore;
   $: sessionsFilter = $sessionsFilterStore;
   $: sessionsLoading = $sessionsLoadingStore;
   $: sessionsError = $sessionsErrorStore;
+  $: sessionsMeta = $sessionsMetaStore;
 
   $: sessionModels = deriveModels(sessions);
   $: sessionHarnesses = deriveHarnesses(sessions);
@@ -118,9 +123,11 @@
   async function loadSessions(): Promise<void> {
     sessionsLoadingStore.set(true);
     try {
-      const list = await fetchSessions();
-      sessionsStore.set(list);
+      const result = await fetchSessions({ limit: sessionsLimit, since: sessionsSince });
+      sessionsStore.set(result.sessions);
+      sessionsMetaStore.set(result.meta);
       sessionsErrorStore.set(null);
+      sessionsDeferred = false;
     } catch (error) {
       sessionsErrorStore.set(`Sessions unavailable: ${errorMessage(error)}`);
     } finally {
@@ -132,10 +139,6 @@
     await Promise.all([loadHealth(), loadStatus(), loadSources()]);
   }
 
-  async function hydrateSlow(): Promise<void> {
-    await Promise.all([loadAnalytics(), loadSessions()]);
-  }
-
   async function handleRangeChange(event: CustomEvent<AnalyticsRangeKey>): Promise<void> {
     analyticsRangeStore.set(event.detail);
     analyticsDeferred = false;
@@ -145,6 +148,18 @@
   async function handleAnalyticsLoadRequested(): Promise<void> {
     analyticsDeferred = false;
     await loadAnalytics();
+  }
+
+  async function handleSessionsLoadRequested(): Promise<void> {
+    sessionsDeferred = false;
+    await loadSessions();
+  }
+
+  async function handleSessionsLimitChange(event: CustomEvent<number>): Promise<void> {
+    sessionsLimit = event.detail;
+    if (!sessionsDeferred) {
+      await loadSessions();
+    }
   }
 
   function scheduleInitialAnalyticsLoad(): void {
@@ -176,9 +191,6 @@
     initializeTheme();
 
     void hydrateFast();
-    window.setTimeout(() => {
-      void loadSessions();
-    }, 0);
     scheduleInitialAnalyticsLoad();
 
     const fastInterval = window.setInterval(() => {
@@ -192,7 +204,9 @@
     }, SLOW_POLL_INTERVAL_MS);
 
     const sessionsInterval = window.setInterval(() => {
-      void loadSessions();
+      if (!sessionsDeferred) {
+        void loadSessions();
+      }
     }, SESSIONS_POLL_INTERVAL_MS);
 
     return () => {
@@ -236,7 +250,12 @@
       harnesses={sessionHarnesses}
       loading={sessionsLoading}
       errorMessage={sessionsError}
+      deferred={sessionsDeferred}
+      meta={sessionsMeta}
+      selectedLimit={sessionsLimit}
       on:filterChange={handleFilterChange}
+      on:loadRequested={handleSessionsLoadRequested}
+      on:limitChange={handleSessionsLimitChange}
     />
   </main>
 </div>

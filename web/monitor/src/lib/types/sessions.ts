@@ -80,9 +80,26 @@ export interface Session {
   traceId: string;
 }
 
+export type SessionsSinceKey = '1h' | '6h' | '24h' | '7d' | '30d' | '90d' | 'all';
+
+export interface SessionsMeta {
+  requestedLimit: number;
+  effectiveLimit: number;
+  loadedCount: number;
+  hasMore: boolean;
+  sinceSeconds: number;
+}
+
 export interface SessionsResponse {
   ok: boolean;
   sessions: Session[];
+  meta?: {
+    requested_limit?: number;
+    effective_limit?: number;
+    loaded_count?: number;
+    has_more?: boolean;
+    since_seconds?: number;
+  };
   models?: string[];
   harnesses?: Harness[];
   error?: string;
