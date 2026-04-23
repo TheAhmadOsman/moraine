@@ -678,6 +678,10 @@ struct SessionsQuery {
     limit: Option<u32>,
     since: Option<String>,
     cursor: Option<String>,
+    query: Option<String>,
+    model: Option<String>,
+    status: Option<String>,
+    harness: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -685,6 +689,35 @@ struct SessionsCursor {
     since_seconds: u64,
     ended_at_ms: i64,
     session_id: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SessionsFilterInput {
+    query: Option<String>,
+    model: Option<String>,
+    status: Option<String>,
+    harness: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionDetailQuery {
+    turn_limit: Option<u32>,
+    turn_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionDetailCursor {
+    session_id: String,
+    page_start: u64,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+struct SessionTurnAnchorRow {
+    event_ts_ms: i64,
+    source_file: String,
+    source_generation: u32,
+    source_offset: u64,
+    source_line_no: u64,
 }
 
 fn encode_sessions_cursor(cursor: &SessionsCursor) -> Result<String> {
@@ -699,6 +732,28 @@ fn decode_sessions_cursor(token: &str) -> Result<SessionsCursor> {
         .map_err(|err| anyhow!("invalid cursor: invalid base64: {err}"))?;
     serde_json::from_slice(&bytes)
         .map_err(|err| anyhow!("invalid cursor: invalid payload: {err}"))
+}
+
+fn encode_session_detail_cursor(cursor: &SessionDetailCursor) -> Result<String> {
+    let json = serde_json::to_vec(cursor)
+        .map_err(|err| anyhow!("failed to serialize session detail cursor: {err}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_session_detail_cursor(token: &str) -> Result<SessionDetailCursor> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|err| anyhow!("invalid turn cursor: invalid base64: {err}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow!("invalid turn cursor: invalid payload: {err}"))
+}
+
+fn normalize_filter_value(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 async fn api_sessions(
@@ -724,7 +779,14 @@ async fn api_sessions(
         Some(token) => Some(token),
     };
 
-    match build_sessions_payload(&state, limit, since_seconds, cursor).await {
+    let filters = SessionsFilterInput {
+        query: normalize_filter_value(params.query.as_deref()),
+        model: normalize_filter_value(params.model.as_deref()).map(|value| value.to_ascii_lowercase()),
+        status: normalize_filter_value(params.status.as_deref()).map(|value| value.to_ascii_lowercase()),
+        harness: normalize_filter_value(params.harness.as_deref()),
+    };
+
+    match build_sessions_payload(&state, limit, since_seconds, cursor, &filters).await {
         Ok(payload) => json_response(payload, StatusCode::OK),
         Err(error) => {
             let message = format!("sessions query failed: {error}");
@@ -738,17 +800,32 @@ async fn api_sessions(
     }
 }
 
-async fn api_session_detail(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
-    match build_session_detail_payload(&state, &session_id).await {
+async fn api_session_detail(
+    Path(session_id): Path<String>,
+    Query(params): Query<SessionDetailQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let turn_limit = params.turn_limit.unwrap_or(50).clamp(1, 200);
+    let turn_cursor = match params.turn_cursor.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(token) => Some(token),
+    };
+
+    match build_session_detail_payload(&state, &session_id, turn_limit, turn_cursor).await {
         Ok(Some(payload)) => json_response(json!({"ok": true, "session": payload}), StatusCode::OK),
         Ok(None) => json_response(
             json!({"ok": false, "error": "session not found"}),
             StatusCode::NOT_FOUND,
         ),
-        Err(error) => json_response(
-            json!({"ok": false, "error": format!("session detail query failed: {error}")}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => {
+            let message = format!("session detail query failed: {error}");
+            let status = if message.contains("invalid turn cursor:") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(json!({"ok": false, "error": message}), status)
+        }
     }
 }
 
@@ -888,6 +965,7 @@ async fn build_sessions_payload(
     limit: u32,
     since_seconds: u64,
     cursor_token: Option<&str>,
+    filters: &SessionsFilterInput,
 ) -> Result<Value> {
     let database = &state.clickhouse.config().database;
     let events_table = format!(
@@ -895,6 +973,10 @@ async fn build_sessions_payload(
         escape_identifier(database),
         escape_identifier("events")
     );
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
 
     let cursor = match cursor_token {
         Some(token) => {
@@ -943,14 +1025,44 @@ async fn build_sessions_payload(
          WHERE length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter} \
          GROUP BY session_id"
     );
-    let cursor_filter = if let Some(cursor) = &cursor {
-        format!(
-            " WHERE (ended_at_ms < {ended_at_ms}) OR (ended_at_ms = {ended_at_ms} AND session_id < '{session_id}')",
+    let mut outer_filters: Vec<String> = Vec::new();
+    if let Some(query) = &filters.query {
+        let escaped = escape_literal(query);
+        outer_filters.push(format!(
+            "(positionCaseInsensitiveUTF8(first_user_text, '{escaped}') > 0 \
+              OR positionCaseInsensitiveUTF8(session_id, '{escaped}') > 0 \
+              OR positionCaseInsensitiveUTF8(harness, '{escaped}') > 0 \
+              OR positionCaseInsensitiveUTF8(trace_id, '{escaped}') > 0)"
+        ));
+    }
+    if let Some(model) = &filters.model {
+        let escaped = escape_literal(model);
+        outer_filters.push(format!(
+            "position(concat('\u{1f}', models_blob, '\u{1f}'), concat('\u{1f}', '{escaped}', '\u{1f}')) > 0"
+        ));
+    }
+    if let Some(status) = &filters.status {
+        match status.as_str() {
+            "active" => outer_filters.push(format!("ended_at_ms >= {}", now_ms.saturating_sub(60_000))),
+            "completed" => outer_filters.push(format!("ended_at_ms < {}", now_ms.saturating_sub(60_000))),
+            "cancelled" | "error" => outer_filters.push("0".to_string()),
+            _ => {}
+        }
+    }
+    if let Some(harness) = &filters.harness {
+        outer_filters.push(format!("harness = '{}'", escape_literal(harness)));
+    }
+    if let Some(cursor) = &cursor {
+        outer_filters.push(format!(
+            "((ended_at_ms < {ended_at_ms}) OR (ended_at_ms = {ended_at_ms} AND session_id < '{session_id}'))",
             ended_at_ms = cursor.ended_at_ms,
             session_id = escape_literal(&cursor.session_id),
-        )
-    } else {
+        ));
+    }
+    let where_clause = if outer_filters.is_empty() {
         String::new()
+    } else {
+        format!(" WHERE {}", outer_filters.join(" AND "))
     };
     let summary_query = format!(
         "SELECT \
@@ -965,7 +1077,7 @@ async fn build_sessions_payload(
             models_blob, \
             trace_id, \
             first_user_text \
-         FROM ({summary_subquery}) AS summaries{cursor_filter} \
+         FROM ({summary_subquery}) AS summaries{where_clause} \
          ORDER BY ended_at_ms DESC, session_id DESC \
          LIMIT {limit_plus}"
     );
@@ -1010,11 +1122,6 @@ async fn build_sessions_payload(
         }));
     }
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
     let sessions: Vec<Value> = summary_rows
         .into_iter()
         .map(|summary| build_session_summary_json(summary, now_ms))
@@ -1023,6 +1130,12 @@ async fn build_sessions_payload(
     Ok(json!({
         "ok": true,
         "sessions": sessions,
+        "filters": {
+            "query": filters.query.clone(),
+            "model": filters.model.clone(),
+            "status": filters.status.clone(),
+            "harness": filters.harness.clone(),
+        },
         "meta": {
             "requested_limit": limit,
             "effective_limit": limit,
@@ -1034,7 +1147,12 @@ async fn build_sessions_payload(
     }))
 }
 
-async fn build_session_detail_payload(state: &AppState, session_id: &str) -> Result<Option<Value>> {
+async fn build_session_detail_payload(
+    state: &AppState,
+    session_id: &str,
+    turn_limit: u32,
+    turn_cursor_token: Option<&str>,
+) -> Result<Option<Value>> {
     let database = &state.clickhouse.config().database;
     let events_table = format!(
         "{}.{}",
@@ -1072,44 +1190,136 @@ async fn build_session_detail_payload(state: &AppState, session_id: &str) -> Res
         .query_rows::<SessionSummaryRow>(&summary_query, None)
         .await?;
 
-    let Some(summary) = summary_rows.pop() else {
+    let Some(mut summary) = summary_rows.pop() else {
         return Ok(None);
     };
 
-    let events_query = format!(
+    let anchors_query = format!(
         "SELECT \
             toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
-            event_kind, \
-            actor_kind, \
-            payload_type, \
-            tool_name, \
-            tool_call_id, \
-            tool_error, \
-            latency_ms, \
-            model, \
-            input_tokens, \
-            output_tokens, \
-            cache_read_tokens, \
-            cache_write_tokens, \
-            substring(text_preview, 1, 2000) AS text_preview, \
-            substring(text_content, 1, 2000) AS text_content, \
-            if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
+            source_file, \
+            toUInt32(source_generation) AS source_generation, \
+            toUInt64(source_offset) AS source_offset, \
+            toUInt64(source_line_no) AS source_line_no \
          FROM {events_table} \
          WHERE session_id = '{quoted_session_id}' \
-         ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no"
+           AND event_kind = 'message' \
+           AND actor_kind = 'user' \
+         ORDER BY event_ts, source_file, source_generation, source_offset, source_line_no"
     );
-
-    let event_rows = state
+    let anchors = state
         .clickhouse
-        .query_rows::<SessionEventRow>(&events_query, None)
+        .query_rows::<SessionTurnAnchorRow>(&anchors_query, None)
         .await?;
+    let total_turn_count = anchors.len();
+    summary.turn_count = total_turn_count as u64;
+    let default_start = total_turn_count.saturating_sub(turn_limit as usize);
+    let page_start = match turn_cursor_token {
+        Some(token) => {
+            let cursor = decode_session_detail_cursor(token)?;
+            if cursor.session_id != session_id {
+                return Err(anyhow!("invalid turn cursor: session mismatch"));
+            }
+            let requested_start = usize::try_from(cursor.page_start)
+                .map_err(|_| anyhow!("invalid turn cursor: page_start overflow"))?;
+            if total_turn_count == 0 {
+                0
+            } else if requested_start >= total_turn_count {
+                return Err(anyhow!("invalid turn cursor: page_start out of range"));
+            } else {
+                requested_start
+            }
+        }
+        None => default_start,
+    };
+    let page_end = (page_start + turn_limit as usize).min(total_turn_count);
+    let has_older_turns = page_start > 0;
+    let has_newer_turns = page_end < total_turn_count;
+    let next_turn_cursor = if has_older_turns {
+        Some(encode_session_detail_cursor(&SessionDetailCursor {
+            session_id: session_id.to_string(),
+            page_start: page_start.saturating_sub(turn_limit as usize) as u64,
+        })?)
+    } else {
+        None
+    };
+    let truncated_reason = if total_turn_count > (page_end.saturating_sub(page_start)) {
+        Some(format!("detail paginated to {} turns per page", turn_limit))
+    } else {
+        None
+    };
+
+    let event_rows = if total_turn_count == 0 {
+        Vec::new()
+    } else {
+        let start_anchor = &anchors[page_start];
+        let end_anchor = if page_end < total_turn_count {
+            Some(&anchors[page_end])
+        } else {
+            None
+        };
+        let position_expr = event_position_expr();
+        let mut predicates = vec![format!(
+            "{position_expr} >= {}",
+            event_position_tuple_sql(start_anchor)
+        )];
+        if let Some(end_anchor) = end_anchor {
+            predicates.push(format!(
+                "{position_expr} < {}",
+                event_position_tuple_sql(end_anchor)
+            ));
+        }
+
+        let events_query = format!(
+            "SELECT \
+                toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
+                event_kind, \
+                actor_kind, \
+                payload_type, \
+                tool_name, \
+                tool_call_id, \
+                tool_error, \
+                latency_ms, \
+                model, \
+                input_tokens, \
+                output_tokens, \
+                cache_read_tokens, \
+                cache_write_tokens, \
+                substring(text_preview, 1, 2000) AS text_preview, \
+                substring(text_content, 1, 2000) AS text_content, \
+                if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
+             FROM {events_table} \
+             WHERE session_id = '{quoted_session_id}' \
+               AND {} \
+             ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no",
+            predicates.join(" AND ")
+        );
+
+        state
+            .clickhouse
+            .query_rows::<SessionEventRow>(&events_query, None)
+            .await?
+    };
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    Ok(Some(build_session_json(summary, event_rows, now_ms)))
+    Ok(Some(build_session_json(
+        summary,
+        event_rows,
+        now_ms,
+        Some(json!({
+            "requestedTurnLimit": turn_limit,
+            "loadedTurnCount": page_end.saturating_sub(page_start),
+            "totalTurnCount": total_turn_count,
+            "hasMoreTurns": has_older_turns,
+            "hasPreviousTurns": has_newer_turns,
+            "nextTurnCursor": next_turn_cursor,
+            "truncatedReason": truncated_reason,
+        })),
+    )))
 }
 
 fn build_session_summary_json(summary: SessionSummaryRow, now_ms: i64) -> Value {
@@ -1159,6 +1369,7 @@ fn build_session_json(
     summary: SessionSummaryRow,
     events: Vec<SessionEventRow>,
     now_ms: i64,
+    detail_meta: Option<Value>,
 ) -> Value {
     let duration_ms = (summary.ended_at_ms - summary.started_at_ms).max(0);
 
@@ -1182,14 +1393,6 @@ fn build_session_json(
     let title = derive_title(&summary.first_user_text);
 
     let turns = build_turns(&events);
-    let total_tokens: u64 = turns
-        .iter()
-        .map(|t| t.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0))
-        .sum();
-    let total_tool_calls: u64 = turns
-        .iter()
-        .map(|t| t.get("toolCalls").and_then(|v| v.as_u64()).unwrap_or(0))
-        .sum();
 
     let harness = harness_descriptor(&summary.harness, &summary.source_name);
 
@@ -1203,14 +1406,30 @@ fn build_session_json(
         "durationMs": duration_ms,
         "status": status,
         "models": models,
-        "turnCount": turns.len(),
+        "turnCount": summary.turn_count,
         "turns": turns,
-        "totalTokens": total_tokens,
-        "totalToolCalls": total_tool_calls,
+        "totalTokens": summary.total_tokens,
+        "totalToolCalls": summary.total_tool_calls,
         "tags": Vec::<String>::new(),
         "traceId": summary.trace_id,
         "hasDetail": true,
+        "detailMeta": detail_meta,
     })
+}
+
+fn event_position_expr() -> &'static str {
+    "(toInt64(toUnixTimestamp64Milli(event_ts)), source_file, toUInt32(source_generation), toUInt64(source_offset), toUInt64(source_line_no))"
+}
+
+fn event_position_tuple_sql(anchor: &SessionTurnAnchorRow) -> String {
+    format!(
+        "({}, '{}', toUInt32({}), toUInt64({}), toUInt64({}))",
+        anchor.event_ts_ms,
+        escape_literal(&anchor.source_file),
+        anchor.source_generation,
+        anchor.source_offset,
+        anchor.source_line_no,
+    )
 }
 
 fn derive_title(first_user_text: &str) -> String {

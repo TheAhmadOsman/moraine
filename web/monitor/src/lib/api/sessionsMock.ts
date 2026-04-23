@@ -254,6 +254,15 @@ function makeGenerator(seed: number) {
       tags: [...tagSet],
       traceId: 'tr_' + Math.floor(rng() * 1e14).toString(16).padStart(12, '0'),
       hasDetail: true,
+      detailMeta: {
+        requestedTurnLimit: turns.length,
+        loadedTurnCount: turns.length,
+        totalTurnCount: turns.length,
+        hasMoreTurns: false,
+        hasPreviousTurns: false,
+        nextTurnCursor: null,
+        truncatedReason: null,
+      },
     };
   }
 

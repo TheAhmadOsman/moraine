@@ -81,6 +81,17 @@ export interface Session {
   tags: string[];
   traceId: string;
   hasDetail: boolean;
+  detailMeta?: SessionDetailMeta | null;
+}
+
+export interface SessionDetailMeta {
+  requestedTurnLimit: number;
+  loadedTurnCount: number;
+  totalTurnCount: number;
+  hasMoreTurns: boolean;
+  hasPreviousTurns: boolean;
+  nextTurnCursor: string | null;
+  truncatedReason: string | null;
 }
 
 export type SessionsSinceKey = '1h' | '6h' | '24h' | '7d' | '30d' | '90d' | 'all';
@@ -104,6 +115,12 @@ export interface SessionsResponse {
     has_more?: boolean;
     since_seconds?: number;
     next_cursor?: string | null;
+  };
+  filters?: {
+    query?: string;
+    model?: string;
+    status?: string;
+    harness?: string;
   };
   models?: string[];
   harnesses?: Harness[];

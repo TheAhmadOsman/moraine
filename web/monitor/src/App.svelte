@@ -58,6 +58,7 @@
   let sessionsSince: SessionsSinceKey = '30d';
   let sessionsCursor: string | null = null;
   let sessionsCursorHistory: Array<string | null> = [];
+  let sessionsFilterDebounceHandle: ReturnType<typeof globalThis.setTimeout> | null = null;
   let analyticsController: AbortController | null = null;
   let sessionsController: AbortController | null = null;
   let analyticsIdleHandle: IdleHandle | null = null;
@@ -199,10 +200,14 @@
     sessionsCursorHistory = [];
   }
 
-  async function loadSessions(targetCursor: string | null = sessionsCursor): Promise<boolean> {
-    if (get(sessionsLoadingStore)) {
-      return false;
+  function clearSessionsFilterDebounce(): void {
+    if (sessionsFilterDebounceHandle !== null) {
+      globalThis.clearTimeout(sessionsFilterDebounceHandle);
+      sessionsFilterDebounceHandle = null;
     }
+  }
+
+  async function loadSessions(targetCursor: string | null = sessionsCursor): Promise<boolean> {
     clearSessionsController();
     sessionsController = new AbortController();
     const signal = sessionsController.signal;
@@ -214,6 +219,10 @@
         limit: sessionsLimit,
         since: sessionsSince,
         cursor: targetCursor,
+        query: sessionsFilter.query,
+        model: sessionsFilter.model,
+        status: sessionsFilter.status,
+        harness: sessionsFilter.harness,
         signal,
       });
       if (signal.aborted) {
@@ -262,11 +271,13 @@
   async function handleSessionsLoadRequested(): Promise<void> {
     cancelIdleHandle(sessionsIdleHandle);
     sessionsIdleHandle = null;
+    clearSessionsFilterDebounce();
     sessionsDeferred = false;
     await loadSessions();
   }
 
   async function handleSessionsLimitChange(event: CustomEvent<number>): Promise<void> {
+    clearSessionsFilterDebounce();
     sessionsLimit = event.detail;
     resetSessionsPagination();
     if (!sessionsDeferred && !sessionsLoading) {
@@ -277,6 +288,7 @@
   }
 
   async function handleSessionsPreviousPage(): Promise<void> {
+    clearSessionsFilterDebounce();
     if (sessionsLoading || sessionsCursorHistory.length === 0) return;
     const nextHistory = [...sessionsCursorHistory];
     const previousCursor = nextHistory.pop() ?? null;
@@ -288,6 +300,7 @@
   }
 
   async function handleSessionsNextPage(): Promise<void> {
+    clearSessionsFilterDebounce();
     const nextCursor = sessionsMeta?.nextCursor ?? null;
     if (sessionsLoading || !nextCursor) return;
     const currentCursor = sessionsCursor;
@@ -337,7 +350,28 @@
   }
 
   function handleFilterChange(event: CustomEvent<SessionsFilter>): void {
-    sessionsFilterStore.set(event.detail);
+    const next = event.detail;
+    const previous = get(sessionsFilterStore);
+    sessionsFilterStore.set(next);
+    resetSessionsPagination();
+    if (sessionsDeferred || sessionsLoading) {
+      return;
+    }
+    clearSessionsFilterDebounce();
+    const queryChanged = next.query !== previous.query;
+    const runner = async () => {
+      sessionsFilterDebounceHandle = null;
+      await loadSessions();
+      await tick();
+      scrollSessionsToTop();
+    };
+    if (queryChanged) {
+      sessionsFilterDebounceHandle = globalThis.setTimeout(() => {
+        void runner();
+      }, 250);
+      return;
+    }
+    void runner();
   }
 
   onMount(() => {
@@ -368,6 +402,7 @@
       cancelIdleHandle(sessionsIdleHandle);
       clearAnalyticsController();
       clearSessionsController();
+      clearSessionsFilterDebounce();
       window.clearInterval(fastInterval);
       window.clearInterval(slowInterval);
       window.clearInterval(sessionsInterval);

@@ -7,6 +7,10 @@ export interface FetchSessionsOptions {
   limit?: number;
   since?: SessionsSinceKey;
   cursor?: string | null;
+  query?: string;
+  model?: string;
+  status?: string;
+  harness?: string;
   signal?: AbortSignal;
 }
 
@@ -30,7 +34,7 @@ function normalizeMeta(data: SessionsResponse, sessions: Session[]): SessionsMet
 }
 
 export async function fetchSessions(options: FetchSessionsOptions = {}): Promise<FetchSessionsResult> {
-  const { allowMock = true, limit, since, cursor, signal } = options;
+  const { allowMock = true, limit, since, cursor, query: searchQuery, model, status, harness, signal } = options;
 
   try {
     const query = new URLSearchParams();
@@ -42,6 +46,18 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
     }
     if (cursor) {
       query.set('cursor', cursor);
+    }
+    if (searchQuery?.trim()) {
+      query.set('query', searchQuery.trim());
+    }
+    if (model && model !== 'all') {
+      query.set('model', model);
+    }
+    if (status && status !== 'all') {
+      query.set('status', status);
+    }
+    if (harness && harness !== 'all') {
+      query.set('harness', harness);
     }
     const url = query.size > 0 ? `/api/sessions?${query.toString()}` : '/api/sessions';
     const data = await requestJson<SessionsResponse>(url, { timeoutMs: 15_000, signal });
@@ -72,11 +88,31 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
   };
 }
 
-export async function fetchSessionDetail(id: string, signal?: AbortSignal): Promise<Session | null> {
+export interface FetchSessionDetailOptions {
+  signal?: AbortSignal;
+  turnLimit?: number;
+  turnCursor?: string | null;
+}
+
+export async function fetchSessionDetail(
+  id: string,
+  options: FetchSessionDetailOptions = {},
+): Promise<Session | null> {
   try {
+    const query = new URLSearchParams();
+    if (typeof options.turnLimit === 'number') {
+      query.set('turn_limit', String(options.turnLimit));
+    }
+    if (options.turnCursor) {
+      query.set('turn_cursor', options.turnCursor);
+    }
+    const url =
+      query.size > 0
+        ? `/api/sessions/${encodeURIComponent(id)}?${query.toString()}`
+        : `/api/sessions/${encodeURIComponent(id)}`;
     const data = await requestJson<{ ok: boolean; session?: Session; error?: string }>(
-      `/api/sessions/${encodeURIComponent(id)}`,
-      { timeoutMs: 15_000, signal },
+      url,
+      { timeoutMs: 15_000, signal: options.signal },
     );
     if (data.ok && data.session) {
       return data.session;

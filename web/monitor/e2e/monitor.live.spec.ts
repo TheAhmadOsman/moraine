@@ -75,6 +75,16 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
 
+  const loadAnalyticsButton = page.getByRole('button', { name: 'Load Analytics' });
+  if (await loadAnalyticsButton.isVisible().catch(() => false)) {
+    await loadAnalyticsButton.click();
+  }
+
+  const loadSessionsButton = page.getByRole('button', { name: 'Load Sessions Now' });
+  if (await loadSessionsButton.isVisible().catch(() => false)) {
+    await loadSessionsButton.click();
+  }
+
   const healthGroup = page.locator('#healthGroup');
   await expect(healthGroup).toContainText('ClickHouse');
 

@@ -11,7 +11,9 @@
   export let layout: 'sidepanel' | 'inline' | 'split' | 'drawer' = 'sidepanel';
   export let closable = false;
 
-  const dispatch = createEventDispatcher<{ close: void }>();
+  export let pagingTurns = false;
+
+  const dispatch = createEventDispatcher<{ close: void; olderTurns: void; newerTurns: void }>();
 
   type VizMode = 'transcript' | 'flamegraph';
 
@@ -82,7 +84,7 @@
       </div>
       <div>
         <div class="mv-meta-k">turns</div>
-        <div class="mono mv-meta-v">{session.turns.length}</div>
+        <div class="mono mv-meta-v">{session.detailMeta?.totalTurnCount ?? session.turnCount ?? session.turns.length}</div>
       </div>
       <div>
         <div class="mv-meta-k">tokens</div>
@@ -101,6 +103,42 @@
         </div>
       </div>
     </div>
+    {#if session.detailMeta}
+      <div class="mv-detail-page-meta">
+        <span class="mono">
+          showing {session.detailMeta.loadedTurnCount} of {session.detailMeta.totalTurnCount} turns
+        </span>
+        {#if session.detailMeta.truncatedReason}
+          <span class="mv-chip mv-chip-warn">{session.detailMeta.truncatedReason}</span>
+        {/if}
+      </div>
+      <div class="mv-page-nav">
+        <button
+          class="mv-button"
+          type="button"
+          disabled={pagingTurns || !session.detailMeta.hasPreviousTurns}
+          on:click={() => dispatch('newerTurns')}
+        >
+          {#if pagingTurns}
+            Loading…
+          {:else}
+            Newer Turns
+          {/if}
+        </button>
+        <button
+          class="mv-button"
+          type="button"
+          disabled={pagingTurns || !session.detailMeta.hasMoreTurns}
+          on:click={() => dispatch('olderTurns')}
+        >
+          {#if pagingTurns}
+            Loading…
+          {:else}
+            Older Turns
+          {/if}
+        </button>
+      </div>
+    {/if}
   </div>
 
   <div class="mv-turns">
