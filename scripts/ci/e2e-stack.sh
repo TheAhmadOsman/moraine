@@ -201,6 +201,7 @@ main() {
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_${run_stamp}"
+  local factory_droid_keyword="${base_keyword}_factory_droid_${run_stamp}"
   local clickhouse_database="moraine"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
@@ -208,9 +209,13 @@ main() {
   local claude_session_suffix
   claude_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
+  local factory_droid_session_suffix
+  factory_droid_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local factory_droid_session_id="00000000-0000-4000-8000-${factory_droid_session_suffix}"
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
+  local factory_droid_trace_marker="mcp_factory_droid_trace_marker_${run_stamp}"
 
   need_cmd curl
   need_cmd "$python_bin"
@@ -237,10 +242,13 @@ main() {
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
+  local factory_droid_fixture_file="$fixtures_root/factory/sessions/e2e/${factory_droid_session_id}.jsonl"
+  local factory_droid_settings_file="$fixtures_root/factory/sessions/e2e/${factory_droid_session_id}.settings.json"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
+  mkdir -p "$(dirname "$factory_droid_fixture_file")"
   mkdir -p "$runtime_root"
 
   cat > "$codex_fixture_file" <<EOF
@@ -261,6 +269,16 @@ EOF
   # search+open smoke below can find it.
   cat > "$hermes_fixture_file" <<EOF
 {"timestamp":"2026-02-16T12:00:06.000000","model":"anthropic/claude-sonnet-4.6","prompt_index":1,"completed":true,"partial":false,"api_calls":1,"conversations":[{"from":"human","value":"local e2e hermes user prompt ${hermes_keyword}"},{"from":"gpt","value":"<think>draft the answer</think>\nlocal e2e hermes assistant reply ${hermes_keyword} ${hermes_trace_marker}"}]}
+EOF
+
+  cat > "$factory_droid_fixture_file" <<EOF
+{"type":"session_start","id":"${factory_droid_session_id}","sessionTitle":"Factory Droid e2e session","title":"Factory Droid e2e session","cwd":"${fixtures_root}/factory/project","version":2}
+{"type":"message","id":"factory-user-${run_stamp}","timestamp":"2026-02-16T12:00:07.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e factory droid user prompt ${factory_droid_keyword}"}]}}
+{"type":"message","id":"factory-assistant-${run_stamp}","parentId":"factory-user-${run_stamp}","timestamp":"2026-02-16T12:00:08.000Z","message":{"role":"assistant","openaiMessageId":"msg-factory-${run_stamp}","openaiReasoningId":"reasoning-factory-${run_stamp}","openaiPhase":"completed","openaiEncryptedContent":"ciphertext-that-must-not-enter-payload-json","content":[{"type":"thinking","thinking":"drafting the Factory Droid e2e answer"},{"type":"text","text":"local e2e factory droid assistant reply ${factory_droid_keyword} ${factory_droid_trace_marker}"}]}}
+EOF
+
+  cat > "$factory_droid_settings_file" <<EOF
+{"model":"claude-opus-4-7","providerLock":"anthropic","providerLockTimestamp":"2026-02-16T12:00:09.000Z","tokenUsage":{"inputTokens":13,"outputTokens":7,"cacheReadTokens":5,"cacheCreationTokens":3},"assistantActiveTimeMs":1234}
 EOF
 
   cat > "$config_path" <<EOF
@@ -300,6 +318,14 @@ enabled = true
 glob = "${fixtures_root}/hermes/trajectories/**/*.jsonl"
 watch_root = "${fixtures_root}/hermes/trajectories"
 
+[[ingest.sources]]
+name = "ci-factory-droid"
+harness = "factory-droid"
+enabled = true
+glob = "${fixtures_root}/factory/sessions/**/*.jsonl"
+watch_root = "${fixtures_root}/factory/sessions"
+format = "factory_droid_jsonl"
+
 [runtime]
 root_dir = "${runtime_root}"
 logs_dir = "logs"
@@ -320,6 +346,8 @@ EOF
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
+  echo "[e2e] factory droid fixture: ${factory_droid_fixture_file}"
+  echo "[e2e] factory droid settings: ${factory_droid_settings_file}"
 
   echo "[e2e] installing managed ClickHouse"
   "$moraine_bin" clickhouse install --config "$config_path"
@@ -341,23 +369,30 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${factory_droid_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${factory_droid_keyword}'" 120
   # Confirm the vendor/model split landed at ingest time: the Hermes row
   # should carry harness=hermes and inference_provider=anthropic (parsed from
   # the `anthropic/claude-sonnet-4.6` record field).
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE harness = 'hermes' AND inference_provider = 'anthropic' AND positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 60
+  # Factory Droid reads its sibling settings sidecar for provider/model/token
+  # metadata while preserving the session JSONL as the checkpointed stream.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-factory-droid' AND harness = 'factory-droid' AND inference_provider = 'anthropic' AND model = 'claude-opus-4-7' AND positionCaseInsensitiveUTF8(text_content, '${factory_droid_keyword}') > 0" 60
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-factory-droid' AND top_type = 'session_settings' AND endsWith(source_file, '.settings.json')" 60
 
   echo "[e2e] checking monitor API routes and source health"
   "$python_bin" "$repo_root/scripts/ci/monitor_smoke.py" \
     --base-url "http://127.0.0.1:${monitor_port}" \
     --expect-source "ci-codex:codex" \
     --expect-source "ci-claude:claude-code" \
-    --expect-source "ci-hermes:hermes"
+    --expect-source "ci-hermes:hermes" \
+    --expect-source "ci-factory-droid:factory-droid"
 
   echo "[e2e] checking MCP protocol/schema/retrieval smoke (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --query "$codex_keyword" \
+    --query "$codex_trace_marker" \
     --expect-session-id "$codex_session_id" \
     --expect-source-file "$codex_fixture_file" \
     --expect-open-text "$codex_trace_marker"
@@ -366,7 +401,7 @@ EOF
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --query "$claude_keyword" \
+    --query "$claude_trace_marker" \
     --expect-session-id "$claude_session_id" \
     --expect-source-file "$claude_fixture_file" \
     --expect-open-text "$claude_trace_marker"
@@ -378,9 +413,18 @@ EOF
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --query "$hermes_keyword" \
+    --query "$hermes_trace_marker" \
     --expect-source-file "$hermes_fixture_file" \
     --expect-open-text "$hermes_trace_marker"
+
+  echo "[e2e] checking MCP protocol/schema/retrieval smoke (Factory Droid)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$factory_droid_trace_marker" \
+    --expect-session-id "$factory_droid_session_id" \
+    --expect-source-file "$factory_droid_fixture_file" \
+    --expect-open-text "$factory_droid_trace_marker"
 
   if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
     echo "[e2e] checking replay benchmark script (dry-run)"

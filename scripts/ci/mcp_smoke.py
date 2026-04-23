@@ -381,7 +381,9 @@ def select_hit(
     hits: Iterable[Any],
     expect_session_id: Optional[str],
     expect_source_file: Optional[str],
+    expect_open_text: Optional[str],
 ) -> JsonObject:
+    matched_hits: list[JsonObject] = []
     for hit in hits:
         if not isinstance(hit, dict):
             continue
@@ -391,7 +393,15 @@ def select_hit(
             source_ref = hit.get("source_ref")
             if not isinstance(source_ref, str) or expect_source_file not in source_ref:
                 continue
-        return hit
+        matched_hits.append(hit)
+
+    if expect_open_text is not None:
+        for hit in matched_hits:
+            if hit_contains_text(hit, expect_open_text):
+                return hit
+
+    if matched_hits:
+        return matched_hits[0]
 
     debug_hits = [
         {
@@ -417,6 +427,14 @@ def assert_hit_identity(hit: JsonObject) -> tuple[str, str]:
     if not isinstance(session_id, str) or not session_id:
         raise AssertionError(f"selected search hit missing session_id: {hit}")
     return event_uid, session_id
+
+
+def hit_contains_text(hit: JsonObject, expected_text: str) -> bool:
+    for field in ("text_content", "text_preview", "preview", "snippet"):
+        value = hit.get(field)
+        if isinstance(value, str) and expected_text in value:
+            return True
+    return False
 
 
 def assert_open_contains_expected_event(
@@ -513,7 +531,7 @@ def run_tool_suite(
     if not hits:
         raise AssertionError(f"search returned no hits for query={query}")
 
-    selected_hit = select_hit(hits, expect_session_id, expect_source_file)
+    selected_hit = select_hit(hits, expect_session_id, expect_source_file, expect_open_text)
     event_uid, session_id = assert_hit_identity(selected_hit)
 
     open_event_payload = assert_full_tool_success(

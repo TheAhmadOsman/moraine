@@ -2481,6 +2481,10 @@ mod tests {
             .find(|row| row.get("text_content").and_then(Value::as_str) == Some("hello"))
             .expect("assistant event");
         assert_eq!(
+            assistant_event.get("session_id").and_then(Value::as_str),
+            Some("65082ccf-d3b7-46ac-916e-e3b1cedac604")
+        );
+        assert_eq!(
             assistant_event.get("model").and_then(Value::as_str),
             Some("claude-opus-4-7")
         );

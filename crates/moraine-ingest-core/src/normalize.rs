@@ -342,12 +342,22 @@ fn factory_droid_provider_model(record: &Value, model_hint: &str) -> (String, St
     (provider, model)
 }
 
-fn factory_droid_session_id(source_file: &str, session_hint: &str, record: &Value) -> String {
-    let explicit = to_str(record.get("session_id"))
-        .or_else_nonempty(|| to_str(record.get("sessionId")))
-        .or_else_nonempty(|| to_str(record.get("id")));
+fn factory_droid_session_id(
+    source_file: &str,
+    session_hint: &str,
+    top_type: &str,
+    record: &Value,
+) -> String {
+    let explicit =
+        to_str(record.get("session_id")).or_else_nonempty(|| to_str(record.get("sessionId")));
     if !explicit.is_empty() {
         return explicit;
+    }
+    if top_type == "session_start" {
+        let session_start_id = to_str(record.get("id"));
+        if !session_start_id.is_empty() {
+            return session_start_id;
+        }
     }
     if !session_hint.is_empty() {
         return session_hint.to_string();
@@ -4129,7 +4139,7 @@ pub fn normalize_record(
     let mut session_id = if harness == Harness::ClaudeCode {
         to_str(record.get("sessionId"))
     } else if harness == Harness::FactoryDroid {
-        factory_droid_session_id(source_file, session_hint, record)
+        factory_droid_session_id(source_file, session_hint, &top_type, record)
     } else if harness == Harness::KimiCli {
         kimi_session_id(source_file, session_hint)
     } else {
@@ -4916,6 +4926,10 @@ mod tests {
         assert_eq!(
             text.get("event_kind").and_then(Value::as_str),
             Some("message")
+        );
+        assert_eq!(
+            text.get("session_id").and_then(Value::as_str),
+            Some("65082ccf-d3b7-46ac-916e-e3b1cedac604")
         );
         assert_eq!(
             text.get("actor_kind").and_then(Value::as_str),
